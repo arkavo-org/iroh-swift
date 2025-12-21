@@ -1,0 +1,82 @@
+name: Feature CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  MACOSX_DEPLOYMENT_TARGET: "26.0"
+  IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build Rust library
+        run: |
+          cd rust
+          cargo build --release --target aarch64-apple-darwin
+
+      - name: Generate C header
+        run: |
+          cargo install cbindgen
+          cd rust
+          cbindgen --config cbindgen.toml --crate iroh-swift-ffi --output ../include/iroh_swift.h
+
+      - name: Create XCFramework (macOS only for CI)
+        run: |
+          mkdir -p build/macos
+          cp rust/target/aarch64-apple-darwin/release/libiroh_swift.a build/macos/
+          rm -rf IrohSwiftFFI.xcframework
+          xcodebuild -create-xcframework \
+            -library build/macos/libiroh_swift.a \
+            -headers include \
+            -output IrohSwiftFFI.xcframework
+
+      - name: Build Swift package
+        run: swift build
+
+      - name: Run tests
+        run: swift test
+
+  rust-check:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Check formatting
+        run: |
+          cd rust
+          cargo fmt --check
+
+      - name: Clippy
+        run: |
+          cd rust
+          cargo clippy -- -D warnings
+
+      - name: Run Rust tests
+        run: |
+          cd rust
+          cargo test
