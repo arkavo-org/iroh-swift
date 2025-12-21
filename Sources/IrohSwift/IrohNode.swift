@@ -75,9 +75,11 @@ public actor IrohNode {
     ///
     /// - Parameter data: The data to store.
     /// - Returns: A ticket string that can be used to retrieve the data.
-    /// - Throws: `IrohError.putFailed` if the operation fails.
+    /// - Throws: `IrohError.putFailed` if the operation fails,
+    ///           `CancellationError` if the task was cancelled.
     public func put(_ data: Data) async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
+        try Task.checkCancellation()
+        return try await withCheckedThrowingContinuation { continuation in
             data.withUnsafeBytes { buffer in
                 let bytes = IrohBytes(
                     data: buffer.baseAddress?.assumingMemoryBound(to: UInt8.self),
@@ -119,9 +121,11 @@ public actor IrohNode {
     ///
     /// - Parameter ticket: The ticket string obtained from another node's `put` call.
     /// - Returns: The downloaded data.
-    /// - Throws: `IrohError.getFailed` if the download fails.
+    /// - Throws: `IrohError.getFailed` if the download fails,
+    ///           `CancellationError` if the task was cancelled.
     public func get(ticket: String) async throws -> Data {
-        try await withCheckedThrowingContinuation { continuation in
+        try Task.checkCancellation()
+        return try await withCheckedThrowingContinuation { continuation in
             ticket.withCString { ticketPtr in
                 let box = Unmanaged.passRetained(
                     ContinuationBox<Data>(continuation)
