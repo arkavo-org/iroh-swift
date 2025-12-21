@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+*'
+
+env:
+  MACOSX_DEPLOYMENT_TARGET: "26.0"
+  IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Install cbindgen
+        run: cargo install cbindgen
+
+      - name: Build XCFramework
+        run: ./scripts/build-xcframework.sh
+
+      - name: Run tests
+        run: swift test
+
+      - name: Create release archive
+        run: |
+          zip -r IrohSwiftFFI.xcframework.zip IrohSwiftFFI.xcframework
+          echo "CHECKSUM=$(shasum -a 256 IrohSwiftFFI.xcframework.zip | cut -d ' ' -f 1)" >> $GITHUB_ENV
+
+      - name: Verify tag matches VERSION file
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/}"
+          FILE_VERSION=$(cat VERSION | tr -d '\n')
+
+          if [ "$TAG_VERSION" != "$FILE_VERSION" ]; then
+            echo "::error::Tag ($TAG_VERSION) does not match VERSION file ($FILE_VERSION)"
+            exit 1
+          fi
+          echo "Tag matches VERSION file: $TAG_VERSION"
+
+      - name: Get version
+        id: version
+        run: echo "VERSION=$(cat VERSION | tr -d '\n')" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: IrohSwiftFFI.xcframework.zip
+          body: |
+            ## IrohSwift ${{ steps.version.outputs.VERSION }}
+
+            ### Installation
+
+            Add to your `Package.swift`:
+            ```swift
+            .package(url: "https://github.com/arkavo-org/iroh-swift.git", from: "${{ steps.version.outputs.VERSION }}")
+            ```
+
+            ### Checksum
+            ```
+            ${{ env.CHECKSUM }}
+            ```
+
+            ### What's Changed
+            See [CHANGELOG](https://github.com/arkavo-org/iroh-swift/blob/main/CHANGELOG.md) for details.
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Package.swift checksum
+        run: |
+          sed -i '' "s/CHECKSUM_PLACEHOLDER/${{ env.CHECKSUM }}/" Package.swift
+          echo "Updated Package.swift with checksum: ${{ env.CHECKSUM }}"
+          cat Package.swift | grep checksum
