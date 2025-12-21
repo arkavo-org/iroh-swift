@@ -3,13 +3,8 @@
 //! Provides a minimal interface for blob storage and retrieval.
 
 use anyhow::{Context, Result};
-use iroh::{protocol::Router, Endpoint, RelayMode};
-use iroh_blobs::{
-    store::fs::FsStore,
-    ticket::BlobTicket,
-    BlobsProtocol,
-    ALPN,
-};
+use iroh::{Endpoint, RelayMode, protocol::Router};
+use iroh_blobs::{ALPN, BlobsProtocol, store::fs::FsStore, ticket::BlobTicket};
 use std::path::PathBuf;
 use tokio::runtime::Runtime;
 
@@ -99,9 +94,7 @@ impl IrohNode {
     pub fn get(&self, ticket_str: &str) -> Result<Vec<u8>> {
         self.runtime.block_on(async {
             // Parse the ticket
-            let ticket: BlobTicket = ticket_str
-                .parse()
-                .context("Failed to parse ticket")?;
+            let ticket: BlobTicket = ticket_str.parse().context("Failed to parse ticket")?;
 
             // Create a downloader for fetching from remote peers
             let downloader = self.store.downloader(&self.endpoint);
