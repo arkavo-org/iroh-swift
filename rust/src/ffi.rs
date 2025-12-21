@@ -205,7 +205,7 @@ pub extern "C" fn iroh_put(
 /// - `ticket` must be a valid null-terminated UTF-8 string
 /// - `callback` must have valid function pointers
 #[unsafe(no_mangle)]
-pub extern "C" fn iroh_get(
+pub unsafe extern "C" fn iroh_get(
     handle: *const IrohNodeHandle,
     ticket: *const c_char,
     callback: IrohGetCallback,
@@ -264,7 +264,7 @@ pub extern "C" fn iroh_get(
 /// - `s` must be a pointer returned by an Iroh function, or null
 /// - `s` must not be used after this call
 #[unsafe(no_mangle)]
-pub extern "C" fn iroh_string_free(s: *mut c_char) {
+pub unsafe extern "C" fn iroh_string_free(s: *mut c_char) {
     if !s.is_null() {
         unsafe {
             drop(CString::from_raw(s));
