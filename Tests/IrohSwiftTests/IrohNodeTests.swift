@@ -31,7 +31,7 @@ final class IrohNodeTests: XCTestCase {
         let config = IrohConfig(storagePath: tempDir, relayEnabled: false)
         let node = try await IrohNode(config: config)
 
-        let data = "Hello, Iroh!".data(using: .utf8)!
+        let data = Data("Hello, Iroh!".utf8)
         let ticket = try await node.put(data)
 
         // Tickets should start with "blob" (BlobTicket format)

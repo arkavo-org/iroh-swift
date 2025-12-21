@@ -18,7 +18,7 @@ import IrohSwiftFFI
 /// let retrieved = try await node.get(ticket: ticket)
 /// ```
 public actor IrohNode {
-    private let handle: NodeHandleWrapper
+    let handle: NodeHandleWrapper
 
     /// Create a new Iroh node with the specified configuration.
     ///

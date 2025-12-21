@@ -16,7 +16,7 @@ final class IntegrationTests: XCTestCase {
         let config = IrohConfig(storagePath: tempDir, relayEnabled: true)
         let node = try await IrohNode(config: config)
 
-        let testData = "Hello from iroh-swift integration test!".data(using: .utf8)!
+        let testData = Data("Hello from iroh-swift integration test!".utf8)
         let ticket = try await node.put(testData)
 
         print("Generated ticket: \(ticket)")
@@ -39,7 +39,7 @@ final class IntegrationTests: XCTestCase {
         let config = IrohConfig(storagePath: tempDir, relayEnabled: false)
         let node = try await IrohNode(config: config)
 
-        let originalData = "Test data for roundtrip verification".data(using: .utf8)!
+        let originalData = Data("Test data for roundtrip verification".utf8)
         let ticket = try await node.put(originalData)
 
         print("Ticket: \(ticket)")
@@ -75,7 +75,7 @@ final class IntegrationTests: XCTestCase {
         let node2 = try await IrohNode(config: config2)
 
         // Node 1 puts data
-        let testData = "Data from node1 to node2".data(using: .utf8)!
+        let testData = Data("Data from node1 to node2".utf8)
         let ticket = try await node1.put(testData)
 
         print("Node1 created ticket: \(ticket)")

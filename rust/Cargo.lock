@@ -1847,6 +1847,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cbindgen",
+ "futures-lite",
  "iroh",
  "iroh-blobs",
  "tempfile",

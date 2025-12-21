@@ -5,6 +5,7 @@
 //! Swift's concurrency model.
 
 use crate::node::IrohNode;
+use iroh_blobs::ticket::BlobTicket;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::PathBuf;
 
@@ -83,6 +84,75 @@ pub struct IrohNodeCreateCallback {
     pub on_success: extern "C" fn(userdata: *mut c_void, handle: *mut IrohNodeHandle),
     /// Called on failure with an error message (caller must free with `iroh_string_free`).
     pub on_failure: extern "C" fn(userdata: *mut c_void, error: *const c_char),
+}
+
+/// Progress information for a download operation.
+#[repr(C)]
+pub struct IrohDownloadProgress {
+    /// Bytes downloaded so far.
+    pub downloaded: u64,
+    /// Total bytes expected (0 if unknown).
+    pub total: u64,
+}
+
+/// Callback for get operations with progress reporting.
+#[repr(C)]
+pub struct IrohGetProgressCallback {
+    /// Opaque pointer passed back to Swift.
+    pub userdata: *mut c_void,
+    /// Called with progress updates during download.
+    pub on_progress: extern "C" fn(userdata: *mut c_void, progress: IrohDownloadProgress),
+    /// Called on success with owned bytes (caller must free with `iroh_bytes_free`).
+    pub on_success: extern "C" fn(userdata: *mut c_void, bytes: IrohOwnedBytes),
+    /// Called on failure with an error message (caller must free with `iroh_string_free`).
+    pub on_failure: extern "C" fn(userdata: *mut c_void, error: *const c_char),
+}
+
+/// Information about an Iroh node.
+#[repr(C)]
+pub struct IrohNodeInfo {
+    /// Node ID as a string (caller must free with `iroh_string_free`).
+    pub node_id: *const c_char,
+    /// Relay URL if connected (caller must free with `iroh_string_free`).
+    /// Null if not connected to a relay.
+    pub relay_url: *const c_char,
+    /// Whether the node is connected to the network.
+    pub is_connected: bool,
+}
+
+/// Callback for node info retrieval.
+#[repr(C)]
+pub struct IrohNodeInfoCallback {
+    /// Opaque pointer passed back to Swift.
+    pub userdata: *mut c_void,
+    /// Called on success with node info.
+    pub on_success: extern "C" fn(userdata: *mut c_void, info: IrohNodeInfo),
+    /// Called on failure with an error message (caller must free with `iroh_string_free`).
+    pub on_failure: extern "C" fn(userdata: *mut c_void, error: *const c_char),
+}
+
+/// Parsed ticket information.
+#[repr(C)]
+pub struct IrohTicketInfo {
+    /// Whether the ticket is valid.
+    pub is_valid: bool,
+    /// The blob hash as a string (caller must free with `iroh_string_free`).
+    /// Null if invalid.
+    pub hash: *const c_char,
+    /// The node ID from the ticket (caller must free with `iroh_string_free`).
+    /// Null if invalid.
+    pub node_id: *const c_char,
+    /// Whether this is a recursive (collection) ticket.
+    pub is_recursive: bool,
+}
+
+/// Callback for ticket validation.
+#[repr(C)]
+pub struct IrohTicketValidateCallback {
+    /// Opaque pointer passed back to Swift.
+    pub userdata: *mut c_void,
+    /// Called with validation result. Always called (never fails).
+    pub on_complete: extern "C" fn(userdata: *mut c_void, info: IrohTicketInfo),
 }
 
 // ============================================================================
@@ -285,4 +355,161 @@ pub extern "C" fn iroh_bytes_free(bytes: IrohOwnedBytes) {
             drop(Vec::from_raw_parts(bytes.data, bytes.len, bytes.capacity));
         }
     }
+}
+
+// ============================================================================
+// Extended Operations
+// ============================================================================
+
+/// Download bytes from a ticket with progress reporting.
+///
+/// # Safety
+/// - `handle` must be a valid node handle
+/// - `ticket` must be a valid null-terminated UTF-8 string
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_get_with_progress(
+    handle: *const IrohNodeHandle,
+    ticket: *const c_char,
+    callback: IrohGetProgressCallback,
+) {
+    if handle.is_null() {
+        let error = CString::new("handle cannot be null").unwrap();
+        (callback.on_failure)(callback.userdata, error.into_raw());
+        return;
+    }
+
+    if ticket.is_null() {
+        let error = CString::new("ticket cannot be null").unwrap();
+        (callback.on_failure)(callback.userdata, error.into_raw());
+        return;
+    }
+
+    // Parse the ticket string
+    let ticket_str = match unsafe { CStr::from_ptr(ticket) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(e) => {
+            let error = CString::new(format!("Invalid ticket string: {}", e)).unwrap();
+            (callback.on_failure)(callback.userdata, error.into_raw());
+            return;
+        }
+    };
+
+    let node = unsafe { &*(handle as *const IrohNode) };
+    let userdata = callback.userdata;
+    let on_progress_fn = callback.on_progress;
+
+    // Progress callback closure
+    let progress_fn = move |downloaded: u64, total: u64| {
+        let progress = IrohDownloadProgress { downloaded, total };
+        (on_progress_fn)(userdata, progress);
+    };
+
+    match node.get_with_progress(&ticket_str, progress_fn) {
+        Ok(bytes) => {
+            let mut vec = bytes;
+            let owned = IrohOwnedBytes {
+                data: vec.as_mut_ptr(),
+                len: vec.len(),
+                capacity: vec.capacity(),
+            };
+            std::mem::forget(vec);
+            (callback.on_success)(callback.userdata, owned);
+        }
+        Err(e) => {
+            let error = CString::new(format!("{:#}", e)).unwrap();
+            (callback.on_failure)(callback.userdata, error.into_raw());
+        }
+    }
+}
+
+/// Get information about the node.
+///
+/// # Safety
+/// - `handle` must be a valid node handle
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub extern "C" fn iroh_node_info(handle: *const IrohNodeHandle, callback: IrohNodeInfoCallback) {
+    if handle.is_null() {
+        let error = CString::new("handle cannot be null").unwrap();
+        (callback.on_failure)(callback.userdata, error.into_raw());
+        return;
+    }
+
+    let node = unsafe { &*(handle as *const IrohNode) };
+
+    match node.info() {
+        Ok(info) => {
+            let node_id = CString::new(info.node_id).unwrap().into_raw();
+            let relay_url = info
+                .relay_url
+                .map(|url| CString::new(url).unwrap().into_raw())
+                .unwrap_or(std::ptr::null_mut());
+
+            let ffi_info = IrohNodeInfo {
+                node_id,
+                relay_url,
+                is_connected: info.is_connected,
+            };
+            (callback.on_success)(callback.userdata, ffi_info);
+        }
+        Err(e) => {
+            let error = CString::new(format!("{:#}", e)).unwrap();
+            (callback.on_failure)(callback.userdata, error.into_raw());
+        }
+    }
+}
+
+/// Validate and parse a ticket string.
+///
+/// This function always succeeds - check `info.is_valid` for the result.
+///
+/// # Safety
+/// - `ticket` must be a valid null-terminated UTF-8 string (or null)
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_validate_ticket(
+    ticket: *const c_char,
+    callback: IrohTicketValidateCallback,
+) {
+    let result = if ticket.is_null() {
+        IrohTicketInfo {
+            is_valid: false,
+            hash: std::ptr::null(),
+            node_id: std::ptr::null(),
+            is_recursive: false,
+        }
+    } else {
+        match unsafe { CStr::from_ptr(ticket) }.to_str() {
+            Ok(ticket_str) => match ticket_str.parse::<BlobTicket>() {
+                Ok(parsed) => {
+                    let hash = CString::new(parsed.hash().to_string()).unwrap().into_raw();
+                    let node_id = CString::new(parsed.addr().id.to_string())
+                        .unwrap()
+                        .into_raw();
+
+                    IrohTicketInfo {
+                        is_valid: true,
+                        hash,
+                        node_id,
+                        is_recursive: parsed.recursive(),
+                    }
+                }
+                Err(_) => IrohTicketInfo {
+                    is_valid: false,
+                    hash: std::ptr::null(),
+                    node_id: std::ptr::null(),
+                    is_recursive: false,
+                },
+            },
+            Err(_) => IrohTicketInfo {
+                is_valid: false,
+                hash: std::ptr::null(),
+                node_id: std::ptr::null(),
+                is_recursive: false,
+            },
+        }
+    };
+
+    (callback.on_complete)(callback.userdata, result);
 }

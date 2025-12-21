@@ -15,7 +15,7 @@ struct IrohCLI {
         print("Node started successfully!")
 
         // Put test data
-        let testData = "Hello from iroh-swift CLI! Timestamp: \(Date())".data(using: .utf8)!
+        let testData = Data("Hello from iroh-swift CLI! Timestamp: \(Date())".utf8)
         let ticket = try await node.put(testData)
 
         print("")
