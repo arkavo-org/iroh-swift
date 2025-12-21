@@ -11,6 +11,51 @@ env:
   IPHONEOS_DEPLOYMENT_TARGET: "26.0"
 
 jobs:
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check version consistency
+        run: |
+          VERSION=$(cat VERSION | tr -d '\n')
+          CARGO_VERSION=$(grep '^version' rust/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          SWIFT_VERSION=$(grep 'let version' Package.swift | sed 's/.*"\(.*\)".*/\1/')
+
+          echo "VERSION file: $VERSION"
+          echo "Cargo.toml:   $CARGO_VERSION"
+          echo "Package.swift: $SWIFT_VERSION"
+
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Version mismatch: VERSION ($VERSION) != Cargo.toml ($CARGO_VERSION)"
+            exit 1
+          fi
+
+          if [ "$VERSION" != "$SWIFT_VERSION" ]; then
+            echo "::error::Version mismatch: VERSION ($VERSION) != Package.swift ($SWIFT_VERSION)"
+            exit 1
+          fi
+
+          echo "All versions match: $VERSION"
+
+      - name: Check version bump on PR
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin main
+          MAIN_VERSION=$(git show origin/main:VERSION 2>/dev/null | tr -d '\n' || echo "0.0.0")
+          PR_VERSION=$(cat VERSION | tr -d '\n')
+
+          echo "main branch version: $MAIN_VERSION"
+          echo "PR version: $PR_VERSION"
+
+          if [ "$MAIN_VERSION" = "$PR_VERSION" ]; then
+            echo "::warning::Version not bumped. Consider updating VERSION file if this PR includes user-facing changes."
+          else
+            echo "Version bumped from $MAIN_VERSION to $PR_VERSION"
+          fi
+
   test:
     runs-on: macos-15
     steps:
