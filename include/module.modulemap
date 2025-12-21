@@ -1,0 +1,4 @@
+module IrohSwiftFFI {
+    header "iroh_swift.h"
+    export *
+}
