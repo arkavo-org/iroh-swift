@@ -69,39 +69,12 @@ jobs:
           echo "CHECKSUM=$CHECKSUM" >> $GITHUB_OUTPUT
           echo "Checksum: $CHECKSUM"
 
-      - name: Update Package.swift with checksum and create tag
-        if: steps.version.outputs.SKIP != 'true'
-        id: tag
-        run: |
-          VERSION=${{ steps.version.outputs.VERSION }}
-          CHECKSUM=${{ steps.archive.outputs.CHECKSUM }}
-
-          # Update Package.swift with actual checksum
-          sed -i '' 's/let checksum = ".*"/let checksum = "'"$CHECKSUM"'"/' Package.swift
-
-          # Commit the checksum update
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Package.swift
-          git commit -m "chore: set checksum for $VERSION [skip ci]"
-          git push
-
-          # Create tag on this commit (with correct checksum)
-          git tag "$VERSION"
-          git push origin "$VERSION"
-
-          echo "TAG_SHA=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Generate release notes
         if: steps.version.outputs.SKIP != 'true'
         id: notes
         run: |
           VERSION=${{ steps.version.outputs.VERSION }}
-
-          # Get previous tag (exclude current)
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
 
           {
             echo "NOTES<<EOF"
@@ -111,19 +84,20 @@ jobs:
             echo ""
 
             if [ -n "$PREV_TAG" ]; then
-              git log ${PREV_TAG}..HEAD~1 --pretty=format:"- %s" | head -20 || true
+              git log ${PREV_TAG}..HEAD --pretty=format:"- %s" | head -20 || true
               echo ""
               echo ""
               echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...$VERSION"
             else
               echo "Initial release"
-              git log HEAD~1 --pretty=format:"- %s" | head -20 || true
+              git log --pretty=format:"- %s" | head -20 || true
             fi
             echo ""
             echo "EOF"
           } >> $GITHUB_OUTPUT
 
-      - name: Create GitHub release
+      # Step 1: Create release with artifact (tag created on current commit)
+      - name: Create GitHub release with artifact
         if: steps.version.outputs.SKIP != 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -131,7 +105,6 @@ jobs:
           VERSION: ${{ steps.version.outputs.VERSION }}
           CHECKSUM: ${{ steps.archive.outputs.CHECKSUM }}
         run: |
-          # Build release notes
           {
             echo "$NOTES"
             echo ""
@@ -148,11 +121,46 @@ jobs:
             echo '```'
           } > /tmp/release-notes.md
 
-          # Create release with artifact
           gh release create "$VERSION" \
             IrohSwiftFFI.xcframework.zip \
             --title "IrohSwift $VERSION" \
             --notes-file /tmp/release-notes.md
+
+      # Step 2: Commit checksum to Package.swift
+      - name: Update Package.swift with checksum
+        if: steps.version.outputs.SKIP != 'true'
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          CHECKSUM=${{ steps.archive.outputs.CHECKSUM }}
+
+          # Update Package.swift with actual checksum
+          sed -i '' 's/let checksum = ".*"/let checksum = "'"$CHECKSUM"'"/' Package.swift
+
+          # Commit and push
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Package.swift
+          git commit -m "chore: set checksum for $VERSION [skip ci]"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 3: Move tag to the commit with correct checksum
+      - name: Update tag to point to checksum commit
+        if: steps.version.outputs.SKIP != 'true'
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+
+          # Delete remote tag
+          git push origin --delete "$VERSION"
+
+          # Create new tag on current commit (with checksum)
+          git tag -f "$VERSION"
+          git push origin "$VERSION"
+
+          echo "Tag $VERSION now points to $(git rev-parse HEAD)"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Smoke test - verify artifact download
         if: steps.version.outputs.SKIP != 'true'
