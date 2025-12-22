@@ -20,7 +20,7 @@ let binaryTarget: Target = useLocalBinary
     )
     : .binaryTarget(
         name: "IrohSwiftFFI",
-        url: "https://github.com/arkavo-org/iroh-swift/releases/download/v\(version)/IrohSwiftFFI.xcframework.zip",
+        url: "https://github.com/arkavo-org/iroh-swift/releases/download/\(version)/IrohSwiftFFI.xcframework.zip",
         checksum: checksum
     )
 
