@@ -20,6 +20,14 @@ public enum IrohError: Error, Sendable {
     case decodingFailed(String)
     /// Operation failed after maximum retry attempts.
     case maxRetriesExceeded(attempts: Int, lastError: any Error)
+    /// Invalid configuration.
+    case invalidConfiguration(String)
+    /// Operation timed out.
+    case timeout
+    /// Node has been closed.
+    case nodeClosed
+    /// Failed to close the node.
+    case closeFailed(String)
 }
 
 extension IrohError: LocalizedError {
@@ -43,6 +51,14 @@ extension IrohError: LocalizedError {
             return "Failed to decode value: \(msg)"
         case .maxRetriesExceeded(let attempts, let lastError):
             return "Operation failed after \(attempts) attempts: \(lastError.localizedDescription)"
+        case .invalidConfiguration(let msg):
+            return "Invalid configuration: \(msg)"
+        case .timeout:
+            return "Operation timed out"
+        case .nodeClosed:
+            return "Node has been closed"
+        case .closeFailed(let msg):
+            return "Failed to close node: \(msg)"
         }
     }
 }

@@ -4,10 +4,12 @@
 
 use anyhow::{Context, Result};
 use futures_lite::StreamExt;
-use iroh::{Endpoint, RelayMode, protocol::Router};
+use iroh::endpoint::RelayMode;
+use iroh::{Endpoint, RelayMap, RelayUrl, protocol::Router};
 use iroh_blobs::api::downloader::DownloadProgressItem;
 use iroh_blobs::{ALPN, BlobsProtocol, store::fs::FsStore, ticket::BlobTicket};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::runtime::Runtime;
 
 /// Information about an Iroh node.
@@ -36,8 +38,13 @@ impl IrohNode {
     ///
     /// # Arguments
     /// * `storage_path` - Directory for the blob store (created if doesn't exist)
-    /// * `relay_enabled` - Whether to use n0's public relay servers
-    pub fn new(storage_path: PathBuf, relay_enabled: bool) -> Result<Self> {
+    /// * `relay_enabled` - Whether to use relay servers
+    /// * `custom_relay_url` - Optional custom relay URL (if None, uses n0's public relays)
+    pub fn new(
+        storage_path: PathBuf,
+        relay_enabled: bool,
+        custom_relay_url: Option<String>,
+    ) -> Result<Self> {
         // Create dedicated runtime for this node
         let runtime = Runtime::new().context("Failed to create Tokio runtime")?;
 
@@ -47,12 +54,17 @@ impl IrohNode {
                 .await
                 .context("Failed to load blob store")?;
 
-            // Build endpoint with optional relay
+            // Build endpoint with relay configuration
             let mut builder = Endpoint::builder();
             if !relay_enabled {
                 builder = builder.relay_mode(RelayMode::Disabled);
+            } else if let Some(url) = custom_relay_url {
+                // Parse and use custom relay
+                let relay_url: RelayUrl = url.parse().context("Invalid relay URL")?;
+                let relay_map = RelayMap::from(relay_url);
+                builder = builder.relay_mode(RelayMode::Custom(relay_map));
             }
-            // n0 public relays are default when relay_enabled=true
+            // else: n0 public relays are default when relay_enabled=true
 
             let endpoint = builder.bind().await.context("Failed to bind endpoint")?;
 
@@ -182,6 +194,70 @@ impl IrohNode {
         })
     }
 
+    /// Add bytes to the blob store with an optional timeout.
+    ///
+    /// # Arguments
+    /// * `data` - The bytes to store
+    /// * `timeout_ms` - Timeout in milliseconds (0 = no timeout)
+    pub fn put_with_timeout(&self, data: &[u8], timeout_ms: u64) -> Result<String> {
+        self.runtime.block_on(async {
+            let fut = async {
+                let tag = self
+                    .store
+                    .add_slice(data)
+                    .await
+                    .context("Failed to add bytes to store")?;
+
+                let addr = self.endpoint.addr();
+                let ticket = BlobTicket::new(addr, tag.hash, tag.format);
+                Ok::<_, anyhow::Error>(ticket.to_string())
+            };
+
+            if timeout_ms == 0 {
+                fut.await
+            } else {
+                tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                    .await
+                    .context("Operation timed out")?
+            }
+        })
+    }
+
+    /// Download bytes from a ticket with an optional timeout.
+    ///
+    /// # Arguments
+    /// * `ticket_str` - The ticket string
+    /// * `timeout_ms` - Timeout in milliseconds (0 = no timeout)
+    pub fn get_with_timeout(&self, ticket_str: &str, timeout_ms: u64) -> Result<Vec<u8>> {
+        self.runtime.block_on(async {
+            let fut = async {
+                let ticket: BlobTicket = ticket_str.parse().context("Failed to parse ticket")?;
+                let downloader = self.store.downloader(&self.endpoint);
+
+                downloader
+                    .download(ticket.hash(), [ticket.addr().id])
+                    .await
+                    .context("Failed to download blob")?;
+
+                let bytes = self
+                    .store
+                    .get_bytes(ticket.hash())
+                    .await
+                    .context("Failed to read bytes from store")?;
+
+                Ok::<_, anyhow::Error>(bytes.to_vec())
+            };
+
+            if timeout_ms == 0 {
+                fut.await
+            } else {
+                tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                    .await
+                    .context("Operation timed out")?
+            }
+        })
+    }
+
     /// Get information about this node.
     pub fn info(&self) -> Result<NodeInfo> {
         self.runtime.block_on(async {
@@ -225,7 +301,7 @@ mod tests {
     #[test]
     fn test_put_roundtrip() {
         let dir = tempdir().unwrap();
-        let node = IrohNode::new(dir.path().to_path_buf(), false).unwrap();
+        let node = IrohNode::new(dir.path().to_path_buf(), false, None).unwrap();
 
         let data = b"Hello, Iroh!";
         let ticket = node.put(data).unwrap();

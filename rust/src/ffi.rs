@@ -33,8 +33,18 @@ pub struct IrohOwnedBytes {
 pub struct IrohNodeConfig {
     /// Path to the blob store directory (required).
     pub storage_path: *const c_char,
-    /// Whether to use n0's public relay servers (default: true).
+    /// Whether to use relay servers (default: true).
     pub relay_enabled: bool,
+    /// Custom relay URL (null to use n0's public relays).
+    /// Must be a valid URL like "https://relay.example.com".
+    pub custom_relay_url: *const c_char,
+}
+
+/// Options for put/get operations.
+#[repr(C)]
+pub struct IrohOperationOptions {
+    /// Timeout in milliseconds (0 = no timeout).
+    pub timeout_ms: u64,
 }
 
 /// Opaque handle to an Iroh node.
@@ -155,6 +165,17 @@ pub struct IrohTicketValidateCallback {
     pub on_complete: extern "C" fn(userdata: *mut c_void, info: IrohTicketInfo),
 }
 
+/// Callback for node close operation.
+#[repr(C)]
+pub struct IrohCloseCallback {
+    /// Opaque pointer passed back to Swift.
+    pub userdata: *mut c_void,
+    /// Called when close completes successfully.
+    pub on_complete: extern "C" fn(userdata: *mut c_void),
+    /// Called if close fails with an error message.
+    pub on_failure: extern "C" fn(userdata: *mut c_void, error: *const c_char),
+}
+
 // ============================================================================
 // Node Lifecycle
 // ============================================================================
@@ -163,6 +184,7 @@ pub struct IrohTicketValidateCallback {
 ///
 /// # Safety
 /// - `config.storage_path` must be a valid null-terminated UTF-8 string
+/// - `config.custom_relay_url` must be null or a valid null-terminated UTF-8 string
 /// - `callback` must have valid function pointers
 #[unsafe(no_mangle)]
 pub extern "C" fn iroh_node_create(config: IrohNodeConfig, callback: IrohNodeCreateCallback) {
@@ -183,11 +205,26 @@ pub extern "C" fn iroh_node_create(config: IrohNodeConfig, callback: IrohNodeCre
         }
     };
 
+    // Parse optional custom relay URL
+    let custom_relay_url = if config.custom_relay_url.is_null() {
+        None
+    } else {
+        let url_str = unsafe { CStr::from_ptr(config.custom_relay_url) };
+        match url_str.to_str() {
+            Ok(s) => Some(s.to_string()),
+            Err(e) => {
+                let error = CString::new(format!("Invalid custom relay URL: {}", e)).unwrap();
+                (callback.on_failure)(callback.userdata, error.into_raw());
+                return;
+            }
+        }
+    };
+
     let relay_enabled = config.relay_enabled;
 
     // Create the node synchronously
     // Note: Swift should call this from a background thread/task
-    match IrohNode::new(storage_path, relay_enabled) {
+    match IrohNode::new(storage_path, relay_enabled, custom_relay_url) {
         Ok(node) => {
             // Box the node and convert to raw pointer
             let boxed = Box::new(node);
@@ -512,4 +549,132 @@ pub unsafe extern "C" fn iroh_validate_ticket(
     };
 
     (callback.on_complete)(callback.userdata, result);
+}
+
+// ============================================================================
+// Close and Timeout Operations
+// ============================================================================
+
+/// Explicitly close a node and free its resources asynchronously.
+///
+/// This is preferred over `iroh_node_destroy` when you need to await
+/// graceful shutdown completion.
+///
+/// # Safety
+/// - `handle` must be a valid pointer returned by `iroh_node_create`
+/// - `handle` must not be used after this call
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub extern "C" fn iroh_node_close(handle: *mut IrohNodeHandle, callback: IrohCloseCallback) {
+    if handle.is_null() {
+        (callback.on_complete)(callback.userdata);
+        return;
+    }
+
+    unsafe {
+        let node = Box::from_raw(handle as *mut IrohNode);
+        match node.shutdown() {
+            Ok(()) => (callback.on_complete)(callback.userdata),
+            Err(e) => {
+                let error = CString::new(format!("{:#}", e)).unwrap();
+                (callback.on_failure)(callback.userdata, error.into_raw());
+            }
+        }
+    }
+}
+
+/// Add bytes to the blob store with options (e.g., timeout).
+///
+/// # Safety
+/// - `handle` must be a valid node handle
+/// - `bytes.data` must point to valid memory for `bytes.len` bytes
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub extern "C" fn iroh_put_with_options(
+    handle: *const IrohNodeHandle,
+    bytes: IrohBytes,
+    options: IrohOperationOptions,
+    callback: IrohCallback,
+) {
+    if handle.is_null() {
+        let error = CString::new("handle cannot be null").unwrap();
+        (callback.on_failure)(callback.userdata, error.into_raw());
+        return;
+    }
+
+    // Copy the bytes to own them (Swift memory may not be stable)
+    let data = if bytes.data.is_null() || bytes.len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes.data, bytes.len).to_vec() }
+    };
+
+    let node = unsafe { &*(handle as *const IrohNode) };
+    let timeout_ms = options.timeout_ms;
+
+    match node.put_with_timeout(&data, timeout_ms) {
+        Ok(ticket) => {
+            let ticket_cstr = CString::new(ticket).unwrap();
+            (callback.on_success)(callback.userdata, ticket_cstr.into_raw());
+        }
+        Err(e) => {
+            let error = CString::new(format!("{:#}", e)).unwrap();
+            (callback.on_failure)(callback.userdata, error.into_raw());
+        }
+    }
+}
+
+/// Download bytes from a ticket with options (e.g., timeout).
+///
+/// # Safety
+/// - `handle` must be a valid node handle
+/// - `ticket` must be a valid null-terminated UTF-8 string
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_get_with_options(
+    handle: *const IrohNodeHandle,
+    ticket: *const c_char,
+    options: IrohOperationOptions,
+    callback: IrohGetCallback,
+) {
+    if handle.is_null() {
+        let error = CString::new("handle cannot be null").unwrap();
+        (callback.on_failure)(callback.userdata, error.into_raw());
+        return;
+    }
+
+    if ticket.is_null() {
+        let error = CString::new("ticket cannot be null").unwrap();
+        (callback.on_failure)(callback.userdata, error.into_raw());
+        return;
+    }
+
+    let ticket_str = match unsafe { CStr::from_ptr(ticket) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(e) => {
+            let error = CString::new(format!("Invalid ticket string: {}", e)).unwrap();
+            (callback.on_failure)(callback.userdata, error.into_raw());
+            return;
+        }
+    };
+
+    let node = unsafe { &*(handle as *const IrohNode) };
+    let timeout_ms = options.timeout_ms;
+
+    match node.get_with_timeout(&ticket_str, timeout_ms) {
+        Ok(bytes) => {
+            let mut vec = bytes;
+            let owned = IrohOwnedBytes {
+                data: vec.as_mut_ptr(),
+                len: vec.len(),
+                capacity: vec.capacity(),
+            };
+            std::mem::forget(vec);
+            (callback.on_success)(callback.userdata, owned);
+        }
+        Err(e) => {
+            let error = CString::new(format!("{:#}", e)).unwrap();
+            (callback.on_failure)(callback.userdata, error.into_raw());
+        }
+    }
 }
