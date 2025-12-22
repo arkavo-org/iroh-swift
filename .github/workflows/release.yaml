@@ -2,85 +2,200 @@ name: Release
 
 on:
   push:
-    tags:
-      - '[0-9]+.[0-9]+.[0-9]+*'
+    branches: [main]
+    paths:
+      - 'VERSION'
 
 env:
   MACOSX_DEPLOYMENT_TARGET: "26.0"
   IPHONEOS_DEPLOYMENT_TARGET: "26.0"
 
 jobs:
-  build:
+  release:
     runs-on: macos-26
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for release notes
+
+      - name: Get version and check if release exists
+        id: version
+        run: |
+          VERSION=$(cat VERSION | tr -d '\n')
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+          # Check if tag already exists
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "Tag $VERSION already exists, skipping release"
+            echo "SKIP=true" >> $GITHUB_OUTPUT
+          else
+            echo "SKIP=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate release notes
+        if: steps.version.outputs.SKIP != 'true'
+        id: notes
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+
+          # Get previous tag
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+          # Build release notes
+          {
+            echo "NOTES<<EOF"
+            echo "## IrohSwift $VERSION"
+            echo ""
+            echo "### What's Changed"
+            echo ""
+
+            if [ -n "$PREV_TAG" ]; then
+              # Categorize commits by conventional commit type
+              echo "#### Features"
+              git log ${PREV_TAG}..HEAD --pretty=format:"- %s" --grep="^feat" | head -20 || true
+              echo ""
+              echo ""
+              echo "#### Bug Fixes"
+              git log ${PREV_TAG}..HEAD --pretty=format:"- %s" --grep="^fix" | head -20 || true
+              echo ""
+              echo ""
+              echo "#### Other Changes"
+              git log ${PREV_TAG}..HEAD --pretty=format:"- %s" --grep="^chore\|^ci\|^docs\|^refactor\|^style\|^test" | head -20 || true
+              echo ""
+              echo ""
+              echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...$VERSION"
+            else
+              echo "Initial release"
+              git log --pretty=format:"- %s" | head -20 || true
+            fi
+            echo ""
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Create pre-release with tag
+        if: steps.version.outputs.SKIP != 'true'
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          gh release create "$VERSION" \
+            --title "IrohSwift $VERSION" \
+            --notes "🚧 Building release artifacts..." \
+            --prerelease
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust
+        if: steps.version.outputs.SKIP != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
 
       - name: Cache Rust
+        if: steps.version.outputs.SKIP != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
 
       - name: Install cbindgen
+        if: steps.version.outputs.SKIP != 'true'
         run: cargo install cbindgen
 
       - name: Build XCFramework
+        if: steps.version.outputs.SKIP != 'true'
         run: ./scripts/build-xcframework.sh
 
       - name: Run tests
+        if: steps.version.outputs.SKIP != 'true'
         run: swift test
+        env:
+          IROH_LOCAL_DEV: "1"
 
       - name: Create release archive
+        if: steps.version.outputs.SKIP != 'true'
+        id: archive
         run: |
           zip -r IrohSwiftFFI.xcframework.zip IrohSwiftFFI.xcframework
-          echo "CHECKSUM=$(shasum -a 256 IrohSwiftFFI.xcframework.zip | cut -d ' ' -f 1)" >> $GITHUB_ENV
+          CHECKSUM=$(shasum -a 256 IrohSwiftFFI.xcframework.zip | cut -d ' ' -f 1)
+          echo "CHECKSUM=$CHECKSUM" >> $GITHUB_OUTPUT
 
-      - name: Verify tag matches VERSION file
+      - name: Upload artifact to pre-release
+        if: steps.version.outputs.SKIP != 'true'
         run: |
-          TAG_VERSION="${GITHUB_REF#refs/tags/}"
-          FILE_VERSION=$(cat VERSION | tr -d '\n')
-
-          if [ "$TAG_VERSION" != "$FILE_VERSION" ]; then
-            echo "::error::Tag $TAG_VERSION does not match VERSION file ($FILE_VERSION)"
-            exit 1
-          fi
-          echo "Tag matches VERSION file: $TAG_VERSION"
-
-      - name: Get version
-        id: version
-        run: echo "VERSION=$(cat VERSION | tr -d '\n')" >> $GITHUB_OUTPUT
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: IrohSwiftFFI.xcframework.zip
-          body: |
-            ## IrohSwift ${{ steps.version.outputs.VERSION }}
-
-            ### Installation
-
-            Add to your `Package.swift`:
-            ```swift
-            .package(url: "https://github.com/arkavo-org/iroh-swift.git", from: "${{ steps.version.outputs.VERSION }}")
-            ```
-
-            ### Checksum
-            ```
-            ${{ env.CHECKSUM }}
-            ```
-
-            ### What's Changed
-            See [CHANGELOG](https://github.com/arkavo-org/iroh-swift/blob/main/CHANGELOG.md) for details.
-          generate_release_notes: true
+          VERSION=${{ steps.version.outputs.VERSION }}
+          gh release upload "$VERSION" IrohSwiftFFI.xcframework.zip --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update Package.swift checksum
+      - name: Smoke test - verify artifact download
+        if: steps.version.outputs.SKIP != 'true'
         run: |
-          sed -i '' "s/CHECKSUM_PLACEHOLDER/${{ env.CHECKSUM }}/" Package.swift
-          echo "Updated Package.swift with checksum: ${{ env.CHECKSUM }}"
-          cat Package.swift | grep checksum
+          VERSION=${{ steps.version.outputs.VERSION }}
+          CHECKSUM=${{ steps.archive.outputs.CHECKSUM }}
+
+          # Download and verify the uploaded artifact
+          mkdir -p smoke-test && cd smoke-test
+          curl -L -o test.zip "https://github.com/${{ github.repository }}/releases/download/${VERSION}/IrohSwiftFFI.xcframework.zip"
+
+          # Verify checksum
+          DOWNLOADED_CHECKSUM=$(shasum -a 256 test.zip | cut -d ' ' -f 1)
+          if [ "$CHECKSUM" != "$DOWNLOADED_CHECKSUM" ]; then
+            echo "::error::Checksum mismatch! Expected $CHECKSUM, got $DOWNLOADED_CHECKSUM"
+            exit 1
+          fi
+          echo "✓ Artifact checksum verified"
+
+          # Verify zip contents
+          unzip -t test.zip
+          echo "✓ Artifact is a valid zip"
+
+          # Verify XCFramework structure
+          unzip -q test.zip
+          if [ ! -f "IrohSwiftFFI.xcframework/Info.plist" ]; then
+            echo "::error::Invalid XCFramework structure"
+            exit 1
+          fi
+          echo "✓ XCFramework structure verified"
+
+      - name: Promote to full release
+        if: steps.version.outputs.SKIP != 'true'
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          CHECKSUM=${{ steps.archive.outputs.CHECKSUM }}
+
+          # Update release with full notes and remove pre-release flag
+          gh release edit "$VERSION" \
+            --prerelease=false \
+            --notes "$(cat <<'EOF'
+          ${{ steps.notes.outputs.NOTES }}
+
+          ### Installation
+
+          Add to your `Package.swift`:
+          ```swift
+          .package(url: "https://github.com/${{ github.repository }}.git", from: "${{ steps.version.outputs.VERSION }}")
+          ```
+
+          ### Checksum
+          ```
+          ${{ steps.archive.outputs.CHECKSUM }}
+          ```
+          EOF
+          )"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Package.swift with checksum
+        if: steps.version.outputs.SKIP != 'true'
+        run: |
+          CHECKSUM=${{ steps.archive.outputs.CHECKSUM }}
+          sed -i '' "s/CHECKSUM_PLACEHOLDER/$CHECKSUM/" Package.swift
+
+          # Commit and push the checksum update
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Package.swift
+          git commit -m "chore: update checksum for ${{ steps.version.outputs.VERSION }} [skip ci]"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
