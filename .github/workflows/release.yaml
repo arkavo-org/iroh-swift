@@ -159,31 +159,31 @@ jobs:
 
       - name: Promote to full release
         if: steps.version.outputs.SKIP != 'true'
-        run: |
-          VERSION=${{ steps.version.outputs.VERSION }}
-          CHECKSUM=${{ steps.archive.outputs.CHECKSUM }}
-
-          # Update release with full notes and remove pre-release flag
-          gh release edit "$VERSION" \
-            --prerelease=false \
-            --notes "$(cat <<'EOF'
-          ${{ steps.notes.outputs.NOTES }}
-
-          ### Installation
-
-          Add to your `Package.swift`:
-          ```swift
-          .package(url: "https://github.com/${{ github.repository }}.git", from: "${{ steps.version.outputs.VERSION }}")
-          ```
-
-          ### Checksum
-          ```
-          ${{ steps.archive.outputs.CHECKSUM }}
-          ```
-          EOF
-          )"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NOTES: ${{ steps.notes.outputs.NOTES }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+          CHECKSUM: ${{ steps.archive.outputs.CHECKSUM }}
+        run: |
+          # Build release notes file
+          {
+            echo "$NOTES"
+            echo ""
+            echo "### Installation"
+            echo ""
+            echo 'Add to your `Package.swift`:'
+            echo '```swift'
+            echo ".package(url: \"https://github.com/${{ github.repository }}.git\", from: \"${VERSION}\")"
+            echo '```'
+            echo ""
+            echo "### Checksum"
+            echo '```'
+            echo "${CHECKSUM}"
+            echo '```'
+          } > /tmp/release-notes.md
+
+          # Update release with full notes and remove pre-release flag
+          gh release edit "$VERSION" --prerelease=false --notes-file /tmp/release-notes.md
 
       - name: Update Package.swift with checksum
         if: steps.version.outputs.SKIP != 'true'

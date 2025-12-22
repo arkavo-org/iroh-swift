@@ -2,7 +2,7 @@
 import PackageDescription
 import Foundation
 
-let version = "0.2.1"
+let version = "0.2.2"
 
 // Checksum is updated by release automation (scripts/release.sh)
 let checksum = "CHECKSUM_PLACEHOLDER"
