@@ -57,9 +57,10 @@ Swift Layer (IrohSwift)           Rust FFI Layer                Iroh Libraries
 
 ## Version Management
 
-Version must be synchronized across three files:
+Version must be synchronized across these files:
 - `VERSION` (source of truth)
 - `rust/Cargo.toml` (package.version)
+- `rust/Cargo.lock` (run `cd rust && cargo update` after updating Cargo.toml)
 - `Package.swift` (binaryTarget checksum, updated by CI on release)
 
 ## Platform Targets
