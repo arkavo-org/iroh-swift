@@ -11,12 +11,15 @@ extension IrohNode {
     ///   - ticket: The ticket string obtained from another node's `put` call.
     ///   - onProgress: Called with progress updates during the download.
     /// - Returns: The downloaded data.
-    /// - Throws: `IrohError.getFailed` if the download fails.
+    /// - Throws: `IrohError.nodeClosed` if the node is closed,
+    ///           `IrohError.getFailed` if the download fails.
     public func get(
         ticket: String,
         onProgress: @escaping ProgressHandler
     ) async throws -> Data {
-        try await withCheckedThrowingContinuation { continuation in
+        try ensureNotClosed()
+        try Task.checkCancellation()
+        return try await withCheckedThrowingContinuation { continuation in
             ticket.withCString { ticketPtr in
                 let context = ProgressContext(
                     continuation: continuation,

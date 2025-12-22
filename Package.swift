@@ -1,9 +1,28 @@
 // swift-tools-version: 6.2
 import PackageDescription
+import Foundation
 
-let version = "0.1.0"
-// Checksum is updated by release automation
+let version = "0.2.0"
+
+// Checksum is updated by release automation (scripts/release.sh)
 let checksum = "CHECKSUM_PLACEHOLDER"
+
+// Check if using local development mode
+// Set IROH_LOCAL_DEV=1 environment variable to use local XCFramework
+let useLocalBinary = ProcessInfo.processInfo.environment["IROH_LOCAL_DEV"] != nil
+    || !FileManager.default.fileExists(atPath: "Package.swift")  // Always local when cloned
+
+// Binary target configuration
+let binaryTarget: Target = useLocalBinary
+    ? .binaryTarget(
+        name: "IrohSwiftFFI",
+        path: "IrohSwiftFFI.xcframework"
+    )
+    : .binaryTarget(
+        name: "IrohSwiftFFI",
+        url: "https://github.com/arkavo-org/iroh-swift/releases/download/v\(version)/IrohSwiftFFI.xcframework.zip",
+        checksum: checksum
+    )
 
 let package = Package(
     name: "IrohSwift",
@@ -22,12 +41,7 @@ let package = Package(
         ),
     ],
     targets: [
-        // For local development, use the local XCFramework
-        // For releases, this will be replaced with a URL-based binary target
-        .binaryTarget(
-            name: "IrohSwiftFFI",
-            path: "IrohSwiftFFI.xcframework"
-        ),
+        binaryTarget,
         .target(
             name: "IrohSwift",
             dependencies: ["IrohSwiftFFI"],

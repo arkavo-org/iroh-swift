@@ -19,9 +19,14 @@ typedef struct IrohNodeConfig {
      */
     const char *storage_path;
     /**
-     * Whether to use n0's public relay servers (default: true).
+     * Whether to use relay servers (default: true).
      */
     bool relay_enabled;
+    /**
+     * Custom relay URL (null to use n0's public relays).
+     * Must be a valid URL like "https://relay.example.com".
+     */
+    const char *custom_relay_url;
 } IrohNodeConfig;
 
 /**
@@ -220,10 +225,39 @@ typedef struct IrohTicketValidateCallback {
 } IrohTicketValidateCallback;
 
 /**
+ * Callback for node close operation.
+ */
+typedef struct IrohCloseCallback {
+    /**
+     * Opaque pointer passed back to Swift.
+     */
+    void *userdata;
+    /**
+     * Called when close completes successfully.
+     */
+    void (*on_complete)(void *userdata);
+    /**
+     * Called if close fails with an error message.
+     */
+    void (*on_failure)(void *userdata, const char *error);
+} IrohCloseCallback;
+
+/**
+ * Options for put/get operations.
+ */
+typedef struct IrohOperationOptions {
+    /**
+     * Timeout in milliseconds (0 = no timeout).
+     */
+    uint64_t timeout_ms;
+} IrohOperationOptions;
+
+/**
  * Create a new Iroh node asynchronously.
  *
  * # Safety
  * - `config.storage_path` must be a valid null-terminated UTF-8 string
+ * - `config.custom_relay_url` must be null or a valid null-terminated UTF-8 string
  * - `callback` must have valid function pointers
  */
 void iroh_node_create(struct IrohNodeConfig config, struct IrohNodeCreateCallback callback);
@@ -312,5 +346,44 @@ void iroh_node_info(const struct IrohNodeHandle *handle, struct IrohNodeInfoCall
  * - `callback` must have valid function pointers
  */
 void iroh_validate_ticket(const char *ticket, struct IrohTicketValidateCallback callback);
+
+/**
+ * Explicitly close a node and free its resources asynchronously.
+ *
+ * This is preferred over `iroh_node_destroy` when you need to await
+ * graceful shutdown completion.
+ *
+ * # Safety
+ * - `handle` must be a valid pointer returned by `iroh_node_create`
+ * - `handle` must not be used after this call
+ * - `callback` must have valid function pointers
+ */
+void iroh_node_close(struct IrohNodeHandle *handle, struct IrohCloseCallback callback);
+
+/**
+ * Add bytes to the blob store with options (e.g., timeout).
+ *
+ * # Safety
+ * - `handle` must be a valid node handle
+ * - `bytes.data` must point to valid memory for `bytes.len` bytes
+ * - `callback` must have valid function pointers
+ */
+void iroh_put_with_options(const struct IrohNodeHandle *handle,
+                           struct IrohBytes bytes,
+                           struct IrohOperationOptions options,
+                           struct IrohCallback callback);
+
+/**
+ * Download bytes from a ticket with options (e.g., timeout).
+ *
+ * # Safety
+ * - `handle` must be a valid node handle
+ * - `ticket` must be a valid null-terminated UTF-8 string
+ * - `callback` must have valid function pointers
+ */
+void iroh_get_with_options(const struct IrohNodeHandle *handle,
+                           const char *ticket,
+                           struct IrohOperationOptions options,
+                           struct IrohGetCallback callback);
 
 #endif  /* IROH_SWIFT_H */
