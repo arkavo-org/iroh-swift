@@ -2,7 +2,7 @@
 import PackageDescription
 import Foundation
 
-let version = "0.2.0"
+let version = "0.2.1"
 
 // Checksum is updated by release automation (scripts/release.sh)
 let checksum = "CHECKSUM_PLACEHOLDER"
@@ -20,7 +20,7 @@ let binaryTarget: Target = useLocalBinary
     )
     : .binaryTarget(
         name: "IrohSwiftFFI",
-        url: "https://github.com/arkavo-org/iroh-swift/releases/download/v\(version)/IrohSwiftFFI.xcframework.zip",
+        url: "https://github.com/arkavo-org/iroh-swift/releases/download/\(version)/IrohSwiftFFI.xcframework.zip",
         checksum: checksum
     )
 

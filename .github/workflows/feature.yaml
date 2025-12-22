@@ -1,8 +1,6 @@
 name: Feature CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
 
@@ -94,9 +92,13 @@ jobs:
 
       - name: Build Swift package
         run: swift build
+        env:
+          IROH_LOCAL_DEV: "1"
 
       - name: Run tests
         run: swift test
+        env:
+          IROH_LOCAL_DEV: "1"
 
   rust-check:
     runs-on: macos-26
