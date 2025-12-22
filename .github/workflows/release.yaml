@@ -151,12 +151,10 @@ jobs:
         run: |
           VERSION=${{ steps.version.outputs.VERSION }}
 
-          # Delete remote tag
-          git push origin --delete "$VERSION"
-
-          # Create new tag on current commit (with checksum)
+          # Force-update tag to point to current commit (with checksum)
+          # This preserves the release association
           git tag -f "$VERSION"
-          git push origin "$VERSION"
+          git push origin "$VERSION" --force
 
           echo "Tag $VERSION now points to $(git rev-parse HEAD)"
         env:
