@@ -4,8 +4,8 @@ import Foundation
 
 let version = "0.2.1"
 
-// Checksum is updated by release automation (scripts/release.sh)
-let checksum = "CHECKSUM_PLACEHOLDER"
+// Checksum is updated by release automation
+let checksum = "d9eb7c54c0269fdb4dd830225eb266ec86b0ee4b88f055041984c0f75c7760b6"
 
 // Check if using local development mode
 // Set IROH_LOCAL_DEV=1 environment variable to use local XCFramework
