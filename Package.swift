@@ -2,15 +2,16 @@
 import PackageDescription
 import Foundation
 
-let version = "0.2.4"
+let version = "0.2.5"
 
 // Checksum is updated by release automation
 let checksum = "6a03af5ecbaf6d8e7dd4f122461d79d4b216a531136b6327c9210ef490134563"
 
 // Check if using local development mode
 // Set IROH_LOCAL_DEV=1 environment variable to use local XCFramework
+// Use local binary if XCFramework exists (local dev) or env var is set
 let useLocalBinary = ProcessInfo.processInfo.environment["IROH_LOCAL_DEV"] != nil
-    || !FileManager.default.fileExists(atPath: "Package.swift")  // Always local when cloned
+    || FileManager.default.fileExists(atPath: "IrohSwiftFFI.xcframework")
 
 // Binary target configuration
 let binaryTarget: Target = useLocalBinary
