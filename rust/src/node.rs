@@ -117,8 +117,7 @@ impl IrohNode {
             };
 
             // Build router with all protocols
-            let mut router_builder = Router::builder(endpoint.clone())
-                .accept(BLOBS_ALPN, blobs);
+            let mut router_builder = Router::builder(endpoint.clone()).accept(BLOBS_ALPN, blobs);
 
             if let Some(ref g) = gossip {
                 router_builder = router_builder.accept(GOSSIP_ALPN, g.clone());

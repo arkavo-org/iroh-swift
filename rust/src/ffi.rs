@@ -325,7 +325,8 @@ pub struct IrohAuthorCreateCallback {
     /// Opaque pointer passed back to Swift.
     pub userdata: *mut c_void,
     /// Called on success with the author secret and ID.
-    pub on_success: extern "C" fn(userdata: *mut c_void, secret: IrohAuthorSecret, id: IrohAuthorId),
+    pub on_success:
+        extern "C" fn(userdata: *mut c_void, secret: IrohAuthorSecret, id: IrohAuthorId),
     /// Called on failure with an error message (caller must free with `iroh_string_free`).
     pub on_failure: extern "C" fn(userdata: *mut c_void, error: *const c_char),
 }
@@ -336,7 +337,11 @@ pub struct IrohDocCreateCallback {
     /// Opaque pointer passed back to Swift.
     pub userdata: *mut c_void,
     /// Called on success with the document handle and namespace ID.
-    pub on_success: extern "C" fn(userdata: *mut c_void, handle: *mut IrohDocHandle, namespace_id: *const c_char),
+    pub on_success: extern "C" fn(
+        userdata: *mut c_void,
+        handle: *mut IrohDocHandle,
+        namespace_id: *const c_char,
+    ),
     /// Called on failure with an error message (caller must free with `iroh_string_free`).
     pub on_failure: extern "C" fn(userdata: *mut c_void, error: *const c_char),
 }
@@ -990,8 +995,11 @@ pub unsafe extern "C" fn iroh_author_from_hex(
             arr
         }
         Ok(bytes) => {
-            let error =
-                CString::new(format!("Invalid secret length: expected 32 bytes, got {}", bytes.len())).unwrap();
+            let error = CString::new(format!(
+                "Invalid secret length: expected 32 bytes, got {}",
+                bytes.len()
+            ))
+            .unwrap();
             (callback.on_failure)(callback.userdata, error.into_raw());
             return;
         }
@@ -1092,10 +1100,7 @@ pub extern "C" fn iroh_author_import(
 /// - `handle` must be a valid node handle with docs enabled
 /// - `callback` must have valid function pointers
 #[unsafe(no_mangle)]
-pub extern "C" fn iroh_doc_create(
-    handle: *const IrohNodeHandle,
-    callback: IrohDocCreateCallback,
-) {
+pub extern "C" fn iroh_doc_create(handle: *const IrohNodeHandle, callback: IrohDocCreateCallback) {
     if handle.is_null() {
         let error = CString::new("handle cannot be null").unwrap();
         (callback.on_failure)(callback.userdata, error.into_raw());
@@ -1249,9 +1254,12 @@ pub extern "C" fn iroh_doc_set(
 
     // set_bytes takes author_id (AuthorId), not Author
     let author_id = author.id();
-    match node.runtime().block_on(wrapper.doc.set_bytes(author_id, key_bytes, value_bytes)) {
+    match node
+        .runtime()
+        .block_on(wrapper.doc.set_bytes(author_id, key_bytes, value_bytes))
+    {
         Ok(hash) => {
-            let hash: iroh_blobs::Hash = hash;  // type annotation
+            let hash: iroh_blobs::Hash = hash; // type annotation
             let hash_str = CString::new(hash.to_string()).unwrap().into_raw();
             (callback.on_success)(callback.userdata, hash_str);
         }
@@ -1410,7 +1418,10 @@ pub extern "C" fn iroh_doc_del(
         unsafe { std::slice::from_raw_parts(key.data, key.len).to_vec() }
     };
 
-    match node.runtime().block_on(wrapper.doc.del(author_id, key_bytes)) {
+    match node
+        .runtime()
+        .block_on(wrapper.doc.del(author_id, key_bytes))
+    {
         Ok(count) => {
             (callback.on_success)(callback.userdata, count as u64);
         }
@@ -1510,7 +1521,11 @@ pub extern "C" fn iroh_doc_share(
         IrohDocShareMode::Write => ShareMode::Write,
     };
 
-    match node.runtime().block_on(wrapper.doc.share(share_mode, AddrInfoOptions::RelayAndAddresses)) {
+    match node.runtime().block_on(
+        wrapper
+            .doc
+            .share(share_mode, AddrInfoOptions::RelayAndAddresses),
+    ) {
         Ok(ticket) => {
             let ticket_str = CString::new(ticket.to_string()).unwrap().into_raw();
             (callback.on_success)(callback.userdata, ticket_str);
@@ -1554,7 +1569,11 @@ pub extern "C" fn iroh_doc_entry_free(entry: *mut IrohDocEntry) {
         let entry = Box::from_raw(entry);
         // Free the key bytes
         if !entry.key.data.is_null() {
-            drop(Vec::from_raw_parts(entry.key.data, entry.key.len, entry.key.capacity));
+            drop(Vec::from_raw_parts(
+                entry.key.data,
+                entry.key.len,
+                entry.key.capacity,
+            ));
         }
         // Free the content hash string
         if !entry.content_hash.is_null() {
@@ -1585,7 +1604,9 @@ fn convert_entry_to_ffi(entry: &iroh_docs::Entry) -> IrohDocEntry {
     };
 
     // Get content hash as string
-    let hash_str = CString::new(entry.content_hash().to_string()).unwrap().into_raw();
+    let hash_str = CString::new(entry.content_hash().to_string())
+        .unwrap()
+        .into_raw();
 
     IrohDocEntry {
         author_id,
@@ -1774,14 +1795,12 @@ fn convert_live_event_to_ffi(event: &iroh_docs::engine::LiveEvent) -> IrohDocEve
                 content_hash: hash_str,
             }
         }
-        LiveEvent::PendingContentReady => {
-            IrohDocEvent {
-                event_type: IrohDocEventType::PendingContentReady,
-                entry: std::ptr::null(),
-                peer_id: std::ptr::null(),
-                content_hash: std::ptr::null(),
-            }
-        }
+        LiveEvent::PendingContentReady => IrohDocEvent {
+            event_type: IrohDocEventType::PendingContentReady,
+            entry: std::ptr::null(),
+            peer_id: std::ptr::null(),
+            content_hash: std::ptr::null(),
+        },
         LiveEvent::NeighborUp(peer) => {
             let peer_id = CString::new(peer.to_string()).unwrap().into_raw();
             IrohDocEvent {
@@ -1801,7 +1820,9 @@ fn convert_live_event_to_ffi(event: &iroh_docs::engine::LiveEvent) -> IrohDocEve
             }
         }
         LiveEvent::SyncFinished(sync_event) => {
-            let peer_id = CString::new(sync_event.peer.to_string()).unwrap().into_raw();
+            let peer_id = CString::new(sync_event.peer.to_string())
+                .unwrap()
+                .into_raw();
             IrohDocEvent {
                 event_type: IrohDocEventType::SyncFinished,
                 entry: std::ptr::null(),
@@ -1892,7 +1913,10 @@ pub extern "C" fn iroh_blob_tag_set(
     let node = unsafe { &*(handle as *const IrohNode) };
 
     // Use the store's tags API (FsStore derefs to Store which has tags())
-    match node.runtime().block_on(node.store().tags().set(tag_name_str, hash_and_format)) {
+    match node
+        .runtime()
+        .block_on(node.store().tags().set(tag_name_str, hash_and_format))
+    {
         Ok(()) => {
             (callback.on_complete)(callback.userdata);
         }
