@@ -11,6 +11,68 @@
 #include <stdlib.h>
 
 /**
+ * Share mode for document tickets.
+ */
+typedef enum IrohDocShareMode {
+    /**
+     * Read-only access.
+     */
+    Read = 0,
+    /**
+     * Read and write access.
+     */
+    Write = 1,
+} IrohDocShareMode;
+
+/**
+ * Document event types.
+ */
+typedef enum IrohDocEventType {
+    /**
+     * A local insertion.
+     */
+    InsertLocal = 0,
+    /**
+     * Received a remote insert.
+     */
+    InsertRemote = 1,
+    /**
+     * Content is now available locally.
+     */
+    ContentReady = 2,
+    /**
+     * All pending content is ready.
+     */
+    PendingContentReady = 3,
+    /**
+     * A new neighbor joined the swarm.
+     */
+    NeighborUp = 4,
+    /**
+     * A neighbor left the swarm.
+     */
+    NeighborDown = 5,
+    /**
+     * Sync finished with a peer.
+     */
+    SyncFinished = 6,
+} IrohDocEventType;
+
+/**
+ * Blob format for tickets and tags.
+ */
+typedef enum IrohBlobFormat {
+    /**
+     * Raw single blob.
+     */
+    Raw = 0,
+    /**
+     * Hash sequence (collection of blobs).
+     */
+    HashSeq = 1,
+} IrohBlobFormat;
+
+/**
  * Configuration for creating a node.
  */
 typedef struct IrohNodeConfig {
@@ -27,6 +89,11 @@ typedef struct IrohNodeConfig {
      * Must be a valid URL like "https://relay.example.com".
      */
     const char *custom_relay_url;
+    /**
+     * Whether to enable the Docs engine (default: false).
+     * When enabled, the node can create, join, and sync documents.
+     */
+    bool docs_enabled;
 } IrohNodeConfig;
 
 /**
@@ -253,6 +320,233 @@ typedef struct IrohOperationOptions {
 } IrohOperationOptions;
 
 /**
+ * Author secret key (32 bytes).
+ *
+ * This is the private key material used for signing document entries.
+ * Must be kept secure (e.g., in iOS Keychain).
+ */
+typedef struct IrohAuthorSecret {
+    uint8_t bytes[32];
+} IrohAuthorSecret;
+
+/**
+ * Author public ID (32 bytes).
+ *
+ * This is the public identifier derived from the secret key.
+ * Safe to share and store openly.
+ */
+typedef struct IrohAuthorId {
+    uint8_t bytes[32];
+} IrohAuthorId;
+
+/**
+ * Callback for author creation.
+ */
+typedef struct IrohAuthorCreateCallback {
+    /**
+     * Opaque pointer passed back to Swift.
+     */
+    void *userdata;
+    /**
+     * Called on success with the author secret and ID.
+     */
+    void (*on_success)(void *userdata, struct IrohAuthorSecret secret, struct IrohAuthorId id);
+    /**
+     * Called on failure with an error message (caller must free with `iroh_string_free`).
+     */
+    void (*on_failure)(void *userdata, const char *error);
+} IrohAuthorCreateCallback;
+
+/**
+ * Opaque handle to an Iroh document.
+ *
+ * Documents are syncing key-value stores shared between peers.
+ * The handle wraps a Doc from iroh-docs.
+ */
+typedef struct IrohDocHandle {
+    uint8_t _private[0];
+} IrohDocHandle;
+
+/**
+ * Callback for document creation/join operations.
+ */
+typedef struct IrohDocCreateCallback {
+    /**
+     * Opaque pointer passed back to Swift.
+     */
+    void *userdata;
+    /**
+     * Called on success with the document handle and namespace ID.
+     */
+    void (*on_success)(void *userdata, struct IrohDocHandle *handle, const char *namespace_id);
+    /**
+     * Called on failure with an error message (caller must free with `iroh_string_free`).
+     */
+    void (*on_failure)(void *userdata, const char *error);
+} IrohDocCreateCallback;
+
+/**
+ * Callback for document set operations.
+ */
+typedef struct IrohDocSetCallback {
+    /**
+     * Opaque pointer passed back to Swift.
+     */
+    void *userdata;
+    /**
+     * Called on success with the content hash (caller must free with `iroh_string_free`).
+     */
+    void (*on_success)(void *userdata, const char *hash);
+    /**
+     * Called on failure with an error message.
+     */
+    void (*on_failure)(void *userdata, const char *error);
+} IrohDocSetCallback;
+
+/**
+ * A document entry (key-value pair with metadata).
+ */
+typedef struct IrohDocEntry {
+    /**
+     * Author ID who wrote this entry (32 bytes).
+     */
+    struct IrohAuthorId author_id;
+    /**
+     * Key bytes (owned, must be freed).
+     */
+    struct IrohOwnedBytes key;
+    /**
+     * Content hash as hex string (must be freed with `iroh_string_free`).
+     */
+    char *content_hash;
+    /**
+     * Size of the content in bytes.
+     */
+    uint64_t content_size;
+    /**
+     * Timestamp when entry was created (microseconds since epoch).
+     */
+    uint64_t timestamp;
+} IrohDocEntry;
+
+/**
+ * Callback for document get operations.
+ */
+typedef struct IrohDocGetCallback {
+    /**
+     * Opaque pointer passed back to Swift.
+     */
+    void *userdata;
+    /**
+     * Called on success with the entry (may be null if not found).
+     * Caller must free entry with `iroh_doc_entry_free` if not null.
+     */
+    void (*on_success)(void *userdata, const struct IrohDocEntry *entry);
+    /**
+     * Called on failure with an error message.
+     */
+    void (*on_failure)(void *userdata, const char *error);
+} IrohDocGetCallback;
+
+/**
+ * Streaming callback for get_many (prefix queries).
+ * Called multiple times - once per entry, then on_complete.
+ */
+typedef struct IrohDocGetManyCallback {
+    /**
+     * Opaque pointer passed back to Swift.
+     */
+    void *userdata;
+    /**
+     * Called for each entry found. Entry must be freed with `iroh_doc_entry_free`.
+     */
+    void (*on_entry)(void *userdata, const struct IrohDocEntry *entry);
+    /**
+     * Called when iteration completes successfully.
+     */
+    void (*on_complete)(void *userdata);
+    /**
+     * Called on error. No more callbacks after this.
+     */
+    void (*on_failure)(void *userdata, const char *error);
+} IrohDocGetManyCallback;
+
+/**
+ * Callback for document delete operations.
+ */
+typedef struct IrohDocDelCallback {
+    /**
+     * Opaque pointer passed back to Swift.
+     */
+    void *userdata;
+    /**
+     * Called on success with count of deleted entries.
+     */
+    void (*on_success)(void *userdata, uint64_t deleted_count);
+    /**
+     * Called on failure with an error message.
+     */
+    void (*on_failure)(void *userdata, const char *error);
+} IrohDocDelCallback;
+
+/**
+ * Opaque handle to a document subscription.
+ *
+ * Used to cancel an active subscription.
+ */
+typedef struct IrohSubscriptionHandle {
+    uint8_t _private[0];
+} IrohSubscriptionHandle;
+
+/**
+ * A document event from subscription.
+ */
+typedef struct IrohDocEvent {
+    /**
+     * The type of event.
+     */
+    enum IrohDocEventType event_type;
+    /**
+     * The entry for insert events (null for other events).
+     * Must be freed with `iroh_doc_entry_free` if not null.
+     */
+    const struct IrohDocEntry *entry;
+    /**
+     * The peer ID for remote events (null for local events).
+     * Must be freed with `iroh_string_free` if not null.
+     */
+    const char *peer_id;
+    /**
+     * The content hash for ContentReady events (null for other events).
+     * Must be freed with `iroh_string_free` if not null.
+     */
+    const char *content_hash;
+} IrohDocEvent;
+
+/**
+ * Streaming callback for document subscriptions.
+ * Called multiple times - once per event, then on_complete when stream ends.
+ */
+typedef struct IrohDocSubscribeCallback {
+    /**
+     * Opaque pointer passed back to Swift.
+     */
+    void *userdata;
+    /**
+     * Called for each event. Event must be freed with `iroh_doc_event_free`.
+     */
+    void (*on_event)(void *userdata, struct IrohDocEvent event);
+    /**
+     * Called when subscription ends normally.
+     */
+    void (*on_complete)(void *userdata);
+    /**
+     * Called on error. No more callbacks after this.
+     */
+    void (*on_failure)(void *userdata, const char *error);
+} IrohDocSubscribeCallback;
+
+/**
  * Create a new Iroh node asynchronously.
  *
  * # Safety
@@ -385,5 +679,257 @@ void iroh_get_with_options(const struct IrohNodeHandle *handle,
                            const char *ticket,
                            struct IrohOperationOptions options,
                            struct IrohGetCallback callback);
+
+/**
+ * Create a new random author keypair.
+ *
+ * The secret key should be stored securely (e.g., in iOS Keychain).
+ * The ID is derived from the secret and can be stored openly.
+ *
+ * # Safety
+ * - `callback` must have valid function pointers
+ */
+void iroh_author_create(struct IrohAuthorCreateCallback callback);
+
+/**
+ * Get the author ID from a secret key.
+ *
+ * This is a pure computation - no node required.
+ * Useful for deriving the ID after loading secret from Keychain.
+ *
+ * # Safety
+ * - `secret` must contain valid author secret bytes
+ */
+struct IrohAuthorId iroh_author_id_from_secret(struct IrohAuthorSecret secret);
+
+/**
+ * Import an author from a hex-encoded secret key.
+ *
+ * Useful for debugging or cross-device sync.
+ *
+ * # Safety
+ * - `secret_hex` must be a valid null-terminated UTF-8 string containing 64 hex chars
+ * - `callback` must have valid function pointers
+ */
+void iroh_author_from_hex(const char *secretHex, struct IrohAuthorCreateCallback callback);
+
+/**
+ * Export an author secret as a hex string.
+ *
+ * Useful for debugging or backup.
+ *
+ * # Safety
+ * - The returned string must be freed with `iroh_string_free`
+ */
+char *iroh_author_secret_to_hex(struct IrohAuthorSecret secret);
+
+/**
+ * Export an author ID as a hex string.
+ *
+ * # Safety
+ * - The returned string must be freed with `iroh_string_free`
+ */
+char *iroh_author_id_to_hex(struct IrohAuthorId id);
+
+/**
+ * Import an author into the docs engine.
+ *
+ * This must be called before using an author to sign document entries.
+ * The author is registered with the docs engine so it can sign entries.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle with docs enabled
+ * - `callback` must have valid function pointers
+ */
+void iroh_author_import(const struct IrohNodeHandle *handle,
+                        struct IrohAuthorSecret authorSecret,
+                        struct IrohCloseCallback callback);
+
+/**
+ * Create a new document.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle with docs enabled
+ * - `callback` must have valid function pointers
+ */
+void iroh_doc_create(const struct IrohNodeHandle *handle, struct IrohDocCreateCallback callback);
+
+/**
+ * Join an existing document via ticket.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle with docs enabled
+ * - `ticket` must be a valid null-terminated UTF-8 string
+ * - `callback` must have valid function pointers
+ */
+void iroh_doc_join(const struct IrohNodeHandle *handle,
+                   const char *ticket,
+                   struct IrohDocCreateCallback callback);
+
+/**
+ * Set a key-value pair in a document.
+ *
+ * # Safety
+ * - `doc_handle` must be a valid document handle
+ * - `key.data` must point to valid memory for `key.len` bytes
+ * - `value.data` must point to valid memory for `value.len` bytes
+ * - `callback` must have valid function pointers
+ */
+void iroh_doc_set(const struct IrohDocHandle *docHandle,
+                  struct IrohAuthorSecret authorSecret,
+                  struct IrohBytes key,
+                  struct IrohBytes value,
+                  struct IrohDocSetCallback callback);
+
+/**
+ * Get the latest entry for a key.
+ *
+ * # Safety
+ * - `doc_handle` must be a valid document handle
+ * - `key.data` must point to valid memory for `key.len` bytes
+ * - `callback` must have valid function pointers
+ */
+void iroh_doc_get(const struct IrohDocHandle *docHandle,
+                  struct IrohBytes key,
+                  struct IrohDocGetCallback callback);
+
+/**
+ * Get entries by key prefix.
+ *
+ * This streams entries back via the callback - on_entry is called for each
+ * entry, then on_complete when done.
+ *
+ * # Safety
+ * - `doc_handle` must be a valid document handle
+ * - `prefix.data` must point to valid memory for `prefix.len` bytes
+ * - `callback` must have valid function pointers
+ */
+void iroh_doc_get_many(const struct IrohDocHandle *docHandle,
+                       struct IrohBytes prefix,
+                       struct IrohDocGetManyCallback callback);
+
+/**
+ * Delete an entry (creates a tombstone).
+ *
+ * # Safety
+ * - `doc_handle` must be a valid document handle
+ * - `key.data` must point to valid memory for `key.len` bytes
+ * - `callback` must have valid function pointers
+ */
+void iroh_doc_del(const struct IrohDocHandle *docHandle,
+                  struct IrohAuthorSecret authorSecret,
+                  struct IrohBytes key,
+                  struct IrohDocDelCallback callback);
+
+/**
+ * Read content bytes by hash.
+ *
+ * This fetches the actual content data for an entry (entries only contain the hash).
+ *
+ * # Safety
+ * - `handle` must be a valid node handle
+ * - `content_hash` must be a valid null-terminated UTF-8 hex string
+ * - `callback` must have valid function pointers
+ */
+void iroh_doc_read_content(const struct IrohNodeHandle *handle,
+                           const char *contentHash,
+                           struct IrohGetCallback callback);
+
+/**
+ * Get a share ticket for a document.
+ *
+ * # Safety
+ * - `doc_handle` must be a valid document handle
+ * - `callback` must have valid function pointers
+ */
+void iroh_doc_share(const struct IrohDocHandle *docHandle,
+                    enum IrohDocShareMode mode,
+                    struct IrohCallback callback);
+
+/**
+ * Close a document and free its resources.
+ *
+ * # Safety
+ * - `doc_handle` must be a valid document handle returned by `iroh_doc_create` or `iroh_doc_join`
+ * - `doc_handle` must not be used after this call
+ */
+void iroh_doc_close(struct IrohDocHandle *docHandle);
+
+/**
+ * Free a document entry.
+ *
+ * # Safety
+ * - `entry` must be a valid entry pointer returned by document operations
+ * - `entry` must not be used after this call
+ */
+void iroh_doc_entry_free(struct IrohDocEntry *entry);
+
+/**
+ * Subscribe to document events.
+ *
+ * Returns a subscription handle that can be used to cancel the subscription.
+ * Events are delivered via the callback until the subscription is cancelled
+ * or the stream ends.
+ *
+ * # Safety
+ * - `doc_handle` must be a valid document handle
+ * - `callback` must have valid function pointers that remain valid for the
+ *   duration of the subscription
+ */
+struct IrohSubscriptionHandle *iroh_doc_subscribe(const struct IrohDocHandle *docHandle,
+                                                  struct IrohDocSubscribeCallback callback);
+
+/**
+ * Cancel an active subscription.
+ *
+ * After calling this, no more events will be delivered and on_complete will be called.
+ *
+ * # Safety
+ * - `handle` must be a valid subscription handle returned by `iroh_doc_subscribe`
+ * - `handle` must not be used after this call
+ */
+void iroh_subscription_cancel(struct IrohSubscriptionHandle *handle);
+
+/**
+ * Free a document event.
+ *
+ * # Safety
+ * - `event` fields that are non-null must be valid pointers
+ */
+void iroh_doc_event_free(struct IrohDocEvent event);
+
+/**
+ * Tag (pin) a blob to prevent garbage collection.
+ *
+ * Tagged blobs are protected from GC until the tag is removed.
+ * Use this after downloading content you want to keep.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle
+ * - `tag_name` must be a valid null-terminated UTF-8 string
+ * - `hash_str` must be a valid null-terminated hex hash string
+ * - `callback` must have valid function pointers
+ */
+void iroh_blob_tag_set(const struct IrohNodeHandle *handle,
+                       const char *tagName,
+                       const char *hashStr,
+                       enum IrohBlobFormat format,
+                       struct IrohCloseCallback callback);
+
+/**
+ * Create a shareable ticket for an existing local blob.
+ *
+ * The ticket points to this node as the provider.
+ * Use this to "mint" a bootstrap ticket after downloading content.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle
+ * - `hash_str` must be a valid null-terminated hex hash string
+ * - `callback` must have valid function pointers
+ */
+void iroh_blob_ticket_create(const struct IrohNodeHandle *handle,
+                             const char *hashStr,
+                             enum IrohBlobFormat format,
+                             struct IrohCallback callback);
 
 #endif  /* IROH_SWIFT_H */

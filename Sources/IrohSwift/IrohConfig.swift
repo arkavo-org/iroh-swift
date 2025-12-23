@@ -14,6 +14,10 @@ public struct IrohConfig: Sendable {
     /// Example: "https://relay.example.com"
     public var customRelayUrl: String?
 
+    /// Whether to enable the Docs engine for syncing documents.
+    /// Default: false
+    public var docsEnabled: Bool
+
     /// Create a new IrohConfig with the specified options.
     ///
     /// - Parameters:
@@ -21,14 +25,17 @@ public struct IrohConfig: Sendable {
     ///                  Application Support/iroh (excluded from iCloud backup).
     ///   - relayEnabled: Whether to use relay servers. Default: true.
     ///   - customRelayUrl: Custom relay server URL. If nil, uses n0's public relays.
+    ///   - docsEnabled: Whether to enable the Docs engine. Default: false.
     public init(
         storagePath: URL? = nil,
         relayEnabled: Bool = true,
-        customRelayUrl: String? = nil
+        customRelayUrl: String? = nil,
+        docsEnabled: Bool = false
     ) {
         self.storagePath = storagePath ?? Self.defaultStoragePath()
         self.relayEnabled = relayEnabled
         self.customRelayUrl = customRelayUrl
+        self.docsEnabled = docsEnabled
     }
 
     /// Validate the configuration before node creation.

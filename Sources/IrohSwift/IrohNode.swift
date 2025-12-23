@@ -65,7 +65,8 @@ public actor IrohNode {
                 let ffiConfig = IrohNodeConfig(
                     storage_path: pathPtr,
                     relay_enabled: config.relayEnabled,
-                    custom_relay_url: relayUrlPtr
+                    custom_relay_url: relayUrlPtr,
+                    docs_enabled: config.docsEnabled
                 )
 
                 let box = Unmanaged.passRetained(

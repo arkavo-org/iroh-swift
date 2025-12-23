@@ -1,13 +1,17 @@
 //! IrohNode implementation wrapping iroh/iroh-blobs.
 //!
-//! Provides a minimal interface for blob storage and retrieval.
+//! Provides a minimal interface for blob storage and retrieval,
+//! with optional Docs (syncing key-value documents) support.
 
 use anyhow::{Context, Result};
 use futures_lite::StreamExt;
 use iroh::endpoint::RelayMode;
 use iroh::{Endpoint, RelayMap, RelayUrl, protocol::Router};
 use iroh_blobs::api::downloader::DownloadProgressItem;
-use iroh_blobs::{ALPN, BlobsProtocol, store::fs::FsStore, ticket::BlobTicket};
+use iroh_blobs::{ALPN as BLOBS_ALPN, BlobsProtocol, store::fs::FsStore, ticket::BlobTicket};
+use iroh_docs::protocol::Docs;
+use iroh_gossip::ALPN as GOSSIP_ALPN;
+use iroh_gossip::net::Gossip;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -26,11 +30,20 @@ pub struct NodeInfo {
 ///
 /// Each node owns its own Tokio runtime to avoid conflicts with Swift's
 /// concurrency model. All async operations are executed via `block_on`.
+///
+/// Optionally supports Docs (syncing key-value documents) when `docs_enabled`
+/// is true during construction.
 pub struct IrohNode {
     runtime: Runtime,
     endpoint: Endpoint,
     store: FsStore,
     router: Router,
+    /// Whether docs support is enabled.
+    docs_enabled: bool,
+    /// Gossip protocol for docs sync (only if docs_enabled).
+    gossip: Option<Gossip>,
+    /// Docs protocol (only if docs_enabled).
+    docs: Option<Docs>,
 }
 
 impl IrohNode {
@@ -40,15 +53,17 @@ impl IrohNode {
     /// * `storage_path` - Directory for the blob store (created if doesn't exist)
     /// * `relay_enabled` - Whether to use relay servers
     /// * `custom_relay_url` - Optional custom relay URL (if None, uses n0's public relays)
+    /// * `docs_enabled` - Whether to enable the Docs engine for syncing documents
     pub fn new(
         storage_path: PathBuf,
         relay_enabled: bool,
         custom_relay_url: Option<String>,
+        docs_enabled: bool,
     ) -> Result<Self> {
         // Create dedicated runtime for this node
         let runtime = Runtime::new().context("Failed to create Tokio runtime")?;
 
-        let (endpoint, store, router) = runtime.block_on(async {
+        let (endpoint, store, router, gossip, docs) = runtime.block_on(async {
             // Create or load the persistent store
             let store = FsStore::load(&storage_path)
                 .await
@@ -75,11 +90,47 @@ impl IrohNode {
 
             // Set up the blobs protocol handler
             let blobs = BlobsProtocol::new(&store, None);
-            let router = Router::builder(endpoint.clone())
-                .accept(ALPN, blobs)
-                .spawn();
 
-            Ok::<_, anyhow::Error>((endpoint, store, router))
+            // Conditionally set up Docs protocol
+            let (gossip, docs) = if docs_enabled {
+                // Create gossip protocol (synchronous - returns Gossip directly)
+                let gossip = Gossip::builder().spawn(endpoint.clone());
+
+                // Create docs path for persistent storage
+                let docs_path = storage_path.join("docs");
+
+                // Ensure docs directory exists
+                if !docs_path.exists() {
+                    std::fs::create_dir_all(&docs_path)
+                        .context("Failed to create docs directory")?;
+                }
+
+                // Create docs protocol using the builder pattern
+                let docs = Docs::persistent(docs_path)
+                    .spawn(endpoint.clone(), store.clone().into(), gossip.clone())
+                    .await
+                    .context("Failed to spawn docs protocol")?;
+
+                (Some(gossip), Some(docs))
+            } else {
+                (None, None)
+            };
+
+            // Build router with all protocols
+            let mut router_builder = Router::builder(endpoint.clone())
+                .accept(BLOBS_ALPN, blobs);
+
+            if let Some(ref g) = gossip {
+                router_builder = router_builder.accept(GOSSIP_ALPN, g.clone());
+            }
+
+            if let Some(ref d) = docs {
+                router_builder = router_builder.accept(iroh_docs::ALPN, d.clone());
+            }
+
+            let router = router_builder.spawn();
+
+            Ok::<_, anyhow::Error>((endpoint, store, router, gossip, docs))
         })?;
 
         Ok(Self {
@@ -87,7 +138,35 @@ impl IrohNode {
             endpoint,
             store,
             router,
+            docs_enabled,
+            gossip,
+            docs,
         })
+    }
+
+    /// Check if docs support is enabled.
+    pub fn is_docs_enabled(&self) -> bool {
+        self.docs_enabled
+    }
+
+    /// Get the docs protocol if enabled.
+    pub fn docs(&self) -> Option<&Docs> {
+        self.docs.as_ref()
+    }
+
+    /// Get a reference to the runtime for FFI operations.
+    pub fn runtime(&self) -> &Runtime {
+        &self.runtime
+    }
+
+    /// Get a reference to the store for content operations.
+    pub fn store(&self) -> &FsStore {
+        &self.store
+    }
+
+    /// Get a reference to the endpoint for network operations.
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
     }
 
     /// Add bytes to the blob store and return a shareable ticket.
@@ -301,13 +380,24 @@ mod tests {
     #[test]
     fn test_put_roundtrip() {
         let dir = tempdir().unwrap();
-        let node = IrohNode::new(dir.path().to_path_buf(), false, None).unwrap();
+        let node = IrohNode::new(dir.path().to_path_buf(), false, None, false).unwrap();
 
         let data = b"Hello, Iroh!";
         let ticket = node.put(data).unwrap();
 
         assert!(!ticket.is_empty());
         assert!(ticket.starts_with("blob")); // BlobTicket format
+
+        node.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_node_with_docs_enabled() {
+        let dir = tempdir().unwrap();
+        let node = IrohNode::new(dir.path().to_path_buf(), false, None, true).unwrap();
+
+        assert!(node.is_docs_enabled());
+        assert!(node.docs().is_some());
 
         node.shutdown().unwrap();
     }

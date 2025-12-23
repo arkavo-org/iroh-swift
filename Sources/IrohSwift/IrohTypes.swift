@@ -63,3 +63,15 @@ public struct TicketInfo: Sendable {
     /// A recursive ticket can contain multiple related blobs.
     public let isRecursive: Bool
 }
+
+/// Format of blob data.
+///
+/// Determines how the blob content is interpreted:
+/// - `.raw`: A single blob (most common case)
+/// - `.hashSeq`: A collection of blobs referenced by their hashes
+public enum BlobFormat: UInt8, Sendable {
+    /// Raw single blob.
+    case raw = 0
+    /// Hash sequence (collection of blobs).
+    case hashSeq = 1
+}
