@@ -46,12 +46,12 @@ struct IrohCLI {
         print("==============")
         print("")
         print("Share this ticket with iroh.arkavo.net to download the data.")
-        print("Keeping node alive for 60 seconds...")
+        print("Press Enter to exit...")
 
         // Keep node alive so remote can fetch
-        try await Task.sleep(nanoseconds: 60_000_000_000)
+        _ = readLine()
 
-        print("Done. Cleaning up...")
+        print("Shutting down...")
         try? FileManager.default.removeItem(at: tempDir)
     }
 
@@ -104,10 +104,10 @@ struct IrohCLI {
         print("Join from another terminal with:")
         print("  swift run iroh-cli docs-join <ticket>")
         print("")
-        print("Keeping node alive for 5 minutes...")
+        print("Press Enter to exit...")
 
-        try await Task.sleep(for: .seconds(300))
-        print("Done.")
+        _ = readLine()
+        print("Shutting down...")
     }
 
     // MARK: - Docs Join Demo (join document, subscribe to events)

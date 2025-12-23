@@ -2,6 +2,32 @@ import Foundation
 import IrohSwiftFFI
 import Security
 
+/// Keychain accessibility level for author secrets.
+///
+/// Controls when the keychain item can be accessed. More restrictive levels
+/// provide better security but may limit when the author can be used.
+public enum KeychainAccessibility: Sendable {
+    /// Available after first unlock (default, recommended).
+    /// The data is accessible after the device has been unlocked once since boot.
+    case afterFirstUnlock
+
+    /// Available only when unlocked.
+    /// The data is only accessible when the device is unlocked.
+    case whenUnlocked
+
+    /// Always available (less secure).
+    /// The data is always accessible, even when the device is locked.
+    case always
+
+    var secValue: CFString {
+        switch self {
+        case .afterFirstUnlock: return kSecAttrAccessibleAfterFirstUnlock
+        case .whenUnlocked: return kSecAttrAccessibleWhenUnlocked
+        case .always: return kSecAttrAccessibleAlways
+        }
+    }
+}
+
 /// An author identity for signing document entries.
 ///
 /// Authors are cryptographic keypairs used to sign entries in Iroh documents.
@@ -55,21 +81,21 @@ public struct IrohAuthor: Sendable, Hashable {
     /// This is the primary way to obtain an author for document operations.
     /// The secret key is stored in the iOS Keychain under the specified identifier.
     ///
-    /// - Parameter identifier: The Keychain identifier for this author. Default is "default".
+    /// - Parameters:
+    ///   - identifier: The Keychain identifier for this author. Default is "default".
+    ///   - accessibility: The Keychain accessibility level. Default is `.afterFirstUnlock`.
     /// - Returns: The author loaded from or saved to Keychain.
     /// - Throws: `IrohError.authorCreationFailed` if creation fails,
     ///           `IrohError.keychainError` if Keychain operations fail.
-    public static func getOrCreate(identifier: String = "default") async throws -> IrohAuthor {
+    public static func getOrCreate(
+        identifier: String = "default",
+        accessibility: KeychainAccessibility = .afterFirstUnlock
+    ) async throws -> IrohAuthor {
         // Try to load from Keychain first
         if let secretData = try? loadFromKeychain(account: identifier) {
             // Derive ID from secret
             var ffiSecret = IrohAuthorSecret()
             secretData.withUnsafeBytes { buffer in
-                let bytes = buffer.bindMemory(to: UInt8.self)
-                for i in 0..<32 {
-                    ffiSecret.bytes.0 = i == 0 ? bytes[0] : ffiSecret.bytes.0
-                }
-                // Copy all bytes using tuple indexing
                 withUnsafeMutableBytes(of: &ffiSecret.bytes) { destBuffer in
                     destBuffer.copyMemory(from: UnsafeRawBufferPointer(buffer))
                 }
@@ -92,7 +118,7 @@ public struct IrohAuthor: Sendable, Hashable {
         let author = try await create()
 
         // Save to Keychain
-        try saveToKeychain(account: identifier, data: author.secret)
+        try saveToKeychain(account: identifier, data: author.secret, accessibility: accessibility)
 
         return author
     }
@@ -143,9 +169,14 @@ public struct IrohAuthor: Sendable, Hashable {
     /// - Parameters:
     ///   - secretHex: The 64-character hex-encoded secret key.
     ///   - saveTo: Optional Keychain identifier to save to.
+    ///   - accessibility: The Keychain accessibility level if saving. Default is `.afterFirstUnlock`.
     /// - Returns: The imported author.
     /// - Throws: `IrohError.authorCreationFailed` if the hex is invalid.
-    public static func fromHex(_ secretHex: String, saveTo identifier: String? = nil) async throws -> IrohAuthor {
+    public static func fromHex(
+        _ secretHex: String,
+        saveTo identifier: String? = nil,
+        accessibility: KeychainAccessibility = .afterFirstUnlock
+    ) async throws -> IrohAuthor {
         let author: IrohAuthor = try await withCheckedThrowingContinuation { continuation in
             let box = Unmanaged.passRetained(
                 AuthorContinuationBox(continuation)
@@ -181,7 +212,7 @@ public struct IrohAuthor: Sendable, Hashable {
 
         // Optionally save to Keychain
         if let identifier = identifier {
-            try saveToKeychain(account: identifier, data: author.secret)
+            try saveToKeychain(account: identifier, data: author.secret, accessibility: accessibility)
         }
 
         return author
@@ -260,7 +291,11 @@ public struct IrohAuthor: Sendable, Hashable {
         return data
     }
 
-    private static func saveToKeychain(account: String, data: Data) throws {
+    private static func saveToKeychain(
+        account: String,
+        data: Data,
+        accessibility: KeychainAccessibility = .afterFirstUnlock
+    ) throws {
         // First try to delete any existing item
         let deleteQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -275,7 +310,7 @@ public struct IrohAuthor: Sendable, Hashable {
             kSecAttrService as String: keychainService,
             kSecAttrAccount as String: account,
             kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
+            kSecAttrAccessible as String: accessibility.secValue
         ]
 
         let status = SecItemAdd(query as CFDictionary, nil)

@@ -59,6 +59,8 @@ public enum IrohError: Error, Sendable {
     // MARK: - Blob Errors
     /// Failed to tag (pin) a blob.
     case blobTagFailed(String)
+    /// Failed to remove a tag (unpin) from a blob.
+    case blobUntagFailed(String)
     /// Failed to create a ticket for a blob.
     case ticketCreationFailed(String)
 }
@@ -120,6 +122,8 @@ extension IrohError: LocalizedError {
             return "Keychain error: \(msg)"
         case .blobTagFailed(let msg):
             return "Failed to tag blob: \(msg)"
+        case .blobUntagFailed(let msg):
+            return "Failed to untag blob: \(msg)"
         case .ticketCreationFailed(let msg):
             return "Failed to create ticket: \(msg)"
         }

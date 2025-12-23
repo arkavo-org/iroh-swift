@@ -1560,7 +1560,7 @@ pub extern "C" fn iroh_doc_close(doc_handle: *mut IrohDocHandle) {
 /// - `entry` must be a valid entry pointer returned by document operations
 /// - `entry` must not be used after this call
 #[unsafe(no_mangle)]
-pub extern "C" fn iroh_doc_entry_free(entry: *mut IrohDocEntry) {
+pub unsafe extern "C" fn iroh_doc_entry_free(entry: *mut IrohDocEntry) {
     if entry.is_null() {
         return;
     }
@@ -1848,7 +1848,7 @@ fn convert_live_event_to_ffi(event: &iroh_docs::engine::LiveEvent) -> IrohDocEve
 /// - `hash_str` must be a valid null-terminated hex hash string
 /// - `callback` must have valid function pointers
 #[unsafe(no_mangle)]
-pub extern "C" fn iroh_blob_tag_set(
+pub unsafe extern "C" fn iroh_blob_tag_set(
     handle: *const IrohNodeHandle,
     tag_name: *const c_char,
     hash_str: *const c_char,
@@ -1937,7 +1937,7 @@ pub extern "C" fn iroh_blob_tag_set(
 /// - `hash_str` must be a valid null-terminated hex hash string
 /// - `callback` must have valid function pointers
 #[unsafe(no_mangle)]
-pub extern "C" fn iroh_blob_ticket_create(
+pub unsafe extern "C" fn iroh_blob_ticket_create(
     handle: *const IrohNodeHandle,
     hash_str: *const c_char,
     format: IrohBlobFormat,
@@ -1986,4 +1986,54 @@ pub extern "C" fn iroh_blob_ticket_create(
     let ticket_str = CString::new(ticket.to_string()).unwrap().into_raw();
 
     (callback.on_success)(callback.userdata, ticket_str);
+}
+
+/// Remove a tag (unpin) from a blob, allowing garbage collection.
+///
+/// # Safety
+/// - `handle` must be a valid node handle
+/// - `tag_name` must be a valid null-terminated UTF-8 string
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_blob_tag_delete(
+    handle: *const IrohNodeHandle,
+    tag_name: *const c_char,
+    callback: IrohCloseCallback,
+) {
+    if handle.is_null() {
+        let error = CString::new("handle cannot be null").unwrap();
+        (callback.on_failure)(callback.userdata, error.into_raw());
+        return;
+    }
+
+    if tag_name.is_null() {
+        let error = CString::new("tag_name cannot be null").unwrap();
+        (callback.on_failure)(callback.userdata, error.into_raw());
+        return;
+    }
+
+    let tag_name_str = match unsafe { CStr::from_ptr(tag_name) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(e) => {
+            let error = CString::new(format!("Invalid tag_name UTF-8: {}", e)).unwrap();
+            (callback.on_failure)(callback.userdata, error.into_raw());
+            return;
+        }
+    };
+
+    let node = unsafe { &*(handle as *const IrohNode) };
+
+    // Use the store's tags API to delete the tag
+    match node
+        .runtime()
+        .block_on(node.store().tags().delete(tag_name_str))
+    {
+        Ok(_count) => {
+            (callback.on_complete)(callback.userdata);
+        }
+        Err(e) => {
+            let error = CString::new(format!("{:#}", e)).unwrap();
+            (callback.on_failure)(callback.userdata, error.into_raw());
+        }
+    }
 }

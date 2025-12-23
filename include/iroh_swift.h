@@ -932,4 +932,16 @@ void iroh_blob_ticket_create(const struct IrohNodeHandle *handle,
                              enum IrohBlobFormat format,
                              struct IrohCallback callback);
 
+/**
+ * Remove a tag (unpin) from a blob, allowing garbage collection.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle
+ * - `tag_name` must be a valid null-terminated UTF-8 string
+ * - `callback` must have valid function pointers
+ */
+void iroh_blob_tag_delete(const struct IrohNodeHandle *handle,
+                          const char *tagName,
+                          struct IrohCloseCallback callback);
+
 #endif  /* IROH_SWIFT_H */

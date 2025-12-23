@@ -61,6 +61,52 @@ extension IrohNode {
         }
     }
 
+    /// Remove a tag (unpin) from a blob, allowing garbage collection.
+    ///
+    /// After removing the tag, the blob may be garbage collected if no other
+    /// tags or references point to it.
+    ///
+    /// Example usage:
+    /// ```swift
+    /// // Remove a pin
+    /// try await node.untagBlob(name: "pins/my-content")
+    /// ```
+    ///
+    /// - Parameter name: Tag name to remove (e.g., "pins/my-content").
+    /// - Throws: `IrohError.blobUntagFailed` if removal fails.
+    public func untagBlob(name: String) async throws {
+        try ensureNotClosed()
+        try Task.checkCancellation()
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let box = Unmanaged.passRetained(
+                BlobTagContinuationBox(continuation)
+            ).toOpaque()
+
+            let callback = IrohCloseCallback(
+                userdata: box,
+                on_complete: { userdata in
+                    let box = Unmanaged<BlobTagContinuationBox>
+                        .fromOpaque(userdata!)
+                        .takeRetainedValue()
+                    box.continuation.resume()
+                },
+                on_failure: { userdata, errorPtr in
+                    let box = Unmanaged<BlobTagContinuationBox>
+                        .fromOpaque(userdata!)
+                        .takeRetainedValue()
+                    let message = String(cString: errorPtr!)
+                    iroh_string_free(UnsafeMutablePointer(mutating: errorPtr))
+                    box.continuation.resume(throwing: IrohError.blobUntagFailed(message))
+                }
+            )
+
+            name.withCString { namePtr in
+                iroh_blob_tag_delete(handle.pointer, namePtr, callback)
+            }
+        }
+    }
+
     /// Create a shareable ticket for an existing local blob.
     ///
     /// The ticket points to this node as the provider.
