@@ -1,6 +1,6 @@
 [package]
 name = "iroh-swift-ffi"
-version = "0.2.5"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
 description = "Minimal FFI bindings for Iroh blob operations"
@@ -14,9 +14,15 @@ name = "iroh_swift"
 # iroh-blobs 0.97 depends on iroh 0.95
 iroh = "0.95"
 iroh-blobs = { version = "0.97", features = ["fs-store"] }
+# Docs support (optional, enabled via config)
+iroh-docs = "0.95"
+iroh-gossip = "0.95"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio-util = "0.7"
 anyhow = "1"
 futures-lite = "2"
+hex = "0.4"
+rand = "0.9"
 
 [build-dependencies]
 cbindgen = "0.28"
