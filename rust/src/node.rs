@@ -38,9 +38,8 @@ pub struct IrohNode {
     endpoint: Endpoint,
     store: FsStore,
     router: Router,
-    /// Whether docs support is enabled.
-    docs_enabled: bool,
-    /// Gossip protocol for docs sync (only if docs_enabled).
+    /// Gossip protocol for docs sync (must be kept alive for router).
+    #[allow(dead_code)]
     gossip: Option<Gossip>,
     /// Docs protocol (only if docs_enabled).
     docs: Option<Docs>,
@@ -137,15 +136,15 @@ impl IrohNode {
             endpoint,
             store,
             router,
-            docs_enabled,
             gossip,
             docs,
         })
     }
 
     /// Check if docs support is enabled.
+    #[allow(dead_code)]
     pub fn is_docs_enabled(&self) -> bool {
-        self.docs_enabled
+        self.docs.is_some()
     }
 
     /// Get the docs protocol if enabled.
