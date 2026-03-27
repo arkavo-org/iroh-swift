@@ -97,15 +97,23 @@ jobs:
 
       - name: Run tests
         run: |
-          # Use gtimeout (GNU coreutils on macOS) to hard-kill swift test
-          # if it hangs, since GitHub Actions timeout-minutes may not
-          # reliably terminate swift test processes.
-          if command -v gtimeout &> /dev/null; then
-            gtimeout --signal=KILL 300 swift test
-          elif command -v timeout &> /dev/null; then
-            timeout --signal=KILL 300 swift test
+          # Run swift test with a hard 5-minute wall-clock timeout.
+          # Background the test, then wait with a deadline. SIGKILL ensures
+          # the process tree dies even if swift test ignores SIGTERM.
+          swift test &
+          TEST_PID=$!
+          ( sleep 300 && kill -9 $TEST_PID 2>/dev/null ) &
+          WATCHDOG_PID=$!
+          if wait $TEST_PID; then
+            kill $WATCHDOG_PID 2>/dev/null || true
+            echo "Tests passed"
           else
-            swift test
+            EXIT_CODE=$?
+            kill $WATCHDOG_PID 2>/dev/null || true
+            if [ $EXIT_CODE -eq 137 ]; then
+              echo "::error::Tests were killed after 5-minute timeout (likely hanging)"
+            fi
+            exit $EXIT_CODE
           fi
         timeout-minutes: 10
         env:
