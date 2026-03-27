@@ -96,7 +96,17 @@ jobs:
           IROH_LOCAL_DEV: "1"
 
       - name: Run tests
-        run: swift test
+        run: |
+          # Use gtimeout (GNU coreutils on macOS) to hard-kill swift test
+          # if it hangs, since GitHub Actions timeout-minutes may not
+          # reliably terminate swift test processes.
+          if command -v gtimeout &> /dev/null; then
+            gtimeout --signal=KILL 300 swift test
+          elif command -v timeout &> /dev/null; then
+            timeout --signal=KILL 300 swift test
+          else
+            swift test
+          fi
         timeout-minutes: 10
         env:
           IROH_LOCAL_DEV: "1"

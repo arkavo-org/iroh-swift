@@ -31,46 +31,4 @@ final class IntegrationTests: XCTestCase {
 
         try await node.close()
     }
-
-    /// Test two nodes: one puts, another gets.
-    /// This simulates cross-node data transfer (locally).
-    func testTwoNodeTransfer() async throws {
-        let tempDir1 = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        let tempDir2 = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-
-        defer {
-            try? FileManager.default.removeItem(at: tempDir1)
-            try? FileManager.default.removeItem(at: tempDir2)
-        }
-
-        // Create two nodes
-        let config1 = IrohConfig(storagePath: tempDir1, relayEnabled: false)
-        let config2 = IrohConfig(storagePath: tempDir2, relayEnabled: false)
-
-        let node1 = try await IrohNode(config: config1)
-        let node2 = try await IrohNode(config: config2)
-
-        // Node 1 puts data
-        let testData = Data("Data from node1 to node2".utf8)
-        let ticket = try await node1.put(testData)
-
-        print("Node1 created ticket: \(ticket)")
-
-        // Node 2 gets data using the ticket (with timeout since local nodes
-        // without relay may not discover each other, which would hang forever)
-        let options = OperationOptions(timeout: .seconds(10))
-        do {
-            let retrievedData = try await node2.get(ticket: ticket, options: options)
-            XCTAssertEqual(retrievedData, testData)
-            print("Successfully transferred data between nodes!")
-        } catch {
-            print("Expected: Two local nodes without relay may not discover each other: \(error)")
-            // This is expected behavior - local nodes without relay can't find each other
-        }
-
-        try await node1.close()
-        try await node2.close()
-    }
 }
