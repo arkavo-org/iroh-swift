@@ -5,7 +5,11 @@ import Foundation
 struct PushToNodeTests {
     @Test("pushToNode with invalid node ID throws pushFailed")
     func testPushToNodeInvalidNodeId() async throws {
-        let config = IrohConfig(relayEnabled: false)
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let config = IrohConfig(storagePath: tempDir, relayEnabled: false)
         let node = try await IrohNode(config: config)
 
         let data = "test".data(using: .utf8)!
@@ -19,7 +23,11 @@ struct PushToNodeTests {
 
     @Test("pushToNode on closed node throws nodeClosed")
     func testPushToNodeClosedNode() async throws {
-        let config = IrohConfig(relayEnabled: false)
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let config = IrohConfig(storagePath: tempDir, relayEnabled: false)
         let node = try await IrohNode(config: config)
         try await node.close()
 

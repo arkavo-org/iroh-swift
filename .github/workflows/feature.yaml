@@ -100,7 +100,7 @@ jobs:
           # Run swift test with a hard 5-minute wall-clock timeout.
           # Background the test, then wait with a deadline. SIGKILL ensures
           # the process tree dies even if swift test ignores SIGTERM.
-          swift test &
+          swift test --verbose 2>&1 &
           TEST_PID=$!
           ( sleep 300 && kill -9 $TEST_PID 2>/dev/null ) &
           WATCHDOG_PID=$!
