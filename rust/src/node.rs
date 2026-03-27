@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use futures_lite::StreamExt;
-use iroh::endpoint::RelayMode;
+use iroh::endpoint::{RelayMode, presets};
 use iroh::{Endpoint, RelayMap, RelayUrl, protocol::Router};
 use iroh_blobs::api::downloader::DownloadProgressItem;
 use iroh_blobs::{ALPN as BLOBS_ALPN, BlobsProtocol, store::fs::FsStore, ticket::BlobTicket};
@@ -69,7 +69,7 @@ impl IrohNode {
                 .context("Failed to load blob store")?;
 
             // Build endpoint with relay configuration
-            let mut builder = Endpoint::builder();
+            let mut builder = Endpoint::builder(presets::N0);
             if !relay_enabled {
                 builder = builder.relay_mode(RelayMode::Disabled);
             } else if let Some(url) = custom_relay_url {
