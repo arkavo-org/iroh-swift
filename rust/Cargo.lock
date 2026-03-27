@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-swift-ffi"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "cbindgen",
