@@ -530,16 +530,31 @@ impl IrohNode {
     ///
     /// This ensures all pending writes are flushed to disk.
     /// Uses a timeout to prevent hanging if the router cannot shut down cleanly.
+    /// The Tokio runtime is also shut down with a timeout to avoid blocking on
+    /// background tasks (e.g., event handlers) that may never complete.
     pub fn shutdown(self) -> Result<()> {
-        self.runtime.block_on(async {
-            match tokio::time::timeout(Duration::from_secs(5), self.router.shutdown()).await {
+        let IrohNode {
+            runtime,
+            router,
+            endpoint: _,
+            store: _,
+            gossip: _,
+            docs: _,
+            event_handler: _,
+        } = self;
+
+        let result = runtime.block_on(async {
+            match tokio::time::timeout(Duration::from_secs(5), router.shutdown()).await {
                 Ok(result) => result.context("Failed to shutdown router"),
-                Err(_) => {
-                    // Timeout expired — force drop to avoid hanging forever
-                    Ok(())
-                }
+                Err(_) => Ok(()),
             }
-        })
+        });
+
+        // Explicitly shut down the runtime with a timeout so that
+        // background tasks (event handler, etc.) don't block process exit.
+        runtime.shutdown_timeout(Duration::from_secs(2));
+
+        result
     }
 }
 

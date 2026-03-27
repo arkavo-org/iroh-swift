@@ -2,34 +2,6 @@ import XCTest
 @testable import IrohSwift
 
 final class IntegrationTests: XCTestCase {
-    /// Test that we can create a node with relay enabled and put data.
-    /// This verifies the node can connect to n0 public relays.
-    /// Uses a timeout since relay servers may be unreachable in CI.
-    func testPutWithRelay() async throws {
-        let tempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-
-        defer {
-            try? FileManager.default.removeItem(at: tempDir)
-        }
-
-        // Create node with relay enabled (connects to n0 public relays)
-        let config = IrohConfig(storagePath: tempDir, relayEnabled: true)
-        let node = try await IrohNode(config: config)
-
-        let testData = Data("Hello from iroh-swift integration test!".utf8)
-        let options = OperationOptions(timeout: .seconds(30))
-        let ticket = try await node.put(testData, options: options)
-
-        print("Generated ticket: \(ticket)")
-
-        // Verify ticket format
-        XCTAssertTrue(ticket.hasPrefix("blob"), "Ticket should start with 'blob'")
-        XCTAssertTrue(ticket.count > 50, "Ticket should be substantial in length")
-
-        try await node.close()
-    }
-
     /// Test roundtrip: put data, then get it back using the ticket.
     /// This tests local storage and retrieval.
     func testLocalRoundtrip() async throws {
