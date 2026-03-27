@@ -4,6 +4,7 @@ import XCTest
 final class IntegrationTests: XCTestCase {
     /// Test that we can create a node with relay enabled and put data.
     /// This verifies the node can connect to n0 public relays.
+    /// Uses a timeout since relay servers may be unreachable in CI.
     func testPutWithRelay() async throws {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -17,7 +18,8 @@ final class IntegrationTests: XCTestCase {
         let node = try await IrohNode(config: config)
 
         let testData = Data("Hello from iroh-swift integration test!".utf8)
-        let ticket = try await node.put(testData)
+        let options = OperationOptions(timeout: .seconds(30))
+        let ticket = try await node.put(testData, options: options)
 
         print("Generated ticket: \(ticket)")
 
@@ -84,10 +86,11 @@ final class IntegrationTests: XCTestCase {
 
         print("Node1 created ticket: \(ticket)")
 
-        // Node 2 gets data using the ticket
-        // Note: This may fail if nodes can't discover each other without relay
+        // Node 2 gets data using the ticket (with timeout since local nodes
+        // without relay may not discover each other, which would hang forever)
+        let options = OperationOptions(timeout: .seconds(10))
         do {
-            let retrievedData = try await node2.get(ticket: ticket)
+            let retrievedData = try await node2.get(ticket: ticket, options: options)
             XCTAssertEqual(retrievedData, testData)
             print("Successfully transferred data between nodes!")
         } catch {
