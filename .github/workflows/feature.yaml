@@ -96,26 +96,8 @@ jobs:
           IROH_LOCAL_DEV: "1"
 
       - name: Run tests
-        run: |
-          # Run swift test with a hard 5-minute wall-clock timeout.
-          # Background the test, then wait with a deadline. SIGKILL ensures
-          # the process tree dies even if swift test ignores SIGTERM.
-          swift test --verbose 2>&1 &
-          TEST_PID=$!
-          ( sleep 300 && kill -9 $TEST_PID 2>/dev/null ) &
-          WATCHDOG_PID=$!
-          if wait $TEST_PID; then
-            kill $WATCHDOG_PID 2>/dev/null || true
-            echo "Tests passed"
-          else
-            EXIT_CODE=$?
-            kill $WATCHDOG_PID 2>/dev/null || true
-            if [ $EXIT_CODE -eq 137 ]; then
-              echo "::error::Tests were killed after 5-minute timeout (likely hanging)"
-            fi
-            exit $EXIT_CODE
-          fi
-        timeout-minutes: 10
+        run: swift test -v
+        timeout-minutes: 6
         env:
           IROH_LOCAL_DEV: "1"
 
