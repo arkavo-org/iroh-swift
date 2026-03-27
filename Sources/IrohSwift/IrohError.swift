@@ -8,6 +8,8 @@ public enum IrohError: Error, Sendable {
     case putFailed(String)
     /// Failed to download bytes from a ticket.
     case getFailed(String)
+    /// Failed to push data to a remote node.
+    case pushFailed(String)
     /// Invalid ticket format.
     case invalidTicket(String)
     /// Failed to encode string with the specified encoding.
@@ -74,6 +76,8 @@ extension IrohError: LocalizedError {
             return "Failed to put bytes: \(msg)"
         case .getFailed(let msg):
             return "Failed to get bytes: \(msg)"
+        case .pushFailed(let msg):
+            return "Failed to push data: \(msg)"
         case .invalidTicket(let msg):
             return "Invalid ticket: \(msg)"
         case .stringEncodingFailed(let encoding):

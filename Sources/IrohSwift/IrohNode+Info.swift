@@ -108,14 +108,3 @@ public func validateTicket(_ ticket: String) async -> TicketInfo {
     }
 }
 
-// MARK: - Internal Helpers
-
-/// Box for passing Swift continuations through FFI callbacks (for NodeInfo).
-/// This needs to be accessible from this file since we use it directly.
-private final class ContinuationBox<T>: @unchecked Sendable {
-    let continuation: CheckedContinuation<T, Error>
-
-    init(_ continuation: CheckedContinuation<T, Error>) {
-        self.continuation = continuation
-    }
-}
