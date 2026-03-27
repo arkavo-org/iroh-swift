@@ -473,7 +473,8 @@ pub extern "C" fn iroh_node_create(config: IrohNodeConfig, callback: IrohNodeCre
 
 /// Destroy an Iroh node and free its resources.
 ///
-/// This performs a graceful shutdown, ensuring pending writes are flushed.
+/// Performs shutdown on a background thread to avoid blocking Swift's
+/// cooperative thread pool (which can deadlock if called from deinit).
 ///
 /// # Safety
 /// - `handle` must be a valid pointer returned by `iroh_node_create`
@@ -485,10 +486,13 @@ pub extern "C" fn iroh_node_destroy(handle: *mut IrohNodeHandle) {
     }
 
     unsafe {
-        // Convert back to Box and drop it
         let node = Box::from_raw(handle as *mut IrohNode);
-        // Attempt graceful shutdown, ignore errors
-        let _ = node.shutdown();
+        // Shutdown on a dedicated thread so we never block Swift's
+        // cooperative thread pool. The thread is detached — if the
+        // process is exiting, the OS cleans up.
+        std::thread::spawn(move || {
+            let _ = node.shutdown();
+        });
     }
 }
 

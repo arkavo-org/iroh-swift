@@ -533,14 +533,17 @@ impl IrohNode {
     /// The Tokio runtime is also shut down with a timeout to avoid blocking on
     /// background tasks (e.g., event handlers) that may never complete.
     pub fn shutdown(self) -> Result<()> {
+        // Destructure to control drop order: drop all node resources first,
+        // then shut down the runtime last. This prevents Drop impls on
+        // endpoint/store/etc from trying to use an already-shut-down runtime.
         let IrohNode {
             runtime,
             router,
-            endpoint: _,
-            store: _,
-            gossip: _,
-            docs: _,
-            event_handler: _,
+            endpoint,
+            store,
+            gossip,
+            docs,
+            event_handler,
         } = self;
 
         let result = runtime.block_on(async {
@@ -549,6 +552,13 @@ impl IrohNode {
                 Err(_) => Ok(()),
             }
         });
+
+        // Drop all node resources before shutting down the runtime.
+        drop(event_handler);
+        drop(docs);
+        drop(gossip);
+        drop(store);
+        drop(endpoint);
 
         // Explicitly shut down the runtime with a timeout so that
         // background tasks (event handler, etc.) don't block process exit.
