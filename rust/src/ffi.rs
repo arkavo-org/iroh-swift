@@ -319,6 +319,11 @@ pub struct IrohCloseCallback {
     pub on_failure: extern "C" fn(userdata: *mut c_void, error: *const c_char),
 }
 
+// Safety: The userdata pointer is exclusively owned by the callback and only
+// accessed on the thread that calls on_complete/on_failure. The function
+// pointers are plain C functions safe to call from any thread.
+unsafe impl Send for IrohCloseCallback {}
+
 /// Callback for author creation.
 #[repr(C)]
 pub struct IrohAuthorCreateCallback {
@@ -808,16 +813,22 @@ pub extern "C" fn iroh_node_close(handle: *mut IrohNodeHandle, callback: IrohClo
         return;
     }
 
-    unsafe {
-        let node = Box::from_raw(handle as *mut IrohNode);
+    // Run shutdown on a dedicated thread to avoid blocking Swift's
+    // cooperative thread pool, which can cause deadlocks.
+    let node = unsafe { Box::from_raw(handle as *mut IrohNode) };
+    let on_complete = callback.on_complete;
+    let on_failure = callback.on_failure;
+    let userdata = callback.userdata as usize;
+    std::thread::spawn(move || {
+        let userdata = userdata as *mut c_void;
         match node.shutdown() {
-            Ok(()) => (callback.on_complete)(callback.userdata),
+            Ok(()) => (on_complete)(userdata),
             Err(e) => {
                 let error = CString::new(format!("{:#}", e)).unwrap();
-                (callback.on_failure)(callback.userdata, error.into_raw());
+                (on_failure)(userdata, error.into_raw());
             }
         }
-    }
+    });
 }
 
 /// Add bytes to the blob store with options (e.g., timeout).
