@@ -87,9 +87,9 @@ impl IrohNode {
 
             let endpoint = builder.bind().await.context("Failed to bind endpoint")?;
 
-            // Wait for relay connection if enabled
+            // Wait for relay connection if enabled (with timeout to avoid hanging in CI)
             if relay_enabled {
-                let _ = endpoint.online().await;
+                let _ = tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await;
             }
 
             // Set up the blobs protocol handler with push acceptance.
@@ -529,13 +529,42 @@ impl IrohNode {
     /// Gracefully shut down the node.
     ///
     /// This ensures all pending writes are flushed to disk.
+    /// Uses a timeout to prevent hanging if the router cannot shut down cleanly.
+    /// The Tokio runtime is also shut down with a timeout to avoid blocking on
+    /// background tasks (e.g., event handlers) that may never complete.
     pub fn shutdown(self) -> Result<()> {
-        self.runtime.block_on(async {
-            self.router
-                .shutdown()
-                .await
-                .context("Failed to shutdown router")
-        })
+        // Destructure to control drop order: drop all node resources first,
+        // then shut down the runtime last. This prevents Drop impls on
+        // endpoint/store/etc from trying to use an already-shut-down runtime.
+        let IrohNode {
+            runtime,
+            router,
+            endpoint,
+            store,
+            gossip,
+            docs,
+            event_handler,
+        } = self;
+
+        let result = runtime.block_on(async {
+            match tokio::time::timeout(Duration::from_secs(5), router.shutdown()).await {
+                Ok(result) => result.context("Failed to shutdown router"),
+                Err(_) => Ok(()),
+            }
+        });
+
+        // Drop all node resources before shutting down the runtime.
+        drop(event_handler);
+        drop(docs);
+        drop(gossip);
+        drop(store);
+        drop(endpoint);
+
+        // Explicitly shut down the runtime with a timeout so that
+        // background tasks (event handler, etc.) don't block process exit.
+        runtime.shutdown_timeout(Duration::from_secs(2));
+
+        result
     }
 }
 

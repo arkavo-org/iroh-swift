@@ -13,7 +13,7 @@ final class IrohNodeManagerTests: XCTestCase {
     }
 
     @MainActor
-    func testSuccessfulInitialization() async {
+    func testSuccessfulInitialization() async throws {
         let manager = IrohNodeManager()
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -26,10 +26,14 @@ final class IrohNodeManagerTests: XCTestCase {
         XCTAssertNotNil(manager.node)
         XCTAssertFalse(manager.isInitializing)
         XCTAssertNil(manager.error)
+
+        if let node = manager.node {
+            try await node.close()
+        }
     }
 
     @MainActor
-    func testReset() async {
+    func testReset() async throws {
         let manager = IrohNodeManager()
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -38,6 +42,9 @@ final class IrohNodeManagerTests: XCTestCase {
         let config = IrohConfig(storagePath: tempDir, relayEnabled: false)
 
         await manager.initialize(config: config)
+        if let node = manager.node {
+            try await node.close()
+        }
         manager.reset()
 
         XCTAssertNil(manager.node)
@@ -46,7 +53,7 @@ final class IrohNodeManagerTests: XCTestCase {
     }
 
     @MainActor
-    func testMultipleInitializationsIgnored() async {
+    func testMultipleInitializationsIgnored() async throws {
         let manager = IrohNodeManager()
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -60,6 +67,10 @@ final class IrohNodeManagerTests: XCTestCase {
         // Second initialization should be ignored
         await manager.initialize(config: config)
         XCTAssertTrue(manager.node === firstNode)
+
+        if let node = manager.node {
+            try await node.close()
+        }
     }
 }
 #endif

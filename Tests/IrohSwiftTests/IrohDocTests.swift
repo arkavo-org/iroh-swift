@@ -21,6 +21,10 @@ final class IrohDocTests: XCTestCase {
     }
 
     override func tearDown() async throws {
+        if let node = node {
+            try? await node.close()
+            self.node = nil
+        }
         try? FileManager.default.removeItem(at: tempDir)
     }
 

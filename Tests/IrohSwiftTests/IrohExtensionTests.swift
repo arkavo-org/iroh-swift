@@ -16,6 +16,7 @@ final class IrohExtensionTests: XCTestCase {
         let node = try await createTestNode()
         let ticket = try await node.put("Hello, Iroh!", encoding: .utf8)
         XCTAssertTrue(ticket.hasPrefix("blob"), "Ticket should start with 'blob'")
+        try await node.close()
     }
 
     func testGetString() async throws {
@@ -24,6 +25,7 @@ final class IrohExtensionTests: XCTestCase {
         let ticket = try await node.put(original, encoding: .utf8)
         let retrieved = try await node.getString(ticket: ticket, encoding: .utf8)
         XCTAssertEqual(retrieved, original)
+        try await node.close()
     }
 
     func testStringEncodingFailure() async throws {
@@ -37,6 +39,7 @@ final class IrohExtensionTests: XCTestCase {
         } catch IrohError.stringEncodingFailed {
             // Expected
         }
+        try await node.close()
     }
 
     // MARK: - Codable Tests
@@ -51,6 +54,7 @@ final class IrohExtensionTests: XCTestCase {
         let model = TestModel(name: "test", value: 42)
         let ticket = try await node.put(model)
         XCTAssertTrue(ticket.hasPrefix("blob"), "Ticket should start with 'blob'")
+        try await node.close()
     }
 
     func testGetCodable() async throws {
@@ -59,6 +63,7 @@ final class IrohExtensionTests: XCTestCase {
         let ticket = try await node.put(original)
         let retrieved = try await node.get(ticket: ticket, as: TestModel.self)
         XCTAssertEqual(retrieved, original)
+        try await node.close()
     }
 
     func testDecodingFailure() async throws {
@@ -72,6 +77,7 @@ final class IrohExtensionTests: XCTestCase {
         } catch IrohError.decodingFailed {
             // Expected
         }
+        try await node.close()
     }
 
     // MARK: - Ticket Validation Tests
@@ -93,6 +99,7 @@ final class IrohExtensionTests: XCTestCase {
         XCTAssertTrue(info.isValid, "Ticket should be valid")
         XCTAssertNotNil(info.hash, "Should have hash")
         XCTAssertNotNil(info.nodeId, "Should have node ID")
+        try await node.close()
     }
 
     func testValidateTicketWithInvalidTicket() async {
@@ -109,6 +116,7 @@ final class IrohExtensionTests: XCTestCase {
         let data = Data("test data".utf8)
         let ticket = try await node.putWithRetry(data, maxAttempts: 3)
         XCTAssertTrue(ticket.hasPrefix("blob"), "Ticket should start with 'blob'")
+        try await node.close()
     }
 
     func testGetWithRetrySuccess() async throws {
@@ -117,6 +125,7 @@ final class IrohExtensionTests: XCTestCase {
         let ticket = try await node.put(data)
         let retrieved = try await node.getWithRetry(ticket: ticket, maxAttempts: 3)
         XCTAssertEqual(retrieved, data)
+        try await node.close()
     }
 
     // MARK: - Logging Tests
@@ -126,6 +135,7 @@ final class IrohExtensionTests: XCTestCase {
         let data = Data("test data".utf8)
         let ticket = try await node.putWithLogging(data)
         XCTAssertTrue(ticket.hasPrefix("blob"), "Ticket should start with 'blob'")
+        try await node.close()
     }
 
     func testGetWithLogging() async throws {
@@ -134,6 +144,7 @@ final class IrohExtensionTests: XCTestCase {
         let ticket = try await node.put(data)
         let retrieved = try await node.getWithLogging(ticket: ticket)
         XCTAssertEqual(retrieved, data)
+        try await node.close()
     }
 
     // MARK: - Node Info Tests
@@ -144,6 +155,7 @@ final class IrohExtensionTests: XCTestCase {
         XCTAssertFalse(info.nodeId.isEmpty, "Node ID should not be empty")
         // Without relay, relay URL should be nil
         XCTAssertNil(info.relayUrl, "Without relay, relay URL should be nil")
+        try await node.close()
     }
 
     // MARK: - Progress Tests
@@ -158,6 +170,7 @@ final class IrohExtensionTests: XCTestCase {
         }
 
         XCTAssertEqual(retrieved, testData)
+        try await node.close()
     }
 
     // MARK: - Cancellation Tests
@@ -179,5 +192,7 @@ final class IrohExtensionTests: XCTestCase {
         } catch {
             // Other errors are also acceptable
         }
+
+        try await node.close()
     }
 }

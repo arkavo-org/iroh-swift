@@ -96,7 +96,8 @@ jobs:
           IROH_LOCAL_DEV: "1"
 
       - name: Run tests
-        run: swift test
+        run: swift test -v
+        timeout-minutes: 6
         env:
           IROH_LOCAL_DEV: "1"
 
