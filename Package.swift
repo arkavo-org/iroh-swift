@@ -5,7 +5,7 @@ import Foundation
 let version = "0.3.0"
 
 // Checksum is updated by release automation
-let checksum = "bd64574f9081890c8e340600cd68fdad0ff2434b4a12842520783b00ab6d2558"
+let checksum = "77d765f3020e660c1fca1030dd1e114fe86fbd4b64b644df2855e09651a2da73"
 
 // Check if using local development mode
 // Set IROH_LOCAL_DEV=1 environment variable to use local XCFramework
