@@ -24,6 +24,8 @@ final class IntegrationTests: XCTestCase {
         // Verify ticket format
         XCTAssertTrue(ticket.hasPrefix("blob"), "Ticket should start with 'blob'")
         XCTAssertTrue(ticket.count > 50, "Ticket should be substantial in length")
+
+        try await node.close()
     }
 
     /// Test roundtrip: put data, then get it back using the ticket.
@@ -52,6 +54,8 @@ final class IntegrationTests: XCTestCase {
         if let retrievedString = String(data: retrievedData, encoding: .utf8) {
             print("Retrieved: \(retrievedString)")
         }
+
+        try await node.close()
     }
 
     /// Test two nodes: one puts, another gets.
@@ -90,5 +94,8 @@ final class IntegrationTests: XCTestCase {
             print("Expected: Two local nodes without relay may not discover each other: \(error)")
             // This is expected behavior - local nodes without relay can't find each other
         }
+
+        try await node1.close()
+        try await node2.close()
     }
 }

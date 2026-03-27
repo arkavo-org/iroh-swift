@@ -16,7 +16,7 @@ final class IrohNodeTests: XCTestCase {
         let node = try await IrohNode(config: config)
 
         // If we get here without throwing, node creation succeeded
-        _ = node
+        try await node.close()
     }
 
     /// Test putting data returns a valid ticket.
@@ -37,6 +37,8 @@ final class IrohNodeTests: XCTestCase {
         // Tickets should start with "blob" (BlobTicket format)
         XCTAssertTrue(ticket.hasPrefix("blob"), "Ticket should start with 'blob', got: \(ticket)")
         XCTAssertFalse(ticket.isEmpty, "Ticket should not be empty")
+
+        try await node.close()
     }
 
     /// Test putting empty data.
@@ -55,6 +57,8 @@ final class IrohNodeTests: XCTestCase {
         let ticket = try await node.put(data)
 
         XCTAssertTrue(ticket.hasPrefix("blob"), "Ticket should start with 'blob'")
+
+        try await node.close()
     }
 
     /// Test that IrohConfig uses Application Support by default.

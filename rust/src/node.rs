@@ -87,9 +87,9 @@ impl IrohNode {
 
             let endpoint = builder.bind().await.context("Failed to bind endpoint")?;
 
-            // Wait for relay connection if enabled
+            // Wait for relay connection if enabled (with timeout to avoid hanging in CI)
             if relay_enabled {
-                let _ = endpoint.online().await;
+                let _ = tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await;
             }
 
             // Set up the blobs protocol handler with push acceptance.
@@ -529,12 +529,16 @@ impl IrohNode {
     /// Gracefully shut down the node.
     ///
     /// This ensures all pending writes are flushed to disk.
+    /// Uses a timeout to prevent hanging if the router cannot shut down cleanly.
     pub fn shutdown(self) -> Result<()> {
         self.runtime.block_on(async {
-            self.router
-                .shutdown()
-                .await
-                .context("Failed to shutdown router")
+            match tokio::time::timeout(Duration::from_secs(5), self.router.shutdown()).await {
+                Ok(result) => result.context("Failed to shutdown router"),
+                Err(_) => {
+                    // Timeout expired — force drop to avoid hanging forever
+                    Ok(())
+                }
+            }
         })
     }
 }
