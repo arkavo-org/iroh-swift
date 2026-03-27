@@ -61,7 +61,9 @@ Version must be synchronized across these files:
 - `VERSION` (source of truth)
 - `rust/Cargo.toml` (package.version)
 - `rust/Cargo.lock` (run `cd rust && cargo update` after updating Cargo.toml)
-- `Package.swift` (binaryTarget checksum, updated by CI on release)
+- `Package.swift` (both `version` string AND `checksum`, updated by CI on release)
+
+**Known pitfall:** The `version` variable in `Package.swift` controls the download URL for the binary target. If it falls out of sync with `VERSION`, SPM will fetch the wrong artifact and the checksum will fail. The 0.3.1 release hit this — `VERSION` and `Cargo.toml` were bumped but `Package.swift` still pointed at 0.3.0. When bumping versions, always verify `Package.swift` version matches `VERSION`.
 
 ## Platform Targets
 
