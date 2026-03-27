@@ -857,6 +857,219 @@ pub extern "C" fn iroh_put_with_options(
     }
 }
 
+/// Push bytes to a remote node identified by its node ID.
+///
+/// Adds the data to the local store, connects to the remote node,
+/// and pushes the blob. Returns the blob hash as a hex string on success.
+///
+/// # Safety
+/// - `handle` must be a valid node handle
+/// - `remote_node_id_hex` must be a valid null-terminated UTF-8 string
+/// - `relay_url` is nullable; if non-null must be a valid null-terminated UTF-8 string
+/// - `direct_addrs` is nullable; if non-null must point to an array of `direct_addrs_len` valid
+///   null-terminated UTF-8 strings
+/// - `bytes.data` must point to valid memory for `bytes.len` bytes
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_push_to_node(
+    handle: *const IrohNodeHandle,
+    remote_node_id_hex: *const c_char,
+    relay_url: *const c_char,
+    direct_addrs: *const *const c_char,
+    direct_addrs_len: usize,
+    bytes: IrohBytes,
+    callback: IrohCallback,
+) {
+    if handle.is_null() {
+        let error = CString::new("handle cannot be null").unwrap();
+        (callback.on_failure)(callback.userdata, error.into_raw());
+        return;
+    }
+
+    if remote_node_id_hex.is_null() {
+        let error = CString::new("remote_node_id_hex cannot be null").unwrap();
+        (callback.on_failure)(callback.userdata, error.into_raw());
+        return;
+    }
+
+    // Parse remote node ID hex string
+    let node_id_str = match unsafe { CStr::from_ptr(remote_node_id_hex) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(e) => {
+            let error = CString::new(format!("Invalid remote_node_id_hex string: {}", e)).unwrap();
+            (callback.on_failure)(callback.userdata, error.into_raw());
+            return;
+        }
+    };
+
+    // Parse optional relay URL
+    let relay_url_str = if relay_url.is_null() {
+        None
+    } else {
+        match unsafe { CStr::from_ptr(relay_url) }.to_str() {
+            Ok(s) => Some(s.to_string()),
+            Err(e) => {
+                let error = CString::new(format!("Invalid relay_url string: {}", e)).unwrap();
+                (callback.on_failure)(callback.userdata, error.into_raw());
+                return;
+            }
+        }
+    };
+
+    // Parse optional direct addresses array
+    let addrs = if direct_addrs.is_null() || direct_addrs_len == 0 {
+        Vec::new()
+    } else {
+        let slice = unsafe { std::slice::from_raw_parts(direct_addrs, direct_addrs_len) };
+        let mut result = Vec::with_capacity(direct_addrs_len);
+        for &ptr in slice {
+            if ptr.is_null() {
+                continue;
+            }
+            match unsafe { CStr::from_ptr(ptr) }.to_str() {
+                Ok(s) => result.push(s.to_string()),
+                Err(e) => {
+                    let error =
+                        CString::new(format!("Invalid direct address string: {}", e)).unwrap();
+                    (callback.on_failure)(callback.userdata, error.into_raw());
+                    return;
+                }
+            }
+        }
+        result
+    };
+
+    // Copy the bytes to own them (Swift memory may not be stable)
+    let data = if bytes.data.is_null() || bytes.len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes.data, bytes.len).to_vec() }
+    };
+
+    let node = unsafe { &*(handle as *const IrohNode) };
+
+    match node.push_to_node(&node_id_str, relay_url_str.as_deref(), &data, &addrs) {
+        Ok(hash_hex) => {
+            let result = CString::new(hash_hex).unwrap();
+            (callback.on_success)(callback.userdata, result.into_raw());
+        }
+        Err(e) => {
+            let error = CString::new(format!("{:#}", e)).unwrap();
+            (callback.on_failure)(callback.userdata, error.into_raw());
+        }
+    }
+}
+
+/// Push bytes to a remote node with options (e.g., timeout).
+///
+/// Same as `iroh_push_to_node` but with configurable operation options.
+///
+/// # Safety
+/// - `handle` must be a valid node handle
+/// - `remote_node_id_hex` must be a valid null-terminated UTF-8 string
+/// - `relay_url` is nullable; if non-null must be a valid null-terminated UTF-8 string
+/// - `direct_addrs` is nullable; if non-null must point to an array of `direct_addrs_len` valid
+///   null-terminated UTF-8 strings
+/// - `bytes.data` must point to valid memory for `bytes.len` bytes
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_push_to_node_with_options(
+    handle: *const IrohNodeHandle,
+    remote_node_id_hex: *const c_char,
+    relay_url: *const c_char,
+    direct_addrs: *const *const c_char,
+    direct_addrs_len: usize,
+    bytes: IrohBytes,
+    options: IrohOperationOptions,
+    callback: IrohCallback,
+) {
+    if handle.is_null() {
+        let error = CString::new("handle cannot be null").unwrap();
+        (callback.on_failure)(callback.userdata, error.into_raw());
+        return;
+    }
+
+    if remote_node_id_hex.is_null() {
+        let error = CString::new("remote_node_id_hex cannot be null").unwrap();
+        (callback.on_failure)(callback.userdata, error.into_raw());
+        return;
+    }
+
+    // Parse remote node ID hex string
+    let node_id_str = match unsafe { CStr::from_ptr(remote_node_id_hex) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(e) => {
+            let error = CString::new(format!("Invalid remote_node_id_hex string: {}", e)).unwrap();
+            (callback.on_failure)(callback.userdata, error.into_raw());
+            return;
+        }
+    };
+
+    // Parse optional relay URL
+    let relay_url_str = if relay_url.is_null() {
+        None
+    } else {
+        match unsafe { CStr::from_ptr(relay_url) }.to_str() {
+            Ok(s) => Some(s.to_string()),
+            Err(e) => {
+                let error = CString::new(format!("Invalid relay_url string: {}", e)).unwrap();
+                (callback.on_failure)(callback.userdata, error.into_raw());
+                return;
+            }
+        }
+    };
+
+    // Parse optional direct addresses array
+    let addrs = if direct_addrs.is_null() || direct_addrs_len == 0 {
+        Vec::new()
+    } else {
+        let slice = unsafe { std::slice::from_raw_parts(direct_addrs, direct_addrs_len) };
+        let mut result = Vec::with_capacity(direct_addrs_len);
+        for &ptr in slice {
+            if ptr.is_null() {
+                continue;
+            }
+            match unsafe { CStr::from_ptr(ptr) }.to_str() {
+                Ok(s) => result.push(s.to_string()),
+                Err(e) => {
+                    let error =
+                        CString::new(format!("Invalid direct address string: {}", e)).unwrap();
+                    (callback.on_failure)(callback.userdata, error.into_raw());
+                    return;
+                }
+            }
+        }
+        result
+    };
+
+    // Copy the bytes to own them (Swift memory may not be stable)
+    let data = if bytes.data.is_null() || bytes.len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes.data, bytes.len).to_vec() }
+    };
+
+    let node = unsafe { &*(handle as *const IrohNode) };
+    let timeout_ms = options.timeout_ms;
+
+    match node.push_to_node_with_timeout(
+        &node_id_str,
+        relay_url_str.as_deref(),
+        &data,
+        &addrs,
+        timeout_ms,
+    ) {
+        Ok(hash_hex) => {
+            let result = CString::new(hash_hex).unwrap();
+            (callback.on_success)(callback.userdata, result.into_raw());
+        }
+        Err(e) => {
+            let error = CString::new(format!("{:#}", e)).unwrap();
+            (callback.on_failure)(callback.userdata, error.into_raw());
+        }
+    }
+}
+
 /// Download bytes from a ticket with options (e.g., timeout).
 ///
 /// # Safety

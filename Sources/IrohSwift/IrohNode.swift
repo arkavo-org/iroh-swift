@@ -362,7 +362,7 @@ public actor IrohNode {
 // MARK: - Internal Helpers
 
 /// Box for passing Swift continuations through FFI callbacks.
-private final class ContinuationBox<T>: @unchecked Sendable {
+final class ContinuationBox<T>: @unchecked Sendable {
     let continuation: CheckedContinuation<T, Error>
 
     init(_ continuation: CheckedContinuation<T, Error>) {

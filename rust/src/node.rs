@@ -6,8 +6,10 @@
 use anyhow::{Context, Result};
 use futures_lite::StreamExt;
 use iroh::endpoint::{RelayMode, presets};
-use iroh::{Endpoint, RelayMap, RelayUrl, protocol::Router};
+use iroh::{Endpoint, EndpointAddr, RelayMap, RelayUrl, protocol::Router};
 use iroh_blobs::api::downloader::DownloadProgressItem;
+use iroh_blobs::protocol::{GetRequest, PushRequest};
+use iroh_blobs::provider::events::{EventMask, EventSender, ProviderMessage, RequestMode};
 use iroh_blobs::{ALPN as BLOBS_ALPN, BlobsProtocol, store::fs::FsStore, ticket::BlobTicket};
 use iroh_docs::protocol::Docs;
 use iroh_gossip::ALPN as GOSSIP_ALPN;
@@ -43,6 +45,9 @@ pub struct IrohNode {
     gossip: Option<Gossip>,
     /// Docs protocol (only if docs_enabled).
     docs: Option<Docs>,
+    /// Event handler task for accepting push requests (must be kept alive).
+    #[allow(dead_code)]
+    event_handler: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl IrohNode {
@@ -62,7 +67,7 @@ impl IrohNode {
         // Create dedicated runtime for this node
         let runtime = Runtime::new().context("Failed to create Tokio runtime")?;
 
-        let (endpoint, store, router, gossip, docs) = runtime.block_on(async {
+        let (endpoint, store, router, gossip, docs, event_handler) = runtime.block_on(async {
             // Create or load the persistent store
             let store = FsStore::load(&storage_path)
                 .await
@@ -87,8 +92,31 @@ impl IrohNode {
                 let _ = endpoint.online().await;
             }
 
-            // Set up the blobs protocol handler
-            let blobs = BlobsProtocol::new(&store, None);
+            // Set up the blobs protocol handler with push acceptance.
+            // EventSender::request() checks only mask.get for ALL request types
+            // (get, push, etc.), so we set get: Notify to enable push delivery.
+            let mask = EventMask {
+                get: RequestMode::Notify,
+                ..EventMask::DEFAULT
+            };
+            let (event_sender, mut event_rx) = EventSender::channel(64, mask);
+
+            // Spawn event handler that accepts push requests
+            let event_handler = tokio::spawn(async move {
+                while let Some(msg) = event_rx.recv().await {
+                    match msg {
+                        ProviderMessage::PushRequestReceived(msg) => {
+                            msg.tx.send(Ok(())).await.ok();
+                        }
+                        ProviderMessage::ClientConnected(msg) => {
+                            msg.tx.send(Ok(())).await.ok();
+                        }
+                        _ => {}
+                    }
+                }
+            });
+
+            let blobs = BlobsProtocol::new(&store, Some(event_sender));
 
             // Conditionally set up Docs protocol
             let (gossip, docs) = if docs_enabled {
@@ -128,7 +156,7 @@ impl IrohNode {
 
             let router = router_builder.spawn();
 
-            Ok::<_, anyhow::Error>((endpoint, store, router, gossip, docs))
+            Ok::<_, anyhow::Error>((endpoint, store, router, gossip, docs, event_handler))
         })?;
 
         Ok(Self {
@@ -138,6 +166,7 @@ impl IrohNode {
             router,
             gossip,
             docs,
+            event_handler: Some(event_handler),
         })
     }
 
@@ -335,6 +364,146 @@ impl IrohNode {
         })
     }
 
+    /// Push data to a remote node.
+    ///
+    /// Adds the data to the local store, connects to the remote node,
+    /// and pushes the blob. Returns the blob hash as a hex string.
+    ///
+    /// # Arguments
+    /// * `remote_node_id_hex` - The remote node's ID as a hex string
+    /// * `relay_url` - Optional relay URL for routing the connection
+    /// * `data` - The bytes to push
+    /// * `direct_addrs` - Optional direct IP:port addresses for local / no-relay connections
+    pub fn push_to_node(
+        &self,
+        remote_node_id_hex: &str,
+        relay_url: Option<&str>,
+        data: &[u8],
+        direct_addrs: &[String],
+    ) -> Result<String> {
+        self.runtime.block_on(async {
+            // Add bytes to local store first
+            let tag = self
+                .store
+                .add_slice(data)
+                .await
+                .context("Failed to add bytes to store")?;
+
+            // Parse remote node ID
+            let node_id: iroh::EndpointId = remote_node_id_hex
+                .parse()
+                .context("Failed to parse remote node ID")?;
+
+            // Build EndpointAddr with optional relay and/or direct addresses
+            let mut endpoint_addr = EndpointAddr::from(node_id);
+            if let Some(url) = relay_url {
+                let relay_url: RelayUrl = url.parse().context("Invalid relay URL")?;
+                endpoint_addr = endpoint_addr.with_relay_url(relay_url);
+            }
+            for addr_str in direct_addrs {
+                let socket_addr: std::net::SocketAddr =
+                    addr_str.parse().context("Invalid direct address")?;
+                endpoint_addr = endpoint_addr.with_ip_addr(socket_addr);
+            }
+
+            // Connect to remote node
+            let conn = self
+                .endpoint
+                .connect(endpoint_addr, BLOBS_ALPN)
+                .await
+                .context("Failed to connect to remote node")?;
+
+            // Keep a connection handle alive — execute_push takes ownership but
+            // Connection is Clone (ref-counted). The server needs time to
+            // accept_bi and process the push stream after execute_push returns.
+            let _conn_guard = conn.clone();
+
+            // Push the blob
+            let request = PushRequest::from(GetRequest::blob(tag.hash));
+            self.store
+                .remote()
+                .execute_push(conn, request)
+                .await
+                .context("Failed to push blob to remote node")?;
+
+            // Give the server time to process the push before dropping the connection.
+            // Without this, small blobs may transfer in a single QUIC packet and the
+            // server's accept_bi may not be scheduled before the connection closes.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            Ok(hex::encode(tag.hash.as_bytes()))
+        })
+    }
+
+    /// Push data to a remote node with an optional timeout.
+    ///
+    /// # Arguments
+    /// * `remote_node_id_hex` - The remote node's ID as a hex string
+    /// * `relay_url` - Optional relay URL for routing the connection
+    /// * `data` - The bytes to push
+    /// * `direct_addrs` - Optional direct IP:port addresses for local / no-relay connections
+    /// * `timeout_ms` - Timeout in milliseconds (0 = no timeout)
+    pub fn push_to_node_with_timeout(
+        &self,
+        remote_node_id_hex: &str,
+        relay_url: Option<&str>,
+        data: &[u8],
+        direct_addrs: &[String],
+        timeout_ms: u64,
+    ) -> Result<String> {
+        self.runtime.block_on(async {
+            let fut = async {
+                let tag = self
+                    .store
+                    .add_slice(data)
+                    .await
+                    .context("Failed to add bytes to store")?;
+
+                let node_id: iroh::EndpointId = remote_node_id_hex
+                    .parse()
+                    .context("Failed to parse remote node ID")?;
+
+                let mut endpoint_addr = EndpointAddr::from(node_id);
+                if let Some(url) = relay_url {
+                    let relay_url: RelayUrl = url.parse().context("Invalid relay URL")?;
+                    endpoint_addr = endpoint_addr.with_relay_url(relay_url);
+                }
+                for addr_str in direct_addrs {
+                    let socket_addr: std::net::SocketAddr =
+                        addr_str.parse().context("Invalid direct address")?;
+                    endpoint_addr = endpoint_addr.with_ip_addr(socket_addr);
+                }
+
+                let conn = self
+                    .endpoint
+                    .connect(endpoint_addr, BLOBS_ALPN)
+                    .await
+                    .context("Failed to connect to remote node")?;
+
+                let _conn_guard = conn.clone();
+
+                let request = PushRequest::from(GetRequest::blob(tag.hash));
+                self.store
+                    .remote()
+                    .execute_push(conn, request)
+                    .await
+                    .context("Failed to push blob to remote node")?;
+
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                Ok::<_, anyhow::Error>(hex::encode(tag.hash.as_bytes()))
+            };
+
+            if timeout_ms == 0 {
+                fut.await
+            } else {
+                tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                    .await
+                    .context("Operation timed out")?
+            }
+        })
+    }
+
     /// Get information about this node.
     pub fn info(&self) -> Result<NodeInfo> {
         self.runtime.block_on(async {
@@ -374,6 +543,68 @@ impl IrohNode {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_push_to_node_roundtrip() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+
+        // Create two nodes, relay disabled (local connection)
+        let node_a = IrohNode::new(dir_a.path().to_path_buf(), false, None, false).unwrap();
+        let node_b = IrohNode::new(dir_b.path().to_path_buf(), false, None, false).unwrap();
+
+        // Get node B's ID
+        let node_b_info = node_b.info().unwrap();
+        let node_b_id = &node_b_info.node_id;
+
+        // Collect node B's direct IP addresses for local-only connection (relay disabled)
+        let node_b_addr = node_b.endpoint().addr();
+        let direct_addrs: Vec<String> = node_b_addr.ip_addrs().map(|a| a.to_string()).collect();
+
+        // Push data from A to B
+        let data = b"Push test data!";
+        let hash_hex = node_a
+            .push_to_node(node_b_id, None, data, &direct_addrs)
+            .unwrap();
+
+        // Verify hash is valid hex (64 chars for blake3)
+        assert_eq!(hash_hex.len(), 64);
+        assert!(hash_hex.chars().all(|c: char| c.is_ascii_hexdigit()));
+
+        node_a.shutdown().unwrap();
+        node_b.shutdown().unwrap();
+    }
+
+    /// Push to a live remote node.
+    /// Requires env vars: IROH_REMOTE_NODE_ID, IROH_REMOTE_ADDR
+    /// Run with:
+    ///   IROH_REMOTE_NODE_ID=<hex> IROH_REMOTE_ADDR=<ip:port> \
+    ///     cargo test test_push_to_remote -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_push_to_remote() {
+        let remote_node_id = std::env::var("IROH_REMOTE_NODE_ID").expect("Set IROH_REMOTE_NODE_ID");
+        let direct_addr = std::env::var("IROH_REMOTE_ADDR").expect("Set IROH_REMOTE_ADDR");
+
+        let dir = tempdir().unwrap();
+        let node = IrohNode::new(dir.path().to_path_buf(), true, None, false).unwrap();
+
+        let info = node.info().unwrap();
+        println!("Local node ID: {}", info.node_id);
+        println!("Relay: {}", info.relay_url.as_deref().unwrap_or("none"));
+
+        let data = b"iroh-swift push integration test";
+        println!("Pushing {} bytes to {}...", data.len(), direct_addr);
+
+        let hash_hex = node
+            .push_to_node(&remote_node_id, None, data, &[direct_addr])
+            .expect("Push to remote node failed");
+
+        println!("Push succeeded! Hash: {}", hash_hex);
+        assert_eq!(hash_hex.len(), 64);
+
+        node.shutdown().unwrap();
+    }
 
     #[test]
     fn test_put_roundtrip() {
