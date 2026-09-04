@@ -1,6 +1,6 @@
 [package]
 name = "iroh-swift-ffi"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
 description = "Minimal FFI bindings for Iroh blob operations"
@@ -10,19 +10,19 @@ crate-type = ["staticlib"]
 name = "iroh_swift"
 
 [dependencies]
-# Match iroh.arkavo.net server version
-# iroh-blobs 0.99 depends on iroh 0.97
-iroh = "0.97"
-iroh-blobs = { version = "0.99", features = ["fs-store"] }
+# Match the backend wire: https://github.com/arkavo-org/tdf-iroh-s3 (iroh = "1.0.3", iroh-blobs = "0.103")
+# Caret requirement, same as the backend; its Cargo.lock resolves to iroh 1.1.0.
+iroh = "1.0.3"
+iroh-blobs = { version = "0.103", features = ["fs-store"] }
 # Docs support (optional, enabled via config)
-iroh-docs = "0.97"
-iroh-gossip = "0.97"
+iroh-docs = "0.101"
+iroh-gossip = "0.101"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 tokio-util = "0.7"
 anyhow = "1"
 futures-lite = "2"
 hex = "0.4"
-rand = "0.9"
+rand = "0.10"
 
 [build-dependencies]
 cbindgen = "0.28"

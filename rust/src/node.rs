@@ -659,4 +659,27 @@ mod tests {
 
         node.shutdown().unwrap();
     }
+
+    /// Download a blob from another node via ticket.
+    /// Uses relay + n0 DNS discovery, so it needs network access. Run with:
+    ///   cargo test test_get_cross_node_roundtrip -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_get_cross_node_roundtrip() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+
+        // Relay enabled so node B can discover node A via n0 DNS/relay
+        let node_a = IrohNode::new(dir_a.path().to_path_buf(), true, None, false).unwrap();
+        let node_b = IrohNode::new(dir_b.path().to_path_buf(), true, None, false).unwrap();
+
+        let data = b"Cross-node get test data";
+        let ticket = node_a.put(data).unwrap();
+
+        let fetched = node_b.get_with_timeout(&ticket, 60_000).unwrap();
+        assert_eq!(fetched, data);
+
+        node_a.shutdown().unwrap();
+        node_b.shutdown().unwrap();
+    }
 }

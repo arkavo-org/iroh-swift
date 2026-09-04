@@ -559,7 +559,8 @@ void iroh_node_create(struct IrohNodeConfig config, struct IrohNodeCreateCallbac
 /**
  * Destroy an Iroh node and free its resources.
  *
- * This performs a graceful shutdown, ensuring pending writes are flushed.
+ * Performs shutdown on a background thread to avoid blocking Swift's
+ * cooperative thread pool (which can deadlock if called from deinit).
  *
  * # Safety
  * - `handle` must be a valid pointer returned by `iroh_node_create`
@@ -666,6 +667,52 @@ void iroh_put_with_options(const struct IrohNodeHandle *handle,
                            struct IrohBytes bytes,
                            struct IrohOperationOptions options,
                            struct IrohCallback callback);
+
+/**
+ * Push bytes to a remote node identified by its node ID.
+ *
+ * Adds the data to the local store, connects to the remote node,
+ * and pushes the blob. Returns the blob hash as a hex string on success.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle
+ * - `remote_node_id_hex` must be a valid null-terminated UTF-8 string
+ * - `relay_url` is nullable; if non-null must be a valid null-terminated UTF-8 string
+ * - `direct_addrs` is nullable; if non-null must point to an array of `direct_addrs_len` valid
+ *   null-terminated UTF-8 strings
+ * - `bytes.data` must point to valid memory for `bytes.len` bytes
+ * - `callback` must have valid function pointers
+ */
+void iroh_push_to_node(const struct IrohNodeHandle *handle,
+                       const char *remoteNodeIdHex,
+                       const char *relayUrl,
+                       const char *const *directAddrs,
+                       uintptr_t directAddrsLen,
+                       struct IrohBytes bytes,
+                       struct IrohCallback callback);
+
+/**
+ * Push bytes to a remote node with options (e.g., timeout).
+ *
+ * Same as `iroh_push_to_node` but with configurable operation options.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle
+ * - `remote_node_id_hex` must be a valid null-terminated UTF-8 string
+ * - `relay_url` is nullable; if non-null must be a valid null-terminated UTF-8 string
+ * - `direct_addrs` is nullable; if non-null must point to an array of `direct_addrs_len` valid
+ *   null-terminated UTF-8 strings
+ * - `bytes.data` must point to valid memory for `bytes.len` bytes
+ * - `callback` must have valid function pointers
+ */
+void iroh_push_to_node_with_options(const struct IrohNodeHandle *handle,
+                                    const char *remoteNodeIdHex,
+                                    const char *relayUrl,
+                                    const char *const *directAddrs,
+                                    uintptr_t directAddrsLen,
+                                    struct IrohBytes bytes,
+                                    struct IrohOperationOptions options,
+                                    struct IrohCallback callback);
 
 /**
  * Download bytes from a ticket with options (e.g., timeout).
