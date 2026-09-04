@@ -243,7 +243,7 @@ swift test
 ```
 Swift Layer (IrohSwift)           Rust FFI Layer              Iroh Libraries
 ┌─────────────────────┐          ┌──────────────────┐        ┌─────────────┐
-│ IrohNode (actor)    │──C ABI──▶│ ffi.rs           │──────▶│ iroh 0.95   │
+│ IrohNode (actor)    │──C ABI──▶│ ffi.rs           │──────▶│ iroh 1.1.0  │
 │ IrohDoc (actor)     │          │ node.rs          │       │ iroh-blobs  │
 │ IrohAuthor          │          └──────────────────┘       │ iroh-docs   │
 └─────────────────────┘                                      └─────────────┘
@@ -257,6 +257,8 @@ Swift Layer (IrohSwift)           Rust FFI Layer              Iroh Libraries
 
 | iroh-swift | iroh | iroh-blobs | iroh-docs |
 |------------|------|------------|-----------|
+| 0.5.x | 1.1.0 | 0.103 | 0.101 |
+| 0.4.x | 0.97 | 0.99 | 0.97 |
 | 0.3.x | 0.95 | 0.97 | 0.32 |
 | 0.2.x | 0.95 | 0.97 | - |
 | 0.1.x | 0.95 | 0.97 | - |

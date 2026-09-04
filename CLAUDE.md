@@ -35,8 +35,8 @@ Three-layer design with FFI boundary:
 ```
 Swift Layer (IrohSwift)           Rust FFI Layer                Iroh Libraries
 ┌─────────────────────┐          ┌────────────────────┐        ┌───────────────┐
-│ IrohNode (actor)    │──C ABI──▶│ ffi.rs (callbacks) │──────▶│ iroh 0.97     │
-│ IrohConfig          │          │ node.rs (IrohNode) │       │ iroh-blobs 0.99│
+│ IrohNode (actor)    │──C ABI──▶│ ffi.rs (callbacks) │──────▶│ iroh 1.1.0    │
+│ IrohConfig          │          │ node.rs (IrohNode) │       │ iroh-blobs 0.103│
 │ IrohError           │          └────────────────────┘        │ tokio runtime │
 └─────────────────────┘                                        └───────────────┘
 ```
