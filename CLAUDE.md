@@ -68,7 +68,11 @@ Version must be synchronized across these files:
 ## Platform Targets
 
 - iOS 26+ / macOS 26+
-- ARM64 only: `aarch64-apple-ios`, `aarch64-apple-ios-sim`, `aarch64-apple-darwin`
+- XCFramework slices (keep all of them; consumers build `generic/platform=iOS Simulator` and `generic/platform=macOS` for both architectures):
+  - `ios-arm64`: `aarch64-apple-ios`
+  - `ios-arm64_x86_64-simulator`: `aarch64-apple-ios-sim` + `x86_64-apple-ios`, merged with `lipo`
+  - `macos-arm64_x86_64`: `aarch64-apple-darwin` + `x86_64-apple-darwin`, merged with `lipo`
+- Dropping an x86_64 slice forces every consumer to set `EXCLUDED_ARCHS = x86_64`; otherwise their link fails with `Undefined symbols for architecture x86_64`.
 
 ## Testing
 

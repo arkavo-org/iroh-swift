@@ -10,8 +10,12 @@ let checksum = "441b29b038abb1e7c9ac8d135480423f41581d9634ef9dc7eae0857e57199394
 // Check if using local development mode
 // Set IROH_LOCAL_DEV=1 environment variable to use local XCFramework
 // Use local binary if XCFramework exists (local dev) or env var is set
+// The existence check must be anchored at the package directory: the manifest
+// is not always evaluated with it as the working directory (Xcode, or a
+// consumer depending on this package by path), and a relative check silently
+// falls back to the released artifact.
 let useLocalBinary = ProcessInfo.processInfo.environment["IROH_LOCAL_DEV"] != nil
-    || FileManager.default.fileExists(atPath: "IrohSwiftFFI.xcframework")
+    || FileManager.default.fileExists(atPath: Context.packageDirectory + "/IrohSwiftFFI.xcframework")
 
 // Binary target configuration
 let binaryTarget: Target = useLocalBinary
@@ -53,6 +57,10 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("SystemConfiguration"),
                 .linkedFramework("Security"),
+                // The iOS Rust library monitors network paths with nw_path_*
+                // (rustc `--print native-static-libs` lists -framework Network
+                // for the iOS and iOS Simulator targets only).
+                .linkedFramework("Network", .when(platforms: [.iOS])),
                 .linkedLibrary("resolv"),
             ]
         ),

@@ -228,9 +228,9 @@ swift run iroh-cli docs-join <ticket>
 ```
 
 Targets:
-- `aarch64-apple-ios` (iOS device)
-- `aarch64-apple-ios-sim` (iOS Simulator)
-- `aarch64-apple-darwin` (macOS)
+- `aarch64-apple-ios` (iOS device, arm64)
+- `aarch64-apple-ios-sim` + `x86_64-apple-ios` (iOS Simulator, universal arm64 + x86_64)
+- `aarch64-apple-darwin` + `x86_64-apple-darwin` (macOS, universal arm64 + x86_64)
 
 ### Run Tests
 
