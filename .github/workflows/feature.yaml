@@ -108,11 +108,27 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,x86_64-apple-darwin
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+
+      # The release XCFramework ships every one of these targets; catch a
+      # dependency that fails to compile for one of them before release.
+      - name: Check Apple release targets
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+          MACOSX_DEPLOYMENT_TARGET: "26.0"
+        run: |
+          cd rust
+          for target in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios x86_64-apple-darwin; do
+            echo "::group::cargo check --target $target"
+            cargo check --release --target "$target"
+            echo "::endgroup::"
+          done
 
       - name: Check formatting
         run: |
