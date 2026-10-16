@@ -23,7 +23,7 @@ Add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/arkavo-org/iroh-swift.git", from: "0.3.0")
+    .package(url: "https://github.com/arkavo-org/iroh-swift.git", from: "0.6.0")
 ]
 ```
 
@@ -52,6 +52,57 @@ let ticket = try await node.put(data)
 
 // Retrieve data using a ticket
 let retrieved = try await node.get(ticket: ticket)
+```
+
+### Fetch a Blob from a Pinned Node
+
+Download by BLAKE3 hash from one known node (no ticket) straight into a file.
+Every byte is verified against the hash as it arrives; the file only appears at
+`destination` once the whole blob is verified.
+
+```swift
+// A client-only node: it can fetch and push, but never serves blobs to others.
+let viewer = try await IrohNode(config: IrohConfig(servesBlobs: false))
+
+let task = Task {
+    try await viewer.fetch(
+        hash: blobHash,                 // 64 hex chars
+        fromNode: serverNodeId,         // 64 hex chars, the only node contacted
+        relayUrl: serverRelayUrl,       // optional address hints
+        directAddrs: serverAddrs,
+        to: cacheURL,
+        maxSize: 512 * 1024 * 1024,     // checked before any content is read
+        progress: { downloaded, total in /* cumulative bytes */ }
+    )
+}
+// task.cancel() aborts the transfer and throws CancellationError.
+```
+
+Errors: `IrohError.notFound` (the node does not have the blob),
+`IrohError.sizeLimitExceeded(size)`, `CancellationError`, `IrohError.nodeClosed`,
+and `IrohError.fetchFailed` for everything else. On any error no file is left at
+`destination`.
+
+### Sign with the Endpoint Key, then Push
+
+```swift
+let publisher = try await IrohNode()
+let endpointID = try await publisher.endpointID()   // Ed25519 public key, 64 lowercase hex
+
+let message = Data("""
+    tdf-iroh-s3 publish-session v1
+    \(endpointID)
+    \(IrohBLAKE3.hex(Data(bearerToken.utf8)))
+    \(timestamp)
+    """.utf8)
+let signature = try await publisher.sign(message)   // 64-byte Ed25519 signature
+
+// Push from the same node: the endpoint key is per node instance, not persisted.
+let hash = try await publisher.pushToNode(
+    nodeId: serverNodeId,
+    relayUrl: serverRelayUrl,
+    fileURL: tdfFileURL                             // streamed, never loaded into memory
+)
 ```
 
 ### Docs (Synchronized Documents)
@@ -153,13 +204,18 @@ if IrohAuthor.exists(identifier: "default") {
 | `init(config:)` | Create a node with optional configuration |
 | `put(_:)` | Store data, return shareable ticket |
 | `get(ticket:)` | Download data using a ticket |
+| `fetch(hash:fromNode:relayUrl:directAddrs:to:maxSize:progress:)` | Download a blob by hash from one node into a file (verified, size-limited, cancellable) |
+| `pushToNode(nodeId:relayUrl:directAddrs:data:)` | Push bytes to a node, return the blob hash |
+| `pushToNode(nodeId:relayUrl:directAddrs:fileURL:)` | Push a file to a node without loading it into memory, return the blob hash |
+| `endpointID()` | This node's Ed25519 public key, 64 lowercase hex (same as `info().nodeId`) |
+| `sign(_:)` | 64-byte Ed25519 signature with the endpoint secret key |
 | `createDoc()` | Create a new document (requires `docsEnabled`) |
 | `joinDoc(ticket:)` | Join an existing document |
 | `importAuthor(_:)` | Register an author with the docs engine |
 | `tagBlob(hash:name:format:)` | Pin a blob to prevent GC |
 | `untagBlob(name:)` | Remove a pin |
 | `createTicket(hash:format:)` | Create a ticket for an existing blob |
-| `info()` | Get node ID, relay URL, connection status |
+| `info()` | Get node ID, relay URL, direct addresses, connection status |
 | `close()` | Gracefully shut down the node |
 
 ### IrohDoc
@@ -192,6 +248,13 @@ if IrohAuthor.exists(identifier: "default") {
 | `relayEnabled` | `Bool` | `true` | Use n0 public relay servers |
 | `docsEnabled` | `Bool` | `false` | Enable document sync |
 | `customRelayUrl` | `String?` | `nil` | Custom relay server URL |
+| `servesBlobs` | `Bool` | `true` | Serve blobs to peers; `false` makes a client-only node (fetch and push still work) |
+
+### IrohBLAKE3
+
+| Method | Description |
+|--------|-------------|
+| `hex(_:)` | BLAKE3 hash of `Data` as 64 lowercase hex (equals the raw blob hash) |
 
 ### KeychainAccessibility
 
@@ -235,7 +298,7 @@ Targets:
 ### Run Tests
 
 ```bash
-swift test
+IROH_LOCAL_DEV=1 swift test
 ```
 
 ## Architecture
@@ -257,6 +320,7 @@ Swift Layer (IrohSwift)           Rust FFI Layer              Iroh Libraries
 
 | iroh-swift | iroh | iroh-blobs | iroh-docs |
 |------------|------|------------|-----------|
+| 0.6.x | 1.1.0 | 0.103 | 0.101 |
 | 0.5.x | 1.1.0 | 0.103 | 0.101 |
 | 0.4.x | 0.97 | 0.99 | 0.97 |
 | 0.3.x | 0.95 | 0.97 | 0.32 |
