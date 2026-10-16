@@ -65,6 +65,15 @@ public enum IrohError: Error, Sendable {
     case blobUntagFailed(String)
     /// Failed to create a ticket for a blob.
     case ticketCreationFailed(String)
+    // MARK: - Fetch Errors
+    /// The remote node does not have the requested blob.
+    case notFound
+    /// The remote node announced a blob of this many bytes, more than the
+    /// caller's `maxSize`. Nothing was written.
+    case sizeLimitExceeded(UInt64)
+    /// Failed to fetch a blob from a node (bad arguments, connection,
+    /// protocol, verification or file I/O).
+    case fetchFailed(String)
 }
 
 extension IrohError: LocalizedError {
@@ -130,6 +139,12 @@ extension IrohError: LocalizedError {
             return "Failed to untag blob: \(msg)"
         case .ticketCreationFailed(let msg):
             return "Failed to create ticket: \(msg)"
+        case .notFound:
+            return "Blob not found on the remote node"
+        case .sizeLimitExceeded(let size):
+            return "Blob size \(size) bytes exceeds the size limit"
+        case .fetchFailed(let msg):
+            return "Failed to fetch blob: \(msg)"
         }
     }
 }

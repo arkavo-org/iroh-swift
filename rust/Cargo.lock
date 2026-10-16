@@ -1955,6 +1955,7 @@ name = "iroh-swift-ffi"
 version = "0.5.1"
 dependencies = [
  "anyhow",
+ "bao-tree",
  "blake3",
  "cbindgen",
  "ed25519-dalek",

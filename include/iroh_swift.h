@@ -11,6 +11,12 @@
 #include <stdlib.h>
 
 /**
+ * How often (in downloaded bytes) a fetch reports progress, besides the
+ * first report (0 bytes, once the size is known) and the final one.
+ */
+#define FETCH_PROGRESS_STEP (256 * 1024)
+
+/**
  * Share mode for document tickets.
  */
 typedef enum IrohDocShareMode {
@@ -71,6 +77,33 @@ typedef enum IrohBlobFormat {
      */
     HashSeq = 1,
 } IrohBlobFormat;
+
+/**
+ * Why a spawned operation failed.
+ *
+ */
+typedef enum IrohOperationErrorCode {
+    /**
+     * Any other failure; see the message.
+     */
+    IrohOperationErrorCode_Failed = 0,
+    /**
+     * The remote node does not have the requested blob.
+     */
+    IrohOperationErrorCode_NotFound = 1,
+    /**
+     * The remote announced a blob larger than the size limit (`size` carries it).
+     */
+    IrohOperationErrorCode_SizeLimitExceeded = 2,
+    /**
+     * The operation was cancelled through its cancel token.
+     */
+    IrohOperationErrorCode_Cancelled = 3,
+    /**
+     * The node shut down while the operation was in flight.
+     */
+    IrohOperationErrorCode_NodeShutDown = 4,
+} IrohOperationErrorCode;
 
 /**
  * Configuration for creating a node.
@@ -558,6 +591,49 @@ typedef struct IrohDocSubscribeCallback {
 } IrohDocSubscribeCallback;
 
 /**
+ * Opaque cancellation token for a spawned operation (fetch).
+ *
+ * Create with `iroh_cancel_token_new`, pass to the operation, cancel with
+ * `iroh_cancel_token_cancel` (any thread, any number of times), and free with
+ * `iroh_cancel_token_free` once nothing will cancel it any more. The operation
+ * keeps its own reference, so freeing the token early is safe.
+ */
+typedef struct IrohCancelToken {
+    uint8_t _private[0];
+} IrohCancelToken;
+
+/**
+ * Callback for `iroh_fetch_from_node`.
+ *
+ * Exactly one of `on_success` / `on_failure` is called, once. `on_progress`
+ * (nullable) is only called before that. Callbacks may run on a Tokio worker
+ * thread, or synchronously inside `iroh_fetch_from_node` for argument errors.
+ */
+typedef struct IrohFetchCallback {
+    /**
+     * Opaque pointer passed back to Swift.
+     */
+    void *userdata;
+    /**
+     * Cumulative progress: `(0, total)` once the size is accepted, then
+     * periodically, ending with `(total, total)`. Null to skip progress.
+     */
+    void (*on_progress)(void *userdata, uint64_t downloaded, uint64_t total);
+    /**
+     * Called once the verified blob has been moved to the destination path.
+     */
+    void (*on_success)(void *userdata, uint64_t size);
+    /**
+     * Called on failure. `size` is the announced size for `SizeLimitExceeded`,
+     * else 0. `error` must be freed with `iroh_string_free`.
+     */
+    void (*on_failure)(void *userdata,
+                       enum IrohOperationErrorCode code,
+                       uint64_t size,
+                       const char *error);
+} IrohFetchCallback;
+
+/**
  * Create a new Iroh node asynchronously.
  *
  * # Safety
@@ -1039,5 +1115,64 @@ bool iroh_node_sign(const struct IrohNodeHandle *handle,
  * - `bytes.data` must point to valid memory for `bytes.len` bytes (or be null with len 0)
  */
 char *iroh_blake3_hex(struct IrohBytes bytes);
+
+/**
+ * Create a cancellation token. Free with `iroh_cancel_token_free`.
+ */
+struct IrohCancelToken *iroh_cancel_token_new(void);
+
+/**
+ * Cancel the operation(s) using this token. Idempotent and thread-safe.
+ *
+ * # Safety
+ * - `token` must be a live pointer from `iroh_cancel_token_new` (or null)
+ */
+void iroh_cancel_token_cancel(const struct IrohCancelToken *token);
+
+/**
+ * Free a cancellation token. Does not cancel anything.
+ *
+ * # Safety
+ * - `token` must come from `iroh_cancel_token_new` (or be null) and must not
+ *   be used after this call
+ */
+void iroh_cancel_token_free(struct IrohCancelToken *token);
+
+/**
+ * Fetch the raw blob `hash_hex` from one remote node into the file at `destination_path`.
+ *
+ * Connects to `remote_node_id_hex` (64 hex) only — never to other providers —
+ * using `relay_url` and/or `direct_addrs` as address hints, and streams the
+ * blob with BLAKE3 verification straight to a temporary sibling of
+ * `destination_path`, which is renamed into place only after the full blob is
+ * verified. The blob is not added to the local store. If the remote announces
+ * a size above `max_size` the fetch fails with `SizeLimitExceeded` before any
+ * content is read. On failure or cancellation no file is left at
+ * `destination_path` (an existing file there is left untouched; on success it
+ * is replaced).
+ *
+ * Returns immediately; the transfer runs on the node's runtime. Cancel it with
+ * `iroh_cancel_token_cancel(cancel_token)`.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle that outlives the operation's callback
+ * - `hash_hex`, `remote_node_id_hex`, `destination_path` must be valid
+ *   null-terminated UTF-8 strings
+ * - `relay_url` is nullable; if non-null must be a valid null-terminated UTF-8 string
+ * - `direct_addrs` is nullable; if non-null must point to `direct_addrs_len`
+ *   valid null-terminated UTF-8 strings
+ * - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+ * - `callback` must have valid function pointers
+ */
+void iroh_fetch_from_node(const struct IrohNodeHandle *handle,
+                          const char *hashHex,
+                          const char *remoteNodeIdHex,
+                          const char *relayUrl,
+                          const char *const *directAddrs,
+                          uintptr_t directAddrsLen,
+                          const char *destinationPath,
+                          uint64_t maxSize,
+                          const struct IrohCancelToken *cancelToken,
+                          struct IrohFetchCallback callback);
 
 #endif  /* IROH_SWIFT_H */

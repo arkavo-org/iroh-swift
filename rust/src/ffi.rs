@@ -2348,6 +2348,325 @@ pub unsafe extern "C" fn iroh_blake3_hex(bytes: IrohBytes) -> *mut c_char {
     c_string(crate::node::blake3_hex(data))
 }
 
+// ============================================================================
+// Cancellable Operations
+// ============================================================================
+
+/// Opaque cancellation token for a spawned operation (fetch).
+///
+/// Create with `iroh_cancel_token_new`, pass to the operation, cancel with
+/// `iroh_cancel_token_cancel` (any thread, any number of times), and free with
+/// `iroh_cancel_token_free` once nothing will cancel it any more. The operation
+/// keeps its own reference, so freeing the token early is safe.
+#[repr(C)]
+pub struct IrohCancelToken {
+    _private: [u8; 0],
+}
+
+/// Why a spawned operation failed.
+///
+/// cbindgen:prefix-with-name
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IrohOperationErrorCode {
+    /// Any other failure; see the message.
+    Failed = 0,
+    /// The remote node does not have the requested blob.
+    NotFound = 1,
+    /// The remote announced a blob larger than the size limit (`size` carries it).
+    SizeLimitExceeded = 2,
+    /// The operation was cancelled through its cancel token.
+    Cancelled = 3,
+    /// The node shut down while the operation was in flight.
+    NodeShutDown = 4,
+}
+
+/// Callback for `iroh_fetch_from_node`.
+///
+/// Exactly one of `on_success` / `on_failure` is called, once. `on_progress`
+/// (nullable) is only called before that. Callbacks may run on a Tokio worker
+/// thread, or synchronously inside `iroh_fetch_from_node` for argument errors.
+#[repr(C)]
+pub struct IrohFetchCallback {
+    /// Opaque pointer passed back to Swift.
+    pub userdata: *mut c_void,
+    /// Cumulative progress: `(0, total)` once the size is accepted, then
+    /// periodically, ending with `(total, total)`. Null to skip progress.
+    pub on_progress: Option<extern "C" fn(userdata: *mut c_void, downloaded: u64, total: u64)>,
+    /// Called once the verified blob has been moved to the destination path.
+    pub on_success: extern "C" fn(userdata: *mut c_void, size: u64),
+    /// Called on failure. `size` is the announced size for `SizeLimitExceeded`,
+    /// else 0. `error` must be freed with `iroh_string_free`.
+    pub on_failure: extern "C" fn(
+        userdata: *mut c_void,
+        code: IrohOperationErrorCode,
+        size: u64,
+        error: *const c_char,
+    ),
+}
+
+/// Create a cancellation token. Free with `iroh_cancel_token_free`.
+#[unsafe(no_mangle)]
+pub extern "C" fn iroh_cancel_token_new() -> *mut IrohCancelToken {
+    Box::into_raw(Box::new(tokio_util::sync::CancellationToken::new())) as *mut IrohCancelToken
+}
+
+/// Cancel the operation(s) using this token. Idempotent and thread-safe.
+///
+/// # Safety
+/// - `token` must be a live pointer from `iroh_cancel_token_new` (or null)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_cancel_token_cancel(token: *const IrohCancelToken) {
+    if let Some(token) = unsafe { cancel_token_ref(token) } {
+        token.cancel();
+    }
+}
+
+/// Free a cancellation token. Does not cancel anything.
+///
+/// # Safety
+/// - `token` must come from `iroh_cancel_token_new` (or be null) and must not
+///   be used after this call
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_cancel_token_free(token: *mut IrohCancelToken) {
+    if !token.is_null() {
+        drop(unsafe { Box::from_raw(token as *mut tokio_util::sync::CancellationToken) });
+    }
+}
+
+/// Fetch the raw blob `hash_hex` from one remote node into the file at `destination_path`.
+///
+/// Connects to `remote_node_id_hex` (64 hex) only — never to other providers —
+/// using `relay_url` and/or `direct_addrs` as address hints, and streams the
+/// blob with BLAKE3 verification straight to a temporary sibling of
+/// `destination_path`, which is renamed into place only after the full blob is
+/// verified. The blob is not added to the local store. If the remote announces
+/// a size above `max_size` the fetch fails with `SizeLimitExceeded` before any
+/// content is read. On failure or cancellation no file is left at
+/// `destination_path` (an existing file there is left untouched; on success it
+/// is replaced).
+///
+/// Returns immediately; the transfer runs on the node's runtime. Cancel it with
+/// `iroh_cancel_token_cancel(cancel_token)`.
+///
+/// # Safety
+/// - `handle` must be a valid node handle that outlives the operation's callback
+/// - `hash_hex`, `remote_node_id_hex`, `destination_path` must be valid
+///   null-terminated UTF-8 strings
+/// - `relay_url` is nullable; if non-null must be a valid null-terminated UTF-8 string
+/// - `direct_addrs` is nullable; if non-null must point to `direct_addrs_len`
+///   valid null-terminated UTF-8 strings
+/// - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_fetch_from_node(
+    handle: *const IrohNodeHandle,
+    hash_hex: *const c_char,
+    remote_node_id_hex: *const c_char,
+    relay_url: *const c_char,
+    direct_addrs: *const *const c_char,
+    direct_addrs_len: usize,
+    destination_path: *const c_char,
+    max_size: u64,
+    cancel_token: *const IrohCancelToken,
+    callback: IrohFetchCallback,
+) {
+    let completion = FetchCompletion {
+        userdata: callback.userdata as usize,
+        on_progress: callback.on_progress,
+        on_success: callback.on_success,
+        on_failure: callback.on_failure,
+        done: false,
+    };
+
+    let parsed = (|| {
+        if handle.is_null() {
+            return Err("handle cannot be null".to_string());
+        }
+        let hash = parse_blob_hash(unsafe { required_str(hash_hex, "hash_hex") }?)?;
+        let node_id = unsafe { required_str(remote_node_id_hex, "remote_node_id_hex") }?;
+        let relay = unsafe { optional_str(relay_url, "relay_url") }?;
+        let addrs = unsafe { str_array(direct_addrs, direct_addrs_len) }?;
+        let destination =
+            PathBuf::from(unsafe { required_str(destination_path, "destination_path") }?);
+        let remote = crate::node::remote_endpoint_addr(node_id, relay, &addrs)
+            .map_err(|e| format!("{:#}", e))?;
+        Ok((hash, remote, destination))
+    })();
+
+    let (hash, remote, destination) = match parsed {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            completion.fail(IrohOperationErrorCode::Failed, 0, message);
+            return;
+        }
+    };
+
+    let node = unsafe { &*(handle as *const IrohNode) };
+    if node.is_shutting_down() {
+        completion.fail(IrohOperationErrorCode::NodeShutDown, 0, "node shut down");
+        return;
+    }
+    let token = operation_token(cancel_token);
+    let endpoint = node.endpoint().clone();
+    let shutdown = node.shutdown_token();
+    node.runtime().spawn(async move {
+        let result = crate::node::run_cancellable(
+            crate::node::fetch_to_path(
+                &endpoint,
+                hash,
+                remote,
+                &destination,
+                max_size,
+                &token,
+                |downloaded, total| completion.progress(downloaded, total),
+            ),
+            &token,
+            &shutdown,
+        )
+        .await;
+        match result {
+            Ok(size) => completion.succeed(size),
+            Err(e) => {
+                let (code, size) = operation_error_code(&e);
+                completion.fail(code, size, e.to_string());
+            }
+        }
+    });
+}
+
+/// Delivers the outcome of a fetch to its callback exactly once.
+///
+/// If the task is dropped before completing (the runtime shut down), `Drop`
+/// reports `NodeShutDown`, so the Swift continuation is always resumed.
+struct FetchCompletion {
+    userdata: usize,
+    on_progress: Option<extern "C" fn(userdata: *mut c_void, downloaded: u64, total: u64)>,
+    on_success: extern "C" fn(userdata: *mut c_void, size: u64),
+    on_failure: extern "C" fn(
+        userdata: *mut c_void,
+        code: IrohOperationErrorCode,
+        size: u64,
+        error: *const c_char,
+    ),
+    done: bool,
+}
+
+impl FetchCompletion {
+    fn progress(&self, downloaded: u64, total: u64) {
+        if let Some(on_progress) = self.on_progress {
+            on_progress(self.userdata as *mut c_void, downloaded, total);
+        }
+    }
+
+    fn succeed(mut self, size: u64) {
+        self.done = true;
+        (self.on_success)(self.userdata as *mut c_void, size);
+    }
+
+    fn fail(mut self, code: IrohOperationErrorCode, size: u64, message: impl Into<String>) {
+        self.done = true;
+        (self.on_failure)(
+            self.userdata as *mut c_void,
+            code,
+            size,
+            c_string(message.into()),
+        );
+    }
+}
+
+impl Drop for FetchCompletion {
+    fn drop(&mut self) {
+        if !self.done {
+            self.done = true;
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                IrohOperationErrorCode::NodeShutDown,
+                0,
+                c_string("node shut down".to_string()),
+            );
+        }
+    }
+}
+
+fn operation_error_code(e: &crate::node::OperationError) -> (IrohOperationErrorCode, u64) {
+    use crate::node::OperationError;
+    match e {
+        OperationError::NotFound => (IrohOperationErrorCode::NotFound, 0),
+        OperationError::SizeLimitExceeded(size) => {
+            (IrohOperationErrorCode::SizeLimitExceeded, *size)
+        }
+        OperationError::Cancelled => (IrohOperationErrorCode::Cancelled, 0),
+        OperationError::NodeShutDown => (IrohOperationErrorCode::NodeShutDown, 0),
+        OperationError::Failed(_) => (IrohOperationErrorCode::Failed, 0),
+    }
+}
+
+/// The token one operation watches: a child of the caller's token, so
+/// `iroh_cancel_token_cancel` reaches it synchronously (a child of an already
+/// cancelled token starts cancelled). Without a caller token it never fires.
+fn operation_token(cancel_token: *const IrohCancelToken) -> tokio_util::sync::CancellationToken {
+    match unsafe { cancel_token_ref(cancel_token) } {
+        Some(caller) => caller.child_token(),
+        None => tokio_util::sync::CancellationToken::new(),
+    }
+}
+
+unsafe fn cancel_token_ref<'a>(
+    token: *const IrohCancelToken,
+) -> Option<&'a tokio_util::sync::CancellationToken> {
+    if token.is_null() {
+        None
+    } else {
+        Some(unsafe { &*(token as *const tokio_util::sync::CancellationToken) })
+    }
+}
+
+/// Parse a blob hash given as 64 hex characters.
+fn parse_blob_hash(s: &str) -> Result<Hash, String> {
+    let mut bytes = [0u8; 32];
+    if s.len() != 64 {
+        return Err(format!(
+            "Invalid hash: expected 64 hex characters, got {}",
+            s.len()
+        ));
+    }
+    hex::decode_to_slice(s, &mut bytes).map_err(|e| format!("Invalid hash: {}", e))?;
+    Ok(Hash::from_bytes(bytes))
+}
+
+unsafe fn required_str<'a>(ptr: *const c_char, name: &str) -> Result<&'a str, String> {
+    if ptr.is_null() {
+        return Err(format!("{} cannot be null", name));
+    }
+    unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .map_err(|e| format!("Invalid {} string: {}", name, e))
+}
+
+unsafe fn optional_str<'a>(ptr: *const c_char, name: &str) -> Result<Option<&'a str>, String> {
+    if ptr.is_null() {
+        Ok(None)
+    } else {
+        unsafe { required_str(ptr, name) }.map(Some)
+    }
+}
+
+unsafe fn str_array(ptr: *const *const c_char, len: usize) -> Result<Vec<String>, String> {
+    if ptr.is_null() || len == 0 {
+        return Ok(Vec::new());
+    }
+    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let mut result = Vec::with_capacity(len);
+    for &item in slice {
+        if item.is_null() {
+            continue;
+        }
+        result.push(unsafe { required_str(item, "direct address") }?.to_string());
+    }
+    Ok(result)
+}
+
 unsafe fn borrowed_bytes<'a>(bytes: &IrohBytes) -> &'a [u8] {
     if bytes.data.is_null() || bytes.len == 0 {
         &[]
@@ -2364,4 +2683,40 @@ fn c_string(s: String) -> *mut c_char {
         s
     };
     CString::new(s).unwrap().into_raw()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_caller_cancel_reaches_operation_synchronously() {
+        let caller = iroh_cancel_token_new();
+        let operation = operation_token(caller);
+        assert!(!operation.is_cancelled());
+        unsafe { iroh_cancel_token_cancel(caller) };
+        // No task has to run in between: the operation sees it immediately.
+        assert!(operation.is_cancelled());
+        unsafe { iroh_cancel_token_free(caller) };
+        assert!(operation.is_cancelled());
+
+        // Already-cancelled caller: the operation starts cancelled.
+        let caller = iroh_cancel_token_new();
+        unsafe { iroh_cancel_token_cancel(caller) };
+        assert!(operation_token(caller).is_cancelled());
+        unsafe { iroh_cancel_token_free(caller) };
+
+        // No caller token: never cancelled by the caller.
+        assert!(!operation_token(std::ptr::null()).is_cancelled());
+    }
+
+    #[test]
+    fn test_parse_blob_hash_requires_64_hex() {
+        let hash = Hash::new(b"abc");
+        let hex = hash.to_hex().to_string();
+        assert_eq!(parse_blob_hash(&hex).unwrap(), hash);
+        assert_eq!(parse_blob_hash(&hex.to_uppercase()).unwrap(), hash);
+        assert!(parse_blob_hash(&hex[..63]).is_err());
+        assert!(parse_blob_hash(&"z".repeat(64)).is_err());
+    }
 }

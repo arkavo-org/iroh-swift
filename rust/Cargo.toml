@@ -17,7 +17,7 @@ iroh-blobs = { version = "0.103", features = ["fs-store"] }
 # Docs support (optional, enabled via config)
 iroh-docs = "0.101"
 iroh-gossip = "0.101"
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "fs", "io-util", "time", "macros"] }
 tokio-util = "0.7"
 anyhow = "1"
 futures-lite = "2"
@@ -25,6 +25,9 @@ hex = "0.4"
 rand = "0.10"
 # BLAKE3 for `iroh_blake3_hex` (same crate iroh-blobs hashes with).
 blake3 = "1.8"
+# Verified-streaming types for fetching a blob straight into a file
+# (`iroh_blobs::get::fsm` yields `bao_tree` content items). Same 0.16 line iroh-blobs uses.
+bao-tree = "0.16"
 
 [build-dependencies]
 cbindgen = "0.28"

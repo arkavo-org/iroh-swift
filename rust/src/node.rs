@@ -4,19 +4,25 @@
 //! with optional Docs (syncing key-value documents) support.
 
 use anyhow::{Context, Result};
+use bao_tree::io::BaoContentItem;
 use futures_lite::StreamExt;
-use iroh::endpoint::{RelayMode, presets};
+use iroh::endpoint::{Connection, ReadError, RelayMode, VarInt, presets};
 use iroh::{Endpoint, EndpointAddr, RelayMap, RelayUrl, protocol::Router};
 use iroh_blobs::api::downloader::DownloadProgressItem;
-use iroh_blobs::protocol::{GetRequest, PushRequest};
+use iroh_blobs::get::fsm::{
+    AtBlobHeaderNextError, BlobContentNext, ConnectedNext, DecodeError, EndBlobNext,
+};
+use iroh_blobs::protocol::{ERR_INTERNAL, ERR_PERMISSION, GetRequest, PushRequest};
 use iroh_blobs::provider::events::{EventMask, EventSender, ProviderMessage, RequestMode};
-use iroh_blobs::{ALPN as BLOBS_ALPN, BlobsProtocol, store::fs::FsStore, ticket::BlobTicket};
+use iroh_blobs::{ALPN as BLOBS_ALPN, BlobsProtocol, Hash, store::fs::FsStore, ticket::BlobTicket};
 use iroh_docs::protocol::Docs;
 use iroh_gossip::ALPN as GOSSIP_ALPN;
 use iroh_gossip::net::Gossip;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
+use tokio_util::sync::CancellationToken;
 
 /// Information about an Iroh node.
 pub struct NodeInfo {
@@ -50,6 +56,10 @@ pub struct IrohNode {
     /// Event handler task for accepting push requests (must be kept alive).
     #[allow(dead_code)]
     event_handler: Option<tokio::task::JoinHandle<()>>,
+    /// Parent of every spawned, cancellable operation (fetch).
+    /// Cancelled first on shutdown so in-flight operations report
+    /// [`OperationError::NodeShutDown`] instead of an opaque connection error.
+    operations: CancellationToken,
 }
 
 impl IrohNode {
@@ -185,6 +195,7 @@ impl IrohNode {
             gossip,
             docs,
             event_handler,
+            operations: CancellationToken::new(),
         })
     }
 
@@ -212,6 +223,18 @@ impl IrohNode {
     /// Get a reference to the endpoint for network operations.
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+
+    /// Whether the node has started shutting down.
+    pub fn is_shutting_down(&self) -> bool {
+        self.operations.is_cancelled()
+    }
+
+    /// Cancelled when the node starts shutting down; pass it to
+    /// [`run_cancellable`] so in-flight operations stop with
+    /// [`OperationError::NodeShutDown`].
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.operations.clone()
     }
 
     /// This endpoint's id: the Ed25519 public key as 64 lowercase hex characters.
@@ -582,7 +605,12 @@ impl IrohNode {
             gossip,
             docs,
             event_handler,
+            operations,
         } = self;
+
+        // Stop in-flight fetches first: each reports NodeShutDown and
+        // removes its partial file before the endpoint goes away.
+        operations.cancel();
 
         let result = runtime.block_on(async {
             match tokio::time::timeout(Duration::from_secs(5), router.shutdown()).await {
@@ -606,6 +634,349 @@ impl IrohNode {
     }
 }
 
+/// Build the address of a remote node from its hex id, an optional relay URL
+/// and optional direct `ip:port` addresses.
+///
+/// With neither a relay URL nor direct addresses, iroh resolves the node
+/// through the endpoint's address lookup (n0 DNS/pkarr with the default preset).
+pub fn remote_endpoint_addr(
+    remote_node_id_hex: &str,
+    relay_url: Option<&str>,
+    direct_addrs: &[String],
+) -> Result<EndpointAddr> {
+    let node_id: iroh::EndpointId = remote_node_id_hex
+        .parse()
+        .context("Failed to parse remote node ID")?;
+
+    let mut endpoint_addr = EndpointAddr::from(node_id);
+    if let Some(url) = relay_url {
+        let relay_url: RelayUrl = url.parse().context("Invalid relay URL")?;
+        endpoint_addr = endpoint_addr.with_relay_url(relay_url);
+    }
+    for addr_str in direct_addrs {
+        let socket_addr: std::net::SocketAddr =
+            addr_str.parse().context("Invalid direct address")?;
+        endpoint_addr = endpoint_addr.with_ip_addr(socket_addr);
+    }
+    Ok(endpoint_addr)
+}
+
+/// Why a spawned operation (fetch) did not complete.
+#[derive(Debug)]
+pub enum OperationError {
+    /// The remote does not have the requested blob (or not all of it).
+    NotFound,
+    /// The remote announced a blob size larger than the caller's limit.
+    SizeLimitExceeded(u64),
+    /// The caller cancelled the operation.
+    Cancelled,
+    /// The node shut down while the operation was in flight.
+    NodeShutDown,
+    /// Anything else: bad arguments, connection, protocol, verification or I/O.
+    Failed(anyhow::Error),
+}
+
+impl From<anyhow::Error> for OperationError {
+    fn from(e: anyhow::Error) -> Self {
+        OperationError::Failed(e)
+    }
+}
+
+impl std::fmt::Display for OperationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OperationError::NotFound => write!(f, "blob not found on the remote node"),
+            OperationError::SizeLimitExceeded(size) => {
+                write!(f, "blob size {size} exceeds the size limit")
+            }
+            OperationError::Cancelled => write!(f, "operation cancelled"),
+            OperationError::NodeShutDown => write!(f, "node shut down"),
+            OperationError::Failed(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+/// Run `fut` until it completes, `cancel` is cancelled, or `shutdown` (the
+/// node's [`IrohNode::shutdown_token`]) is cancelled.
+///
+/// Pass the same `cancel` token into `fut` if it should also check for
+/// cancellation between steps that never pend (as [`fetch_to_path`] does).
+pub async fn run_cancellable<T>(
+    fut: impl std::future::Future<Output = Result<T, OperationError>>,
+    cancel: &CancellationToken,
+    shutdown: &CancellationToken,
+) -> Result<T, OperationError> {
+    let result = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => Err(OperationError::NodeShutDown),
+        _ = cancel.cancelled() => Err(OperationError::Cancelled),
+        r = fut => r,
+    };
+    // The future (and any partial file it owned) is dropped by now.
+    match result {
+        Err(OperationError::Cancelled) if shutdown.is_cancelled() => {
+            Err(OperationError::NodeShutDown)
+        }
+        other => other,
+    }
+}
+
+/// How often (in downloaded bytes) a fetch reports progress, besides the
+/// first report (0 bytes, once the size is known) and the final one.
+pub const FETCH_PROGRESS_STEP: u64 = 256 * 1024;
+
+/// Removes a temporary file when dropped, unless it was committed.
+struct TempFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl TempFileGuard {
+    fn commit(mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Sibling temp path for `destination`, so the final rename stays on one volume.
+fn temp_path_for(destination: &Path) -> Result<PathBuf> {
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .context("Destination has no parent directory")?;
+    let name = destination
+        .file_name()
+        .context("Destination has no file name")?
+        .to_string_lossy();
+    let nonce: u64 = rand::random();
+    Ok(parent.join(format!(".{name}.{nonce:016x}.iroh-partial")))
+}
+
+/// Map a failure to read the size header (the first bytes of a response).
+fn header_error(e: AtBlobHeaderNextError) -> OperationError {
+    match e {
+        // The provider finished the stream without sending anything.
+        AtBlobHeaderNextError::NotFound { .. } => OperationError::NotFound,
+        AtBlobHeaderNextError::Read { source, .. } => {
+            let reset_code = source
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<ReadError>())
+                .and_then(|re| match re {
+                    ReadError::Reset(code) => Some(*code),
+                    _ => None,
+                });
+            match reset_code {
+                // An iroh-blobs provider resets the stream with ERR_INTERNAL
+                // before the size header when exporting the blob fails, which
+                // for a hash the store does not have is "no entry found".
+                Some(code) if code == ERR_INTERNAL => OperationError::NotFound,
+                Some(code) if code == ERR_PERMISSION => OperationError::Failed(anyhow::anyhow!(
+                    "Remote node refused the request (permission denied)"
+                )),
+                _ => OperationError::Failed(
+                    anyhow::Error::new(source).context("Failed to read blob size from remote node"),
+                ),
+            }
+        }
+    }
+}
+
+/// Map a failure while streaming verified content.
+fn decode_error(e: DecodeError) -> OperationError {
+    match e {
+        // The provider stopped sending because it lacks (part of) the blob.
+        DecodeError::ChunkNotFound { .. }
+        | DecodeError::ParentNotFound { .. }
+        | DecodeError::LeafNotFound { .. } => OperationError::NotFound,
+        DecodeError::ParentHashMismatch { .. } | DecodeError::LeafHashMismatch { .. } => {
+            OperationError::Failed(anyhow::anyhow!(
+                "Blob verification failed: remote sent data that does not match the hash ({e})"
+            ))
+        }
+        other => OperationError::Failed(
+            anyhow::Error::new(other).context("Failed while receiving blob from remote node"),
+        ),
+    }
+}
+
+/// Fetch the raw blob `hash` from one remote node straight into `destination`.
+///
+/// Uses the iroh-blobs get state machine, so every byte written is verified
+/// against `hash` (BLAKE3 / bao) as it arrives, and nothing is added to the
+/// local store. The size the remote announces is checked against `max_size`
+/// before any content is read; the cumulative byte count is checked again while
+/// streaming. Content goes to a hidden sibling temp file that is renamed to
+/// `destination` only after the whole blob has been verified and synced; on any
+/// failure, cancellation or drop the temp file is removed and `destination` is
+/// left untouched.
+///
+/// `on_progress(downloaded, total)` is called with `(0, total)` once the size
+/// is accepted, then at least every [`FETCH_PROGRESS_STEP`] bytes, and finally
+/// with `(total, total)`. Values are cumulative and never decrease.
+///
+/// Returns the blob size in bytes.
+pub async fn fetch_to_path(
+    endpoint: &Endpoint,
+    hash: Hash,
+    remote: EndpointAddr,
+    destination: &Path,
+    max_size: u64,
+    cancel: &CancellationToken,
+    mut on_progress: impl FnMut(u64, u64),
+) -> Result<u64, OperationError> {
+    let temp_path = temp_path_for(destination)?;
+
+    let conn = endpoint
+        .connect(remote, BLOBS_ALPN)
+        .await
+        .context("Failed to connect to remote node")?;
+
+    let result = fetch_on_connection(
+        &conn,
+        hash,
+        destination,
+        &temp_path,
+        max_size,
+        cancel,
+        &mut on_progress,
+    )
+    .await;
+
+    // Tell the provider to stop sending (no-op if it already finished).
+    conn.close(VarInt::from_u32(0), b"done");
+    result
+}
+
+async fn fetch_on_connection(
+    conn: &Connection,
+    hash: Hash,
+    destination: &Path,
+    temp_path: &Path,
+    max_size: u64,
+    cancel: &CancellationToken,
+    on_progress: &mut impl FnMut(u64, u64),
+) -> Result<u64, OperationError> {
+    use iroh_blobs::get::fsm;
+
+    let connected = fsm::start(conn.clone(), GetRequest::blob(hash), Default::default())
+        .next()
+        .await
+        .context("Failed to open stream to remote node")?;
+    let ConnectedNext::StartRoot(root) = connected
+        .next()
+        .await
+        .context("Failed to send request to remote node")?
+    else {
+        return Err(anyhow::anyhow!("Unexpected response shape for a single-blob request").into());
+    };
+
+    // The size header comes before any content: enforce the limit here.
+    let (mut content, size) = root.next().next().await.map_err(header_error)?;
+    if size > max_size {
+        return Err(OperationError::SizeLimitExceeded(size));
+    }
+
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp_path)
+        .await
+        .with_context(|| format!("Failed to create temporary file {}", temp_path.display()))?;
+    let guard = TempFileGuard {
+        path: Some(temp_path.to_path_buf()),
+    };
+    let mut writer = tokio::io::BufWriter::with_capacity(1024 * 1024, file);
+
+    on_progress(0, size);
+    let mut downloaded: u64 = 0;
+    let mut reported: u64 = 0;
+    let mut position: u64 = 0;
+
+    let end = loop {
+        match content.next().await {
+            BlobContentNext::More((next, item)) => {
+                content = next;
+                match item.map_err(decode_error)? {
+                    BaoContentItem::Parent(_) => {}
+                    BaoContentItem::Leaf(leaf) => {
+                        let len = leaf.data.len() as u64;
+                        let leaf_end = leaf.offset.saturating_add(len);
+                        if leaf_end > size {
+                            return Err(anyhow::anyhow!(
+                                "Remote sent data past the announced size ({leaf_end} > {size})"
+                            )
+                            .into());
+                        }
+                        downloaded += len;
+                        if downloaded > max_size {
+                            return Err(OperationError::SizeLimitExceeded(downloaded));
+                        }
+                        if leaf.offset != position {
+                            writer
+                                .seek(std::io::SeekFrom::Start(leaf.offset))
+                                .await
+                                .context("Failed to seek temporary file")?;
+                        }
+                        writer
+                            .write_all(&leaf.data)
+                            .await
+                            .context("Failed to write temporary file")?;
+                        position = leaf_end;
+
+                        if downloaded == size || downloaded - reported >= FETCH_PROGRESS_STEP {
+                            on_progress(downloaded, size);
+                            reported = downloaded;
+                        }
+                        // Honour cancellation between leaves too, so a transfer
+                        // whose reads never pend still stops promptly.
+                        if cancel.is_cancelled() {
+                            return Err(OperationError::Cancelled);
+                        }
+                    }
+                }
+            }
+            BlobContentNext::Done(end) => break end,
+        }
+    };
+
+    if downloaded != size {
+        return Err(anyhow::anyhow!("Remote finished after {downloaded} of {size} bytes").into());
+    }
+
+    // All content is verified. Reading the end of the response only checks
+    // for trailing data, so a failure there does not invalidate the blob.
+    if let EndBlobNext::Closing(closing) = end.next() {
+        let _ = closing.next().await;
+    }
+
+    writer
+        .flush()
+        .await
+        .context("Failed to flush temporary file")?;
+    let file = writer.into_inner();
+    file.sync_all()
+        .await
+        .context("Failed to sync temporary file")?;
+    drop(file);
+
+    if reported != size {
+        on_progress(size, size);
+    }
+
+    // No await between the rename and returning: once the file is in place,
+    // the operation reports success.
+    std::fs::rename(temp_path, destination)
+        .with_context(|| format!("Failed to move blob to {}", destination.display()))?;
+    guard.commit();
+    Ok(size)
+}
+
 /// BLAKE3 hash of `data` as 64 lowercase hex characters.
 pub fn blake3_hex(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
@@ -614,10 +985,53 @@ pub fn blake3_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
     fn local_node(dir: &tempfile::TempDir, serves_blobs: bool) -> IrohNode {
         IrohNode::new(dir.path().to_path_buf(), false, None, false, serves_blobs).unwrap()
+    }
+
+    fn direct_addrs(node: &IrohNode) -> Vec<String> {
+        node.info().unwrap().direct_addrs
+    }
+
+    /// Deterministic, non-repeating-looking test content.
+    fn test_bytes(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i % 251) as u8 ^ (i / 251) as u8)
+            .collect()
+    }
+
+    /// Fetch on `client` from `server` and collect progress reports.
+    fn fetch(
+        client: &IrohNode,
+        server: &IrohNode,
+        hash: Hash,
+        destination: &Path,
+        max_size: u64,
+    ) -> (Result<u64, OperationError>, Vec<(u64, u64)>) {
+        let addr =
+            remote_endpoint_addr(&server.endpoint_id(), None, &direct_addrs(server)).unwrap();
+        let token = CancellationToken::new();
+        let mut progress = Vec::new();
+        let result = client.runtime().block_on(fetch_to_path(
+            client.endpoint(),
+            hash,
+            addr,
+            destination,
+            max_size,
+            &token,
+            |d, t| progress.push((d, t)),
+        ));
+        (result, progress)
+    }
+
+    fn leftover_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
@@ -712,6 +1126,208 @@ mod tests {
             blake3_hex(b"abc"),
             "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
         );
+    }
+
+    #[test]
+    fn test_fetch_to_path_from_server_to_client_only_node() {
+        let (dir_a, dir_b, out) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let server = local_node(&dir_a, true);
+        let client = local_node(&dir_b, false);
+
+        let data = test_bytes(3 * 1024 * 1024 + 123);
+        let hash = server
+            .runtime()
+            .block_on(async { server.store().add_slice(&data).await })
+            .unwrap()
+            .hash;
+        assert_eq!(hash.to_hex().to_string(), blake3_hex(&data));
+
+        let dest = out.path().join("blob.bin");
+        let (result, progress) = fetch(&client, &server, hash, &dest, data.len() as u64);
+        assert_eq!(result.unwrap(), data.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+        assert_eq!(leftover_files(out.path()), vec!["blob.bin".to_string()]);
+
+        // Cumulative, monotonic, (0, total) first and (total, total) last.
+        let total = data.len() as u64;
+        assert!(progress.len() > 2, "expected several reports: {progress:?}");
+        assert_eq!(progress.first(), Some(&(0, total)));
+        assert_eq!(progress.last(), Some(&(total, total)));
+        assert!(progress.windows(2).all(|w| w[0].0 <= w[1].0));
+        assert!(progress.iter().all(|&(_, t)| t == total));
+
+        // Nothing landed in the client's store.
+        let has = client.runtime().block_on(client.store().has(hash)).unwrap();
+        assert!(!has);
+
+        client.shutdown().unwrap();
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_fetch_rejects_blob_over_size_limit_before_writing() {
+        let (dir_a, dir_b, out) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let server = local_node(&dir_a, true);
+        let client = local_node(&dir_b, false);
+
+        let data = test_bytes(100_000);
+        let hash = server
+            .runtime()
+            .block_on(async { server.store().add_slice(&data).await })
+            .unwrap()
+            .hash;
+
+        let dest = out.path().join("blob.bin");
+        let (result, progress) = fetch(&client, &server, hash, &dest, data.len() as u64 - 1);
+        match result {
+            Err(OperationError::SizeLimitExceeded(size)) => assert_eq!(size, data.len() as u64),
+            other => panic!("expected SizeLimitExceeded, got {other:?}"),
+        }
+        assert!(
+            progress.is_empty(),
+            "no progress before the size is accepted"
+        );
+        assert!(leftover_files(out.path()).is_empty());
+
+        client.shutdown().unwrap();
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_fetch_unknown_hash_is_not_found() {
+        let (dir_a, dir_b, out) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let server = local_node(&dir_a, true);
+        let client = local_node(&dir_b, false);
+
+        let unknown = Hash::new(b"never stored anywhere");
+        let dest = out.path().join("blob.bin");
+        let (result, _) = fetch(&client, &server, unknown, &dest, u64::MAX);
+        assert!(
+            matches!(result, Err(OperationError::NotFound)),
+            "expected NotFound, got {result:?}"
+        );
+        assert!(leftover_files(out.path()).is_empty());
+
+        client.shutdown().unwrap();
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_fetch_from_client_only_node_fails() {
+        let (dir_a, dir_b, out) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let fetcher = local_node(&dir_a, true);
+        let client_only = local_node(&dir_b, false);
+
+        let data = b"not served".to_vec();
+        let hash = client_only
+            .runtime()
+            .block_on(async { client_only.store().add_slice(&data).await })
+            .unwrap()
+            .hash;
+
+        let dest = out.path().join("blob.bin");
+        let (result, _) = fetch(&fetcher, &client_only, hash, &dest, u64::MAX);
+        assert!(
+            matches!(result, Err(OperationError::Failed(_))),
+            "expected a connection failure, got {result:?}"
+        );
+        assert!(leftover_files(out.path()).is_empty());
+
+        fetcher.shutdown().unwrap();
+        client_only.shutdown().unwrap();
+    }
+
+    /// Cancelling mid-transfer stops the fetch and removes the partial file.
+    #[test]
+    fn test_fetch_cancel_mid_transfer_removes_partial_file() {
+        let (dir_a, dir_b, out) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let server = local_node(&dir_a, true);
+        let client = local_node(&dir_b, false);
+
+        let data = test_bytes(8 * 1024 * 1024);
+        let hash = server
+            .runtime()
+            .block_on(async { server.store().add_slice(&data).await })
+            .unwrap()
+            .hash;
+
+        let addr =
+            remote_endpoint_addr(&server.endpoint_id(), None, &direct_addrs(&server)).unwrap();
+        let dest = out.path().join("blob.bin");
+        let token = CancellationToken::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let result = client.runtime().block_on(run_cancellable(
+            fetch_to_path(
+                client.endpoint(),
+                hash,
+                addr,
+                &dest,
+                u64::MAX,
+                &token,
+                |d, t| {
+                    seen.lock().unwrap().push((d, t));
+                    if d > 0 {
+                        token.cancel();
+                    }
+                },
+            ),
+            &token,
+            &client.shutdown_token(),
+        ));
+        assert!(
+            matches!(result, Err(OperationError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+        let seen = seen.lock().unwrap();
+        assert!(seen.last().unwrap().0 < data.len() as u64, "{seen:?}");
+        assert!(leftover_files(out.path()).is_empty());
+
+        client.shutdown().unwrap();
+        server.shutdown().unwrap();
+    }
+
+    /// Cancelling while still connecting (nothing listens) returns promptly.
+    #[test]
+    fn test_fetch_cancel_while_connecting() {
+        let (dir_a, dir_b, out) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let absent = local_node(&dir_a, true);
+        let absent_id = absent.endpoint_id();
+        absent.shutdown().unwrap();
+        let client = local_node(&dir_b, false);
+
+        let addr = remote_endpoint_addr(&absent_id, None, &["127.0.0.1:9".to_string()]).unwrap();
+        let dest = out.path().join("blob.bin");
+        let token = CancellationToken::new();
+        let canceller = token.clone();
+        let started = std::time::Instant::now();
+        let result = client.runtime().block_on(async {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                canceller.cancel();
+            });
+            run_cancellable(
+                fetch_to_path(
+                    client.endpoint(),
+                    Hash::new(b"x"),
+                    addr,
+                    &dest,
+                    u64::MAX,
+                    &token,
+                    |_, _| {},
+                ),
+                &token,
+                &client.shutdown_token(),
+            )
+            .await
+        });
+        assert!(
+            matches!(result, Err(OperationError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(leftover_files(out.path()).is_empty());
+
+        client.shutdown().unwrap();
     }
 
     #[test]
