@@ -13,7 +13,7 @@ use iroh_blobs::get::fsm::{
     AtBlobHeaderNextError, BlobContentNext, ConnectedNext, DecodeError, EndBlobNext,
 };
 use iroh_blobs::protocol::{ERR_INTERNAL, ERR_PERMISSION, GetRequest, PushRequest};
-use iroh_blobs::provider::events::{EventMask, EventSender, ProviderMessage, RequestMode};
+use iroh_blobs::provider::events::{EventMask, EventSender, RequestMode};
 use iroh_blobs::{ALPN as BLOBS_ALPN, BlobsProtocol, Hash, store::fs::FsStore, ticket::BlobTicket};
 use iroh_docs::protocol::Docs;
 use iroh_gossip::ALPN as GOSSIP_ALPN;
@@ -53,7 +53,7 @@ pub struct IrohNode {
     gossip: Option<Gossip>,
     /// Docs protocol (only if docs_enabled).
     docs: Option<Docs>,
-    /// Event handler task for accepting push requests (must be kept alive).
+    /// Task draining the blobs provider's event channel (must be kept alive).
     #[allow(dead_code)]
     event_handler: Option<tokio::task::JoinHandle<()>>,
     /// Parent of every spawned, cancellable operation (fetch, file push).
@@ -73,13 +73,24 @@ impl IrohNode {
     /// * `serves_blobs` - Whether to accept the iroh-blobs ALPN. When false the node
     ///   is client-only: it can still fetch and push, but peers cannot get blobs
     ///   from it (or push to it).
+    /// * `accepts_pushes` - Whether peers may push blobs into this node's store.
+    ///   Requires `serves_blobs`; when false, push requests are refused and
+    ///   nothing is written (gets are still served).
+    ///
+    /// # Errors
+    /// Fails if `accepts_pushes` is set without `serves_blobs`.
     pub fn new(
         storage_path: PathBuf,
         relay_enabled: bool,
         custom_relay_url: Option<String>,
         docs_enabled: bool,
         serves_blobs: bool,
+        accepts_pushes: bool,
     ) -> Result<Self> {
+        if accepts_pushes && !serves_blobs {
+            anyhow::bail!("accepts_pushes requires serves_blobs");
+        }
+
         // Create dedicated runtime for this node
         let runtime = Runtime::new().context("Failed to create Tokio runtime")?;
 
@@ -108,32 +119,28 @@ impl IrohNode {
                 let _ = tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await;
             }
 
-            // Set up the blobs protocol handler with push acceptance, unless the
-            // node is client-only. Fetching (`store.remote()`, the downloader) and
-            // pushing only need the store and the endpoint, not the handler.
+            // Set up the blobs protocol handler, unless the node is client-only.
+            // Fetching (`store.remote()`, the downloader) and pushing only need the
+            // store and the endpoint, not the handler.
             let (blobs, event_handler) = if serves_blobs {
-                // EventSender::request() checks only mask.get for ALL request types
-                // (get, push, etc.), so we set get: Notify to enable push delivery.
+                // Gets are always served. Pushes write to this node's store, so they
+                // are refused (`Disabled`, the iroh-blobs default) unless the app
+                // opts in; `Notify` processes them without asking a handler.
                 let mask = EventMask {
-                    get: RequestMode::Notify,
+                    push: if accepts_pushes {
+                        RequestMode::Notify
+                    } else {
+                        RequestMode::Disabled
+                    },
                     ..EventMask::DEFAULT
                 };
                 let (event_sender, mut event_rx) = EventSender::channel(64, mask);
 
-                // Spawn event handler that accepts push requests
-                let event_handler = tokio::spawn(async move {
-                    while let Some(msg) = event_rx.recv().await {
-                        match msg {
-                            ProviderMessage::PushRequestReceived(msg) => {
-                                msg.tx.send(Ok(())).await.ok();
-                            }
-                            ProviderMessage::ClientConnected(msg) => {
-                                msg.tx.send(Ok(())).await.ok();
-                            }
-                            _ => {}
-                        }
-                    }
-                });
+                // Nothing here needs an answer (no Intercept modes), but the provider
+                // awaits each send (push notifications, connection-closed events), so
+                // drain the channel to keep it from filling up.
+                let event_handler =
+                    tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
 
                 let blobs = BlobsProtocol::new(&store, Some(event_sender));
                 (Some(blobs), Some(event_handler))
@@ -975,7 +982,20 @@ mod tests {
     use tempfile::tempdir;
 
     fn local_node(dir: &tempfile::TempDir, serves_blobs: bool) -> IrohNode {
-        IrohNode::new(dir.path().to_path_buf(), false, None, false, serves_blobs).unwrap()
+        IrohNode::new(
+            dir.path().to_path_buf(),
+            false,
+            None,
+            false,
+            serves_blobs,
+            false,
+        )
+        .unwrap()
+    }
+
+    /// A serving node that accepts pushes.
+    fn push_receiver(dir: &tempfile::TempDir) -> IrohNode {
+        IrohNode::new(dir.path().to_path_buf(), false, None, false, true, true).unwrap()
     }
 
     fn direct_addrs(node: &IrohNode) -> Vec<String> {
@@ -1319,7 +1339,7 @@ mod tests {
     #[test]
     fn test_push_file_from_client_only_node_then_fetch_back() {
         let (dir_a, dir_b, out) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
-        let server = local_node(&dir_a, true);
+        let server = push_receiver(&dir_a);
         let client = local_node(&dir_b, false);
 
         let data = test_bytes(1024 * 1024 + 7);
@@ -1346,14 +1366,82 @@ mod tests {
         server.shutdown().unwrap();
     }
 
+    /// A serving node with the default config (`accepts_pushes: false`) refuses
+    /// pushes: nothing lands in its store, whatever the size.
+    ///
+    /// The pusher is not told reliably. iroh-blobs' push client stops reading its
+    /// side of the stream at once, so it never sees the provider's
+    /// `ERR_PERMISSION` reset; it only fails if the provider drops the stream
+    /// (STOP_SENDING) while the client is still writing. A blob small enough to
+    /// be written in one go reports success; one still being written when the
+    /// STOP_SENDING arrives fails with "sending stopped by peer" (a race for
+    /// mid-size blobs, 1 MiB already fails on localhost; certain once the client
+    /// waits for flow-control credit). If the small push starts failing, the
+    /// pusher now learns about refusals: update the docs that say it may not.
+    #[test]
+    fn test_serving_node_refuses_pushes_by_default() {
+        let (dir_a, dir_b, out) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let server = local_node(&dir_a, true);
+        let client = local_node(&dir_b, false);
+        let server_id = server.endpoint_id();
+        let addrs = direct_addrs(&server);
+
+        let small = b"refused push";
+        let small_result = client.push_to_node(&server_id, None, small, &addrs);
+        assert_eq!(
+            small_result.expect("a small refused push reports success"),
+            blake3_hex(small)
+        );
+
+        let large = test_bytes(2 * 1024 * 1024 + 3);
+        let source = out.path().join("large.bin");
+        std::fs::write(&source, &large).unwrap();
+        let addr = remote_endpoint_addr(&server_id, None, &addrs).unwrap();
+        let large_result =
+            client
+                .runtime()
+                .block_on(push_path(client.endpoint(), client.store(), &source, addr));
+        match large_result {
+            Err(OperationError::Failed(error)) => assert!(
+                format!("{error:#}").contains("stopped by peer"),
+                "unexpected error: {error:#}"
+            ),
+            other => panic!("expected the large refused push to fail, got {other:?}"),
+        }
+
+        for data in [&small[..], &large[..]] {
+            let hash: Hash = blake3_hex(data).parse().unwrap();
+            let has = server.runtime().block_on(server.store().has(hash)).unwrap();
+            assert!(!has, "a refused push must not write to the server's store");
+        }
+
+        client.shutdown().unwrap();
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_accepts_pushes_requires_serves_blobs() {
+        let dir = tempdir().unwrap();
+        let result = IrohNode::new(dir.path().to_path_buf(), false, None, false, false, true);
+        let error = result
+            .err()
+            .expect("accepts_pushes without serves_blobs must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("accepts_pushes requires serves_blobs"),
+            "unexpected error: {error:#}"
+        );
+    }
+
     #[test]
     fn test_push_to_node_roundtrip() {
         let dir_a = tempdir().unwrap();
         let dir_b = tempdir().unwrap();
 
-        // Create two nodes, relay disabled (local connection)
-        let node_a = IrohNode::new(dir_a.path().to_path_buf(), false, None, false, true).unwrap();
-        let node_b = IrohNode::new(dir_b.path().to_path_buf(), false, None, false, true).unwrap();
+        // Create two nodes, relay disabled (local connection); B accepts pushes.
+        let node_a = local_node(&dir_a, true);
+        let node_b = push_receiver(&dir_b);
 
         // Get node B's ID
         let node_b_info = node_b.info().unwrap();
@@ -1372,6 +1460,11 @@ mod tests {
         // Verify hash is valid hex (64 chars for blake3)
         assert_eq!(hash_hex.len(), 64);
         assert!(hash_hex.chars().all(|c: char| c.is_ascii_hexdigit()));
+        assert_eq!(hash_hex, blake3_hex(data));
+
+        let hash: Hash = hash_hex.parse().unwrap();
+        let has = node_b.runtime().block_on(node_b.store().has(hash)).unwrap();
+        assert!(has, "node B should have the pushed blob");
 
         node_a.shutdown().unwrap();
         node_b.shutdown().unwrap();
@@ -1389,7 +1482,7 @@ mod tests {
         let direct_addr = std::env::var("IROH_REMOTE_ADDR").expect("Set IROH_REMOTE_ADDR");
 
         let dir = tempdir().unwrap();
-        let node = IrohNode::new(dir.path().to_path_buf(), true, None, false, true).unwrap();
+        let node = IrohNode::new(dir.path().to_path_buf(), true, None, false, true, false).unwrap();
 
         let info = node.info().unwrap();
         println!("Local node ID: {}", info.node_id);
@@ -1411,7 +1504,8 @@ mod tests {
     #[test]
     fn test_put_roundtrip() {
         let dir = tempdir().unwrap();
-        let node = IrohNode::new(dir.path().to_path_buf(), false, None, false, true).unwrap();
+        let node =
+            IrohNode::new(dir.path().to_path_buf(), false, None, false, true, false).unwrap();
 
         let data = b"Hello, Iroh!";
         let ticket = node.put(data).unwrap();
@@ -1425,7 +1519,7 @@ mod tests {
     #[test]
     fn test_node_with_docs_enabled() {
         let dir = tempdir().unwrap();
-        let node = IrohNode::new(dir.path().to_path_buf(), false, None, true, true).unwrap();
+        let node = IrohNode::new(dir.path().to_path_buf(), false, None, true, true, false).unwrap();
 
         assert!(node.is_docs_enabled());
         assert!(node.docs().is_some());
@@ -1443,8 +1537,10 @@ mod tests {
         let dir_b = tempdir().unwrap();
 
         // Relay enabled so node B can discover node A via n0 DNS/relay
-        let node_a = IrohNode::new(dir_a.path().to_path_buf(), true, None, false, true).unwrap();
-        let node_b = IrohNode::new(dir_b.path().to_path_buf(), true, None, false, true).unwrap();
+        let node_a =
+            IrohNode::new(dir_a.path().to_path_buf(), true, None, false, true, false).unwrap();
+        let node_b =
+            IrohNode::new(dir_b.path().to_path_buf(), true, None, false, true, false).unwrap();
 
         let data = b"Cross-node get test data";
         let ticket = node_a.put(data).unwrap();

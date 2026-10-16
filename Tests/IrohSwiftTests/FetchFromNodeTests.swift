@@ -17,11 +17,16 @@ struct FetchFromNodeTests {
         }
     }
 
-    private func makeNode(servesBlobs: Bool) async throws -> TestNode {
+    private func makeNode(servesBlobs: Bool, acceptsPushes: Bool = false) async throws -> TestNode {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         let node = try await IrohNode(
-            config: IrohConfig(storagePath: dir, relayEnabled: false, servesBlobs: servesBlobs)
+            config: IrohConfig(
+                storagePath: dir,
+                relayEnabled: false,
+                servesBlobs: servesBlobs,
+                acceptsPushes: acceptsPushes
+            )
         )
         return TestNode(node: node, dir: dir)
     }
@@ -385,7 +390,7 @@ struct FetchFromNodeTests {
 
     @Test("client-only node pushes Data to a serving node and fetches it back")
     func pushDataThenFetch() async throws {
-        let server = try await makeNode(servesBlobs: true)
+        let server = try await makeNode(servesBlobs: true, acceptsPushes: true)
         let client = try await makeNode(servesBlobs: false)
         let out = try makeOutputDir()
         defer { try? FileManager.default.removeItem(at: out) }
@@ -410,7 +415,7 @@ struct FetchFromNodeTests {
 
     @Test("client-only node pushes a file to a serving node and fetches it back")
     func pushFileThenFetch() async throws {
-        let server = try await makeNode(servesBlobs: true)
+        let server = try await makeNode(servesBlobs: true, acceptsPushes: true)
         let client = try await makeNode(servesBlobs: false)
         let out = try makeOutputDir()
         defer { try? FileManager.default.removeItem(at: out) }
@@ -433,6 +438,48 @@ struct FetchFromNodeTests {
         #expect(size == UInt64(data.count))
         #expect(try Data(contentsOf: destination) == data)
         #expect(IrohBLAKE3.hex(try Data(contentsOf: destination)) == hash)
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("a serving node refuses pushes unless acceptsPushes is set")
+    func servingNodeRefusesPushesByDefault() async throws {
+        let server = try await makeNode(servesBlobs: true)
+        let client = try await makeNode(servesBlobs: false)
+        let out = try makeOutputDir()
+        defer { try? FileManager.default.removeItem(at: out) }
+
+        let serverID = try await server.node.endpointID()
+        let addrs = try await server.node.info().directAddrs
+
+        // A small refused push can still report success (the pusher does not
+        // see the refusal), so its outcome is not part of the contract.
+        let small = Data("refused push".utf8)
+        _ = try? await client.node.pushToNode(nodeId: serverID, directAddrs: addrs, data: small)
+
+        // A larger one fails: the server stops the stream while it is being written.
+        let large = testData(count: 2 * 1024 * 1024 + 3)
+        let source = out.appendingPathComponent("large.bin")
+        try large.write(to: source)
+        let pushError = await #expect(throws: IrohError.self) {
+            try await client.node.pushToNode(nodeId: serverID, directAddrs: addrs, fileURL: source)
+        }
+        #expect(pushError?.isPushFailed == true, "got \(String(describing: pushError))")
+
+        // Neither blob reached the server's store.
+        for data in [small, large] {
+            let error = await #expect(throws: IrohError.self) {
+                try await client.node.fetch(
+                    hash: IrohBLAKE3.hex(data),
+                    fromNode: serverID,
+                    directAddrs: addrs,
+                    to: out.appendingPathComponent("fetched.bin"),
+                    maxSize: .max
+                )
+            }
+            #expect(error?.isNotFound == true, "got \(String(describing: error))")
+        }
 
         await client.close()
         await server.close()

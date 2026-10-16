@@ -22,12 +22,23 @@ public struct IrohConfig: Sendable {
     ///
     /// When `false` the node is client-only: it can still `fetch(hash:fromNode:...)`,
     /// `get(ticket:)` and `pushToNode(...)`, but peers cannot download blobs from
-    /// it or push blobs to it — their blobs connections are refused at the
-    /// handshake. Tickets created by `put(_:)` on a client-only node are not
-    /// fetchable by others. With `docsEnabled`, peers cannot pull this node's
-    /// document content either.
+    /// it — their blobs connections are refused at the handshake. Tickets created
+    /// by `put(_:)` on a client-only node are not fetchable by others. With
+    /// `docsEnabled`, peers cannot pull this node's document content either.
+    /// Whether peers may push blobs to a serving node is `acceptsPushes`.
     /// Default: true
     public var servesBlobs: Bool
+
+    /// Whether peers may push blobs into this node's store.
+    ///
+    /// Only meaningful when `servesBlobs` is `true`; setting it on a client-only
+    /// node fails `validate()` with `IrohError.invalidConfiguration`. When `false`,
+    /// a serving node refuses push requests and writes nothing; peers can still
+    /// download its blobs. A peer pushing to it is not reliably told: a small
+    /// push can report success even though nothing was stored.
+    /// Default: false, because accepting pushes lets any peer that can reach the
+    /// node write to its disk.
+    public var acceptsPushes: Bool
 
     /// Create a new IrohConfig with the specified options.
     ///
@@ -39,24 +50,37 @@ public struct IrohConfig: Sendable {
     ///   - docsEnabled: Whether to enable the Docs engine. Default: false.
     ///   - servesBlobs: Whether to serve blobs to other nodes. `false` makes the
     ///                  node client-only (fetch and push still work). Default: true.
+    ///   - acceptsPushes: Whether peers may push blobs into this node's store.
+    ///                    Only meaningful when `servesBlobs` is true. Default: false,
+    ///                    because accepting pushes lets any peer that can reach the
+    ///                    node write to its disk.
     public init(
         storagePath: URL? = nil,
         relayEnabled: Bool = true,
         customRelayUrl: String? = nil,
         docsEnabled: Bool = false,
-        servesBlobs: Bool = true
+        servesBlobs: Bool = true,
+        acceptsPushes: Bool = false
     ) {
         self.storagePath = storagePath ?? Self.defaultStoragePath()
         self.relayEnabled = relayEnabled
         self.customRelayUrl = customRelayUrl
         self.docsEnabled = docsEnabled
         self.servesBlobs = servesBlobs
+        self.acceptsPushes = acceptsPushes
     }
 
     /// Validate the configuration before node creation.
     ///
     /// - Throws: `IrohError.invalidConfiguration` if validation fails.
     public func validate() throws {
+        // Checked first so a rejected config touches nothing on disk.
+        if acceptsPushes && !servesBlobs {
+            throw IrohError.invalidConfiguration(
+                "acceptsPushes requires servesBlobs: a client-only node cannot receive pushes"
+            )
+        }
+
         // Check storage path is writable
         let fm = FileManager.default
 

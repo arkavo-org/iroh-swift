@@ -67,7 +67,8 @@ public actor IrohNode {
                     relay_enabled: config.relayEnabled,
                     custom_relay_url: relayUrlPtr,
                     docs_enabled: config.docsEnabled,
-                    serves_blobs: config.servesBlobs
+                    serves_blobs: config.servesBlobs,
+                    accepts_pushes: config.acceptsPushes
                 )
 
                 let box = Unmanaged.passRetained(

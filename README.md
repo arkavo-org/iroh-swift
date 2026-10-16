@@ -105,6 +105,21 @@ let hash = try await publisher.pushToNode(
 )
 ```
 
+### Receive Pushes
+
+A serving node refuses pushes unless it opts in, because accepting them lets any
+peer that can reach the node write to its disk:
+
+```swift
+let inbox = try await IrohNode(config: IrohConfig(servesBlobs: true, acceptsPushes: true))
+```
+
+`acceptsPushes` without `servesBlobs` throws `IrohError.invalidConfiguration`.
+A node that refuses a push stores nothing, but the pusher is not reliably told:
+a small blob can still return its hash, while a larger one fails with
+`IrohError.pushFailed`. Confirm delivery out of band (for example by fetching
+the hash back) when it matters.
+
 ### Docs (Synchronized Documents)
 
 ```swift
@@ -249,6 +264,7 @@ if IrohAuthor.exists(identifier: "default") {
 | `docsEnabled` | `Bool` | `false` | Enable document sync |
 | `customRelayUrl` | `String?` | `nil` | Custom relay server URL |
 | `servesBlobs` | `Bool` | `true` | Serve blobs to peers; `false` makes a client-only node (fetch and push still work) |
+| `acceptsPushes` | `Bool` | `false` | Let peers push blobs into this node's store; requires `servesBlobs` |
 
 ### IrohBLAKE3
 
@@ -305,22 +321,30 @@ IROH_LOCAL_DEV=1 swift test
 
 ```
 Swift Layer (IrohSwift)           Rust FFI Layer              Iroh Libraries
-┌─────────────────────┐          ┌──────────────────┐        ┌─────────────┐
-│ IrohNode (actor)    │──C ABI──▶│ ffi.rs           │──────▶│ iroh 1.1.0  │
-│ IrohDoc (actor)     │          │ node.rs          │       │ iroh-blobs  │
-│ IrohAuthor          │          └──────────────────┘       │ iroh-docs   │
-└─────────────────────┘                                      └─────────────┘
+┌─────────────────────┐          ┌──────────────────┐        ┌────────────────────┐
+│ IrohNode (actor)    │──C ABI──▶│ ffi.rs           │───────▶│ iroh 1.3.0         │
+│ IrohDoc (actor)     │          │ node.rs          │        │ iroh-blobs 0.103.1 │
+│ IrohAuthor          │          └──────────────────┘        │ iroh-docs 0.101    │
+└─────────────────────┘                                      └────────────────────┘
 ```
 
 - **Swift Actor**: Thread-safe with async/await
 - **Rust FFI**: Callback-based async bridged via `CheckedContinuation`
 - **Storage**: Persistent `FsStore` (excluded from iCloud backup)
 
+## Behavior Change in 0.6.0
+
+Serving nodes no longer accept pushes unless `IrohConfig.acceptsPushes` is set
+(default `false`). Up to 0.5.x any peer could push blobs into a serving node's
+store. If your app receives pushes from other iroh-swift nodes, create the
+receiving node with `acceptsPushes: true`. Pushing *to* other nodes, fetching and
+serving blobs are unchanged.
+
 ## Version Compatibility
 
 | iroh-swift | iroh | iroh-blobs | iroh-docs |
 |------------|------|------------|-----------|
-| 0.6.x | 1.1.0 | 0.103 | 0.101 |
+| 0.6.x | 1.3.0 | 0.103.1 | 0.101 |
 | 0.5.x | 1.1.0 | 0.103 | 0.101 |
 | 0.4.x | 0.97 | 0.99 | 0.97 |
 | 0.3.x | 0.95 | 0.97 | 0.32 |

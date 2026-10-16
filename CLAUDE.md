@@ -37,11 +37,11 @@ Three-layer design with FFI boundary:
 
 ```
 Swift Layer (IrohSwift)           Rust FFI Layer                Iroh Libraries
-┌─────────────────────┐          ┌────────────────────┐        ┌───────────────┐
-│ IrohNode (actor)    │──C ABI──▶│ ffi.rs (callbacks) │──────▶│ iroh 1.1.0    │
-│ IrohConfig          │          │ node.rs (IrohNode) │       │ iroh-blobs 0.103│
-│ IrohError           │          └────────────────────┘        │ tokio runtime │
-└─────────────────────┘                                        └───────────────┘
+┌─────────────────────┐          ┌────────────────────┐        ┌────────────────────┐
+│ IrohNode (actor)    │──C ABI──▶│ ffi.rs (callbacks) │───────▶│ iroh 1.3.0         │
+│ IrohConfig          │          │ node.rs (IrohNode) │        │ iroh-blobs 0.103.1 │
+│ IrohError           │          └────────────────────┘        │ tokio runtime      │
+└─────────────────────┘                                        └────────────────────┘
 ```
 
 **Key concepts:**
@@ -69,6 +69,16 @@ Swift Layer (IrohSwift)           Rust FFI Layer                Iroh Libraries
   `ERR_PERMISSION` (1, e.g. tdf-iroh-s3's moderation block) maps to `fetchFailed`.
 - `IrohConfig.servesBlobs = false`: no blobs ALPN on the router and no provider event
   handler. Fetch and push still work (they only need the store and endpoint).
+- Serving nodes refuse pushes unless `IrohConfig.acceptsPushes` (default `false`): the
+  provider `EventMask` is `DEFAULT` (`push: Disabled`) or `push: Notify` when accepted.
+  iroh-blobs 0.103.1+ applies each mask field to its own request type (before #270,
+  `mask.get` governed pushes too). A refused push writes nothing, but the pusher is not
+  reliably told: its client stops reading at once and never sees the `ERR_PERMISSION`
+  reset. A tiny blob, written in one go, reports success; one still being written when
+  the provider's STOP_SENDING arrives fails with "sending stopped by peer" (1 MiB
+  already fails on localhost; a race for sizes in between). `acceptsPushes` without
+  `servesBlobs` is rejected (`invalidConfiguration`; node creation fails on the Rust side).
+  The provider event channel is always drained: the provider awaits each send.
 - Pushes (Data and file) leave a tagged blob in the local store; file push imports
   with `ImportMode::Copy` (needs free space for a copy).
 

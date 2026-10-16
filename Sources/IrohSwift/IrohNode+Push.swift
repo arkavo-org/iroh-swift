@@ -7,6 +7,11 @@ extension IrohNode {
     /// Adds the data to the local store, connects to the remote node,
     /// and pushes the blob. Returns the blob hash as a hex string on success.
     ///
+    /// The remote node must accept pushes (an `IrohNode` created with
+    /// `acceptsPushes: true`, or a server that enables them). A node that refuses
+    /// pushes stores nothing, and the pusher is not reliably told: a small blob
+    /// can still return its hash; a larger one fails with `IrohError.pushFailed`.
+    ///
     /// - Parameters:
     ///   - nodeId: The remote node ID as a hex string.
     ///   - relayUrl: Optional relay URL to assist with connectivity.
@@ -116,6 +121,9 @@ extension IrohNode {
     }
 
     /// Push bytes directly to a remote node with options (e.g., timeout).
+    ///
+    /// Like `pushToNode(nodeId:relayUrl:directAddrs:data:)`, the remote node must
+    /// accept pushes.
     ///
     /// - Parameters:
     ///   - nodeId: The remote node ID as a hex string.
@@ -244,9 +252,9 @@ extension IrohNode {
     /// The file is streamed into this node's blob store (copied, so the store
     /// needs free space for it; the original file is not modified or kept open
     /// afterwards), then pushed to the remote node exactly like
-    /// `pushToNode(nodeId:relayUrl:directAddrs:data:)`. Works on client-only
-    /// nodes (`servesBlobs: false`). Like the `Data` variant, the blob stays in
-    /// this node's store afterwards.
+    /// `pushToNode(nodeId:relayUrl:directAddrs:data:)`, so the remote node must
+    /// accept pushes. Works on client-only nodes (`servesBlobs: false`). Like the
+    /// `Data` variant, the blob stays in this node's store afterwards.
     ///
     /// Cancelling the calling task aborts the import or push and throws
     /// `CancellationError`.

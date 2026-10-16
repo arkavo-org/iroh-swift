@@ -133,6 +133,13 @@ typedef struct IrohNodeConfig {
      * peers cannot download blobs from it or push blobs to it.
      */
     bool serves_blobs;
+    /**
+     * Whether peers may push blobs into this node's store (default: false).
+     * Only meaningful with `serves_blobs`; setting it without `serves_blobs`
+     * fails node creation. When false, a serving node refuses push requests
+     * and writes nothing; peers can still download blobs from it.
+     */
+    bool accepts_pushes;
 } IrohNodeConfig;
 
 /**
@@ -780,6 +787,10 @@ void iroh_put_with_options(const struct IrohNodeHandle *handle,
  *
  * Adds the data to the local store, connects to the remote node,
  * and pushes the blob. Returns the blob hash as a hex string on success.
+ *
+ * The remote must accept pushes (`accepts_pushes` on an iroh-swift node). A
+ * node that refuses them stores nothing; the pusher is not reliably told (a
+ * small blob can still report success, a larger one fails).
  *
  * # Safety
  * - `handle` must be a valid node handle

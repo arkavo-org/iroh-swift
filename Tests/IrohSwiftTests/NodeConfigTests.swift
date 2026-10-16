@@ -2,13 +2,38 @@ import Foundation
 import Testing
 @testable import IrohSwift
 
-/// `IrohConfig.servesBlobs` and `NodeInfo`.
+/// `IrohConfig.servesBlobs`, `IrohConfig.acceptsPushes` and `NodeInfo`.
 struct NodeConfigTests {
     @Test("IrohConfig serves blobs by default")
     func servesBlobsDefault() {
         #expect(IrohConfig().servesBlobs)
         #expect(!IrohConfig(servesBlobs: false).servesBlobs)
         #expect(IrohConfig(relayEnabled: false, docsEnabled: true).servesBlobs)
+    }
+
+    @Test("IrohConfig refuses pushes by default")
+    func acceptsPushesDefault() {
+        #expect(!IrohConfig().acceptsPushes)
+        #expect(!IrohConfig(servesBlobs: true).acceptsPushes)
+        #expect(IrohConfig(servesBlobs: true, acceptsPushes: true).acceptsPushes)
+    }
+
+    @Test("acceptsPushes without servesBlobs is an invalid configuration")
+    func acceptsPushesRequiresServesBlobs() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let config = IrohConfig(
+            storagePath: dir, relayEnabled: false, servesBlobs: false, acceptsPushes: true
+        )
+
+        let validateError = #expect(throws: IrohError.self) { try config.validate() }
+        #expect(validateError?.isInvalidConfiguration == true, "got \(String(describing: validateError))")
+        // Rejected before anything is created on disk.
+        #expect(!FileManager.default.fileExists(atPath: dir.path))
+
+        let initError = await #expect(throws: IrohError.self) { try await IrohNode(config: config) }
+        #expect(initError?.isInvalidConfiguration == true, "got \(String(describing: initError))")
     }
 
     @Test("a client-only node starts, stores blobs and reports its direct addresses")

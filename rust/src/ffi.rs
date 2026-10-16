@@ -50,6 +50,11 @@ pub struct IrohNodeConfig {
     /// When false the node is client-only: it can fetch and push blobs, but
     /// peers cannot download blobs from it or push blobs to it.
     pub serves_blobs: bool,
+    /// Whether peers may push blobs into this node's store (default: false).
+    /// Only meaningful with `serves_blobs`; setting it without `serves_blobs`
+    /// fails node creation. When false, a serving node refuses push requests
+    /// and writes nothing; peers can still download blobs from it.
+    pub accepts_pushes: bool,
 }
 
 /// Options for put/get operations.
@@ -467,6 +472,7 @@ pub extern "C" fn iroh_node_create(config: IrohNodeConfig, callback: IrohNodeCre
     let relay_enabled = config.relay_enabled;
     let docs_enabled = config.docs_enabled;
     let serves_blobs = config.serves_blobs;
+    let accepts_pushes = config.accepts_pushes;
 
     // Create the node synchronously
     // Note: Swift should call this from a background thread/task
@@ -476,6 +482,7 @@ pub extern "C" fn iroh_node_create(config: IrohNodeConfig, callback: IrohNodeCre
         custom_relay_url,
         docs_enabled,
         serves_blobs,
+        accepts_pushes,
     ) {
         Ok(node) => {
             // Box the node and convert to raw pointer
@@ -899,6 +906,10 @@ pub extern "C" fn iroh_put_with_options(
 ///
 /// Adds the data to the local store, connects to the remote node,
 /// and pushes the blob. Returns the blob hash as a hex string on success.
+///
+/// The remote must accept pushes (`accepts_pushes` on an iroh-swift node). A
+/// node that refuses them stores nothing; the pusher is not reliably told (a
+/// small blob can still report success, a larger one fails).
 ///
 /// # Safety
 /// - `handle` must be a valid node handle
