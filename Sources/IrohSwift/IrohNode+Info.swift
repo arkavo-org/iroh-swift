@@ -5,9 +5,11 @@ extension IrohNode {
     /// Get information about this node.
     ///
     /// - Returns: Node information including ID, relay URL, and connection status.
-    /// - Throws: `IrohError.nodeCreationFailed` if the info cannot be retrieved.
+    /// - Throws: `IrohError.nodeClosed` if the node is closed,
+    ///           `IrohError.nodeCreationFailed` if the info cannot be retrieved.
     public func info() async throws -> NodeInfo {
-        try await withCheckedThrowingContinuation { continuation in
+        try ensureNotClosed()
+        return try await withCheckedThrowingContinuation { continuation in
             let box = Unmanaged.passRetained(
                 ContinuationBox<NodeInfo>(continuation)
             ).toOpaque()
@@ -30,10 +32,21 @@ extension IrohNode {
                         relayUrl = nil
                     }
 
+                    let directAddrs: [String]
+                    if info.direct_addrs != nil {
+                        directAddrs = String(cString: info.direct_addrs)
+                            .split(separator: "\n")
+                            .map(String.init)
+                        iroh_string_free(UnsafeMutablePointer(mutating: info.direct_addrs))
+                    } else {
+                        directAddrs = []
+                    }
+
                     let nodeInfo = NodeInfo(
                         nodeId: nodeId,
                         relayUrl: relayUrl,
-                        isConnected: info.is_connected
+                        isConnected: info.is_connected,
+                        directAddrs: directAddrs
                     )
                     box.continuation.resume(returning: nodeInfo)
                 },

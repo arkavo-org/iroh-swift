@@ -26,6 +26,8 @@ pub struct NodeInfo {
     pub relay_url: Option<String>,
     /// Whether the node is connected to the network.
     pub is_connected: bool,
+    /// Direct `ip:port` socket addresses this node is reachable on.
+    pub direct_addrs: Vec<String>,
 }
 
 /// Minimal Iroh node for blob operations.
@@ -58,11 +60,15 @@ impl IrohNode {
     /// * `relay_enabled` - Whether to use relay servers
     /// * `custom_relay_url` - Optional custom relay URL (if None, uses n0's public relays)
     /// * `docs_enabled` - Whether to enable the Docs engine for syncing documents
+    /// * `serves_blobs` - Whether to accept the iroh-blobs ALPN. When false the node
+    ///   is client-only: it can still fetch and push, but peers cannot get blobs
+    ///   from it (or push to it).
     pub fn new(
         storage_path: PathBuf,
         relay_enabled: bool,
         custom_relay_url: Option<String>,
         docs_enabled: bool,
+        serves_blobs: bool,
     ) -> Result<Self> {
         // Create dedicated runtime for this node
         let runtime = Runtime::new().context("Failed to create Tokio runtime")?;
@@ -92,31 +98,38 @@ impl IrohNode {
                 let _ = tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await;
             }
 
-            // Set up the blobs protocol handler with push acceptance.
-            // EventSender::request() checks only mask.get for ALL request types
-            // (get, push, etc.), so we set get: Notify to enable push delivery.
-            let mask = EventMask {
-                get: RequestMode::Notify,
-                ..EventMask::DEFAULT
-            };
-            let (event_sender, mut event_rx) = EventSender::channel(64, mask);
+            // Set up the blobs protocol handler with push acceptance, unless the
+            // node is client-only. Fetching (`store.remote()`, the downloader) and
+            // pushing only need the store and the endpoint, not the handler.
+            let (blobs, event_handler) = if serves_blobs {
+                // EventSender::request() checks only mask.get for ALL request types
+                // (get, push, etc.), so we set get: Notify to enable push delivery.
+                let mask = EventMask {
+                    get: RequestMode::Notify,
+                    ..EventMask::DEFAULT
+                };
+                let (event_sender, mut event_rx) = EventSender::channel(64, mask);
 
-            // Spawn event handler that accepts push requests
-            let event_handler = tokio::spawn(async move {
-                while let Some(msg) = event_rx.recv().await {
-                    match msg {
-                        ProviderMessage::PushRequestReceived(msg) => {
-                            msg.tx.send(Ok(())).await.ok();
+                // Spawn event handler that accepts push requests
+                let event_handler = tokio::spawn(async move {
+                    while let Some(msg) = event_rx.recv().await {
+                        match msg {
+                            ProviderMessage::PushRequestReceived(msg) => {
+                                msg.tx.send(Ok(())).await.ok();
+                            }
+                            ProviderMessage::ClientConnected(msg) => {
+                                msg.tx.send(Ok(())).await.ok();
+                            }
+                            _ => {}
                         }
-                        ProviderMessage::ClientConnected(msg) => {
-                            msg.tx.send(Ok(())).await.ok();
-                        }
-                        _ => {}
                     }
-                }
-            });
+                });
 
-            let blobs = BlobsProtocol::new(&store, Some(event_sender));
+                let blobs = BlobsProtocol::new(&store, Some(event_sender));
+                (Some(blobs), Some(event_handler))
+            } else {
+                (None, None)
+            };
 
             // Conditionally set up Docs protocol
             let (gossip, docs) = if docs_enabled {
@@ -143,8 +156,13 @@ impl IrohNode {
                 (None, None)
             };
 
-            // Build router with all protocols
-            let mut router_builder = Router::builder(endpoint.clone()).accept(BLOBS_ALPN, blobs);
+            // Build router with all protocols. A client-only node registers no
+            // blobs ALPN, so incoming blobs connections fail the TLS/ALPN handshake.
+            let mut router_builder = Router::builder(endpoint.clone());
+
+            if let Some(blobs) = blobs {
+                router_builder = router_builder.accept(BLOBS_ALPN, blobs);
+            }
 
             if let Some(ref g) = gossip {
                 router_builder = router_builder.accept(GOSSIP_ALPN, g.clone());
@@ -166,7 +184,7 @@ impl IrohNode {
             router,
             gossip,
             docs,
-            event_handler: Some(event_handler),
+            event_handler,
         })
     }
 
@@ -518,10 +536,13 @@ impl IrohNode {
             // A node is considered connected if it has a relay URL or IP addresses
             let is_connected = relay_url.is_some() || addr.ip_addrs().next().is_some();
 
+            let direct_addrs = addr.ip_addrs().map(|a| a.to_string()).collect();
+
             Ok(NodeInfo {
                 node_id,
                 relay_url,
                 is_connected,
+                direct_addrs,
             })
         })
     }
@@ -573,14 +594,33 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn local_node(dir: &tempfile::TempDir, serves_blobs: bool) -> IrohNode {
+        IrohNode::new(dir.path().to_path_buf(), false, None, false, serves_blobs).unwrap()
+    }
+
+    #[test]
+    fn test_client_only_node_reports_direct_addrs() {
+        let dir = tempdir().unwrap();
+        let node = local_node(&dir, false);
+
+        let info = node.info().unwrap();
+        assert!(!info.direct_addrs.is_empty());
+        for addr in &info.direct_addrs {
+            addr.parse::<std::net::SocketAddr>()
+                .unwrap_or_else(|e| panic!("{addr}: {e}"));
+        }
+
+        node.shutdown().unwrap();
+    }
+
     #[test]
     fn test_push_to_node_roundtrip() {
         let dir_a = tempdir().unwrap();
         let dir_b = tempdir().unwrap();
 
         // Create two nodes, relay disabled (local connection)
-        let node_a = IrohNode::new(dir_a.path().to_path_buf(), false, None, false).unwrap();
-        let node_b = IrohNode::new(dir_b.path().to_path_buf(), false, None, false).unwrap();
+        let node_a = IrohNode::new(dir_a.path().to_path_buf(), false, None, false, true).unwrap();
+        let node_b = IrohNode::new(dir_b.path().to_path_buf(), false, None, false, true).unwrap();
 
         // Get node B's ID
         let node_b_info = node_b.info().unwrap();
@@ -616,7 +656,7 @@ mod tests {
         let direct_addr = std::env::var("IROH_REMOTE_ADDR").expect("Set IROH_REMOTE_ADDR");
 
         let dir = tempdir().unwrap();
-        let node = IrohNode::new(dir.path().to_path_buf(), true, None, false).unwrap();
+        let node = IrohNode::new(dir.path().to_path_buf(), true, None, false, true).unwrap();
 
         let info = node.info().unwrap();
         println!("Local node ID: {}", info.node_id);
@@ -638,7 +678,7 @@ mod tests {
     #[test]
     fn test_put_roundtrip() {
         let dir = tempdir().unwrap();
-        let node = IrohNode::new(dir.path().to_path_buf(), false, None, false).unwrap();
+        let node = IrohNode::new(dir.path().to_path_buf(), false, None, false, true).unwrap();
 
         let data = b"Hello, Iroh!";
         let ticket = node.put(data).unwrap();
@@ -652,7 +692,7 @@ mod tests {
     #[test]
     fn test_node_with_docs_enabled() {
         let dir = tempdir().unwrap();
-        let node = IrohNode::new(dir.path().to_path_buf(), false, None, true).unwrap();
+        let node = IrohNode::new(dir.path().to_path_buf(), false, None, true, true).unwrap();
 
         assert!(node.is_docs_enabled());
         assert!(node.docs().is_some());
@@ -670,8 +710,8 @@ mod tests {
         let dir_b = tempdir().unwrap();
 
         // Relay enabled so node B can discover node A via n0 DNS/relay
-        let node_a = IrohNode::new(dir_a.path().to_path_buf(), true, None, false).unwrap();
-        let node_b = IrohNode::new(dir_b.path().to_path_buf(), true, None, false).unwrap();
+        let node_a = IrohNode::new(dir_a.path().to_path_buf(), true, None, false, true).unwrap();
+        let node_b = IrohNode::new(dir_b.path().to_path_buf(), true, None, false, true).unwrap();
 
         let data = b"Cross-node get test data";
         let ticket = node_a.put(data).unwrap();

@@ -94,6 +94,12 @@ typedef struct IrohNodeConfig {
      * When enabled, the node can create, join, and sync documents.
      */
     bool docs_enabled;
+    /**
+     * Whether to accept the iroh-blobs protocol (default: true).
+     * When false the node is client-only: it can fetch and push blobs, but
+     * peers cannot download blobs from it or push blobs to it.
+     */
+    bool serves_blobs;
 } IrohNodeConfig;
 
 /**
@@ -233,6 +239,11 @@ typedef struct IrohNodeInfo {
      * Whether the node is connected to the network.
      */
     bool is_connected;
+    /**
+     * Direct `ip:port` addresses, separated by `\n` (caller must free with
+     * `iroh_string_free`). Null if the node has no direct addresses.
+     */
+    const char *direct_addrs;
 } IrohNodeInfo;
 
 /**
@@ -559,7 +570,8 @@ void iroh_node_create(struct IrohNodeConfig config, struct IrohNodeCreateCallbac
 /**
  * Destroy an Iroh node and free its resources.
  *
- * This performs a graceful shutdown, ensuring pending writes are flushed.
+ * Performs shutdown on a background thread to avoid blocking Swift's
+ * cooperative thread pool (which can deadlock if called from deinit).
  *
  * # Safety
  * - `handle` must be a valid pointer returned by `iroh_node_create`

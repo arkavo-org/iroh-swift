@@ -46,6 +46,10 @@ pub struct IrohNodeConfig {
     /// Whether to enable the Docs engine (default: false).
     /// When enabled, the node can create, join, and sync documents.
     pub docs_enabled: bool,
+    /// Whether to accept the iroh-blobs protocol (default: true).
+    /// When false the node is client-only: it can fetch and push blobs, but
+    /// peers cannot download blobs from it or push blobs to it.
+    pub serves_blobs: bool,
 }
 
 /// Options for put/get operations.
@@ -271,6 +275,9 @@ pub struct IrohNodeInfo {
     pub relay_url: *const c_char,
     /// Whether the node is connected to the network.
     pub is_connected: bool,
+    /// Direct `ip:port` addresses, separated by `\n` (caller must free with
+    /// `iroh_string_free`). Null if the node has no direct addresses.
+    pub direct_addrs: *const c_char,
 }
 
 /// Callback for node info retrieval.
@@ -459,10 +466,17 @@ pub extern "C" fn iroh_node_create(config: IrohNodeConfig, callback: IrohNodeCre
 
     let relay_enabled = config.relay_enabled;
     let docs_enabled = config.docs_enabled;
+    let serves_blobs = config.serves_blobs;
 
     // Create the node synchronously
     // Note: Swift should call this from a background thread/task
-    match IrohNode::new(storage_path, relay_enabled, custom_relay_url, docs_enabled) {
+    match IrohNode::new(
+        storage_path,
+        relay_enabled,
+        custom_relay_url,
+        docs_enabled,
+        serves_blobs,
+    ) {
         Ok(node) => {
             // Box the node and convert to raw pointer
             let boxed = Box::new(node);
@@ -725,10 +739,19 @@ pub extern "C" fn iroh_node_info(handle: *const IrohNodeHandle, callback: IrohNo
                 .map(|url| CString::new(url).unwrap().into_raw())
                 .unwrap_or(std::ptr::null_mut());
 
+            let direct_addrs = if info.direct_addrs.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                CString::new(info.direct_addrs.join("\n"))
+                    .unwrap()
+                    .into_raw()
+            };
+
             let ffi_info = IrohNodeInfo {
                 node_id,
                 relay_url,
                 is_connected: info.is_connected,
+                direct_addrs,
             };
             (callback.on_success)(callback.userdata, ffi_info);
         }

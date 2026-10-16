@@ -18,6 +18,17 @@ public struct IrohConfig: Sendable {
     /// Default: false
     public var docsEnabled: Bool
 
+    /// Whether this node serves blobs to other nodes (accepts the iroh-blobs protocol).
+    ///
+    /// When `false` the node is client-only: it can still `fetch(hash:fromNode:...)`,
+    /// `get(ticket:)` and `pushToNode(...)`, but peers cannot download blobs from
+    /// it or push blobs to it — their blobs connections are refused at the
+    /// handshake. Tickets created by `put(_:)` on a client-only node are not
+    /// fetchable by others. With `docsEnabled`, peers cannot pull this node's
+    /// document content either.
+    /// Default: true
+    public var servesBlobs: Bool
+
     /// Create a new IrohConfig with the specified options.
     ///
     /// - Parameters:
@@ -26,16 +37,20 @@ public struct IrohConfig: Sendable {
     ///   - relayEnabled: Whether to use relay servers. Default: true.
     ///   - customRelayUrl: Custom relay server URL. If nil, uses n0's public relays.
     ///   - docsEnabled: Whether to enable the Docs engine. Default: false.
+    ///   - servesBlobs: Whether to serve blobs to other nodes. `false` makes the
+    ///                  node client-only (fetch and push still work). Default: true.
     public init(
         storagePath: URL? = nil,
         relayEnabled: Bool = true,
         customRelayUrl: String? = nil,
-        docsEnabled: Bool = false
+        docsEnabled: Bool = false,
+        servesBlobs: Bool = true
     ) {
         self.storagePath = storagePath ?? Self.defaultStoragePath()
         self.relayEnabled = relayEnabled
         self.customRelayUrl = customRelayUrl
         self.docsEnabled = docsEnabled
+        self.servesBlobs = servesBlobs
     }
 
     /// Validate the configuration before node creation.
