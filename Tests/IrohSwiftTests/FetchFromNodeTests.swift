@@ -382,4 +382,79 @@ struct FetchFromNodeTests {
 
         await client.close()
     }
+
+    @Test("client-only node pushes Data to a serving node and fetches it back")
+    func pushDataThenFetch() async throws {
+        let server = try await makeNode(servesBlobs: true)
+        let client = try await makeNode(servesBlobs: false)
+        let out = try makeOutputDir()
+        defer { try? FileManager.default.removeItem(at: out) }
+
+        let serverID = try await server.node.endpointID()
+        let addrs = try await server.node.info().directAddrs
+        let data = testData(count: 200_000)
+
+        let hash = try await client.node.pushToNode(nodeId: serverID, directAddrs: addrs, data: data)
+        #expect(hash == IrohBLAKE3.hex(data))
+
+        let destination = out.appendingPathComponent("back.bin")
+        let size = try await client.node.fetch(
+            hash: hash, fromNode: serverID, directAddrs: addrs, to: destination, maxSize: .max
+        )
+        #expect(size == UInt64(data.count))
+        #expect(try Data(contentsOf: destination) == data)
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("client-only node pushes a file to a serving node and fetches it back")
+    func pushFileThenFetch() async throws {
+        let server = try await makeNode(servesBlobs: true)
+        let client = try await makeNode(servesBlobs: false)
+        let out = try makeOutputDir()
+        defer { try? FileManager.default.removeItem(at: out) }
+
+        let serverID = try await server.node.endpointID()
+        let addrs = try await server.node.info().directAddrs
+        let data = testData(count: 2 * 1024 * 1024 + 5)
+        let source = out.appendingPathComponent("source.tdf")
+        try data.write(to: source)
+
+        let hash = try await client.node.pushToNode(nodeId: serverID, directAddrs: addrs, fileURL: source)
+        #expect(hash == IrohBLAKE3.hex(data))
+        // The source file is untouched.
+        #expect(try Data(contentsOf: source) == data)
+
+        let destination = out.appendingPathComponent("fetched.tdf")
+        let size = try await client.node.fetch(
+            hash: hash, fromNode: serverID, directAddrs: addrs, to: destination, maxSize: .max
+        )
+        #expect(size == UInt64(data.count))
+        #expect(try Data(contentsOf: destination) == data)
+        #expect(IrohBLAKE3.hex(try Data(contentsOf: destination)) == hash)
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("pushToNode(fileURL:) with a missing file throws pushFailed")
+    func pushMissingFile() async throws {
+        let server = try await makeNode(servesBlobs: true)
+        let client = try await makeNode(servesBlobs: false)
+
+        let missing = FileManager.default.temporaryDirectory
+            .appendingPathComponent("missing-\(UUID().uuidString).tdf")
+        let error = await #expect(throws: IrohError.self) {
+            try await client.node.pushToNode(
+                nodeId: try await server.node.endpointID(),
+                directAddrs: try await server.node.info().directAddrs,
+                fileURL: missing
+            )
+        }
+        #expect(error?.isPushFailed == true, "got \(String(describing: error))")
+
+        await client.close()
+        await server.close()
+    }
 }

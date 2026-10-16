@@ -56,7 +56,7 @@ pub struct IrohNode {
     /// Event handler task for accepting push requests (must be kept alive).
     #[allow(dead_code)]
     event_handler: Option<tokio::task::JoinHandle<()>>,
-    /// Parent of every spawned, cancellable operation (fetch).
+    /// Parent of every spawned, cancellable operation (fetch, file push).
     /// Cancelled first on shutdown so in-flight operations report
     /// [`OperationError::NodeShutDown`] instead of an opaque connection error.
     operations: CancellationToken,
@@ -447,47 +447,8 @@ impl IrohNode {
                 .await
                 .context("Failed to add bytes to store")?;
 
-            // Parse remote node ID
-            let node_id: iroh::EndpointId = remote_node_id_hex
-                .parse()
-                .context("Failed to parse remote node ID")?;
-
-            // Build EndpointAddr with optional relay and/or direct addresses
-            let mut endpoint_addr = EndpointAddr::from(node_id);
-            if let Some(url) = relay_url {
-                let relay_url: RelayUrl = url.parse().context("Invalid relay URL")?;
-                endpoint_addr = endpoint_addr.with_relay_url(relay_url);
-            }
-            for addr_str in direct_addrs {
-                let socket_addr: std::net::SocketAddr =
-                    addr_str.parse().context("Invalid direct address")?;
-                endpoint_addr = endpoint_addr.with_ip_addr(socket_addr);
-            }
-
-            // Connect to remote node
-            let conn = self
-                .endpoint
-                .connect(endpoint_addr, BLOBS_ALPN)
-                .await
-                .context("Failed to connect to remote node")?;
-
-            // Keep a connection handle alive — execute_push takes ownership but
-            // Connection is Clone (ref-counted). The server needs time to
-            // accept_bi and process the push stream after execute_push returns.
-            let _conn_guard = conn.clone();
-
-            // Push the blob
-            let request = PushRequest::from(GetRequest::blob(tag.hash));
-            self.store
-                .remote()
-                .execute_push(conn, request)
-                .await
-                .context("Failed to push blob to remote node")?;
-
-            // Give the server time to process the push before dropping the connection.
-            // Without this, small blobs may transfer in a single QUIC packet and the
-            // server's accept_bi may not be scheduled before the connection closes.
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            let endpoint_addr = remote_endpoint_addr(remote_node_id_hex, relay_url, direct_addrs)?;
+            push_hash(&self.endpoint, &self.store, tag.hash, endpoint_addr).await?;
 
             Ok(hex::encode(tag.hash.as_bytes()))
         })
@@ -517,37 +478,9 @@ impl IrohNode {
                     .await
                     .context("Failed to add bytes to store")?;
 
-                let node_id: iroh::EndpointId = remote_node_id_hex
-                    .parse()
-                    .context("Failed to parse remote node ID")?;
-
-                let mut endpoint_addr = EndpointAddr::from(node_id);
-                if let Some(url) = relay_url {
-                    let relay_url: RelayUrl = url.parse().context("Invalid relay URL")?;
-                    endpoint_addr = endpoint_addr.with_relay_url(relay_url);
-                }
-                for addr_str in direct_addrs {
-                    let socket_addr: std::net::SocketAddr =
-                        addr_str.parse().context("Invalid direct address")?;
-                    endpoint_addr = endpoint_addr.with_ip_addr(socket_addr);
-                }
-
-                let conn = self
-                    .endpoint
-                    .connect(endpoint_addr, BLOBS_ALPN)
-                    .await
-                    .context("Failed to connect to remote node")?;
-
-                let _conn_guard = conn.clone();
-
-                let request = PushRequest::from(GetRequest::blob(tag.hash));
-                self.store
-                    .remote()
-                    .execute_push(conn, request)
-                    .await
-                    .context("Failed to push blob to remote node")?;
-
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                let endpoint_addr =
+                    remote_endpoint_addr(remote_node_id_hex, relay_url, direct_addrs)?;
+                push_hash(&self.endpoint, &self.store, tag.hash, endpoint_addr).await?;
 
                 Ok::<_, anyhow::Error>(hex::encode(tag.hash.as_bytes()))
             };
@@ -608,8 +541,8 @@ impl IrohNode {
             operations,
         } = self;
 
-        // Stop in-flight fetches first: each reports NodeShutDown and
-        // removes its partial file before the endpoint goes away.
+        // Stop in-flight fetches and file pushes first, before the endpoint goes
+        // away: each reports NodeShutDown (a fetch also removes its temp file).
         operations.cancel();
 
         let result = runtime.block_on(async {
@@ -661,7 +594,41 @@ pub fn remote_endpoint_addr(
     Ok(endpoint_addr)
 }
 
-/// Why a spawned operation (fetch) did not complete.
+/// Push a blob that is already in `store` to a remote node.
+async fn push_hash(
+    endpoint: &Endpoint,
+    store: &FsStore,
+    hash: Hash,
+    endpoint_addr: EndpointAddr,
+) -> Result<()> {
+    // Connect to remote node
+    let conn = endpoint
+        .connect(endpoint_addr, BLOBS_ALPN)
+        .await
+        .context("Failed to connect to remote node")?;
+
+    // Keep a connection handle alive — execute_push takes ownership but
+    // Connection is Clone (ref-counted). The server needs time to
+    // accept_bi and process the push stream after execute_push returns.
+    let _conn_guard = conn.clone();
+
+    // Push the blob
+    let request = PushRequest::from(GetRequest::blob(hash));
+    store
+        .remote()
+        .execute_push(conn, request)
+        .await
+        .context("Failed to push blob to remote node")?;
+
+    // Give the server time to process the push before dropping the connection.
+    // Without this, small blobs may transfer in a single QUIC packet and the
+    // server's accept_bi may not be scheduled before the connection closes.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    Ok(())
+}
+
+/// Why a spawned operation (fetch, file push) did not complete.
 #[derive(Debug)]
 pub enum OperationError {
     /// The remote does not have the requested blob (or not all of it).
@@ -975,6 +942,25 @@ async fn fetch_on_connection(
         .with_context(|| format!("Failed to move blob to {}", destination.display()))?;
     guard.commit();
     Ok(size)
+}
+
+/// Import the file at `path` into the store (streamed, copied into the store)
+/// and push it to a remote node. Returns the blob hash.
+pub async fn push_path(
+    endpoint: &Endpoint,
+    store: &FsStore,
+    path: &Path,
+    remote: EndpointAddr,
+) -> Result<Hash, OperationError> {
+    if !path.is_absolute() {
+        return Err(anyhow::anyhow!("File path must be absolute: {}", path.display()).into());
+    }
+    let tag = store
+        .add_path(path)
+        .await
+        .with_context(|| format!("Failed to import {} into the store", path.display()))?;
+    push_hash(endpoint, store, tag.hash, remote).await?;
+    Ok(tag.hash)
 }
 
 /// BLAKE3 hash of `data` as 64 lowercase hex characters.
@@ -1328,6 +1314,36 @@ mod tests {
         assert!(leftover_files(out.path()).is_empty());
 
         client.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_push_file_from_client_only_node_then_fetch_back() {
+        let (dir_a, dir_b, out) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let server = local_node(&dir_a, true);
+        let client = local_node(&dir_b, false);
+
+        let data = test_bytes(1024 * 1024 + 7);
+        let source = out.path().join("source.tdf");
+        std::fs::write(&source, &data).unwrap();
+
+        let addr =
+            remote_endpoint_addr(&server.endpoint_id(), None, &direct_addrs(&server)).unwrap();
+        let hash = client
+            .runtime()
+            .block_on(push_path(client.endpoint(), client.store(), &source, addr))
+            .unwrap();
+        assert_eq!(hash.to_hex().to_string(), blake3_hex(&data));
+
+        let has = server.runtime().block_on(server.store().has(hash)).unwrap();
+        assert!(has, "server should have the pushed blob");
+
+        let dest = out.path().join("fetched.tdf");
+        let (result, _) = fetch(&client, &server, hash, &dest, u64::MAX);
+        assert_eq!(result.unwrap(), data.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+
+        client.shutdown().unwrap();
+        server.shutdown().unwrap();
     }
 
     #[test]

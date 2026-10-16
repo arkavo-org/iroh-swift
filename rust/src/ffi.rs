@@ -2352,7 +2352,7 @@ pub unsafe extern "C" fn iroh_blake3_hex(bytes: IrohBytes) -> *mut c_char {
 // Cancellable Operations
 // ============================================================================
 
-/// Opaque cancellation token for a spawned operation (fetch).
+/// Opaque cancellation token for a spawned operation (fetch, file push).
 ///
 /// Create with `iroh_cancel_token_new`, pass to the operation, cancel with
 /// `iroh_cancel_token_cancel` (any thread, any number of times), and free with
@@ -2403,6 +2403,20 @@ pub struct IrohFetchCallback {
         size: u64,
         error: *const c_char,
     ),
+}
+
+/// Callback for `iroh_push_file_to_node`.
+///
+/// Exactly one of `on_success` / `on_failure` is called, once.
+#[repr(C)]
+pub struct IrohPushFileCallback {
+    /// Opaque pointer passed back to Swift.
+    pub userdata: *mut c_void,
+    /// Called with the blob hash as 64 lowercase hex (free with `iroh_string_free`).
+    pub on_success: extern "C" fn(userdata: *mut c_void, hash: *const c_char),
+    /// Called on failure. `error` must be freed with `iroh_string_free`.
+    pub on_failure:
+        extern "C" fn(userdata: *mut c_void, code: IrohOperationErrorCode, error: *const c_char),
 }
 
 /// Create a cancellation token. Free with `iroh_cancel_token_free`.
@@ -2535,6 +2549,89 @@ pub unsafe extern "C" fn iroh_fetch_from_node(
     });
 }
 
+/// Push the file at `file_path` to a remote node without loading it into memory.
+///
+/// The file is streamed into the local store (copied, BLAKE3/bao-encoded), then
+/// pushed exactly like `iroh_push_to_node`. On success the callback receives the
+/// blob hash (64 lowercase hex). The blob stays in the local store, tagged, like
+/// the bytes pushed by `iroh_push_to_node`.
+///
+/// Returns immediately; the work runs on the node's runtime. Cancel it with
+/// `iroh_cancel_token_cancel(cancel_token)`.
+///
+/// # Safety
+/// - `handle` must be a valid node handle that outlives the operation's callback
+/// - `remote_node_id_hex` and `file_path` must be valid null-terminated UTF-8 strings
+/// - `relay_url` is nullable; if non-null must be a valid null-terminated UTF-8 string
+/// - `direct_addrs` is nullable; if non-null must point to `direct_addrs_len`
+///   valid null-terminated UTF-8 strings
+/// - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_push_file_to_node(
+    handle: *const IrohNodeHandle,
+    remote_node_id_hex: *const c_char,
+    relay_url: *const c_char,
+    direct_addrs: *const *const c_char,
+    direct_addrs_len: usize,
+    file_path: *const c_char,
+    cancel_token: *const IrohCancelToken,
+    callback: IrohPushFileCallback,
+) {
+    let completion = PushFileCompletion {
+        userdata: callback.userdata as usize,
+        on_success: callback.on_success,
+        on_failure: callback.on_failure,
+        done: false,
+    };
+
+    let parsed = (|| {
+        if handle.is_null() {
+            return Err("handle cannot be null".to_string());
+        }
+        let node_id = unsafe { required_str(remote_node_id_hex, "remote_node_id_hex") }?;
+        let relay = unsafe { optional_str(relay_url, "relay_url") }?;
+        let addrs = unsafe { str_array(direct_addrs, direct_addrs_len) }?;
+        let path = PathBuf::from(unsafe { required_str(file_path, "file_path") }?);
+        let remote = crate::node::remote_endpoint_addr(node_id, relay, &addrs)
+            .map_err(|e| format!("{:#}", e))?;
+        Ok((remote, path))
+    })();
+
+    let (remote, path) = match parsed {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            completion.fail(IrohOperationErrorCode::Failed, message);
+            return;
+        }
+    };
+
+    let node = unsafe { &*(handle as *const IrohNode) };
+    if node.is_shutting_down() {
+        completion.fail(IrohOperationErrorCode::NodeShutDown, "node shut down");
+        return;
+    }
+    let token = operation_token(cancel_token);
+    let endpoint = node.endpoint().clone();
+    let store = node.store().clone();
+    let shutdown = node.shutdown_token();
+    node.runtime().spawn(async move {
+        let result = crate::node::run_cancellable(
+            crate::node::push_path(&endpoint, &store, &path, remote),
+            &token,
+            &shutdown,
+        )
+        .await;
+        match result {
+            Ok(hash) => completion.succeed(hash.to_hex().to_string()),
+            Err(e) => {
+                let (code, _) = operation_error_code(&e);
+                completion.fail(code, e.to_string());
+            }
+        }
+    });
+}
+
 /// Delivers the outcome of a fetch to its callback exactly once.
 ///
 /// If the task is dropped before completing (the runtime shut down), `Drop`
@@ -2583,6 +2680,40 @@ impl Drop for FetchCompletion {
                 self.userdata as *mut c_void,
                 IrohOperationErrorCode::NodeShutDown,
                 0,
+                c_string("node shut down".to_string()),
+            );
+        }
+    }
+}
+
+/// Delivers the outcome of a file push to its callback exactly once (see `FetchCompletion`).
+struct PushFileCompletion {
+    userdata: usize,
+    on_success: extern "C" fn(userdata: *mut c_void, hash: *const c_char),
+    on_failure:
+        extern "C" fn(userdata: *mut c_void, code: IrohOperationErrorCode, error: *const c_char),
+    done: bool,
+}
+
+impl PushFileCompletion {
+    fn succeed(mut self, hash_hex: String) {
+        self.done = true;
+        (self.on_success)(self.userdata as *mut c_void, c_string(hash_hex));
+    }
+
+    fn fail(mut self, code: IrohOperationErrorCode, message: impl Into<String>) {
+        self.done = true;
+        (self.on_failure)(self.userdata as *mut c_void, code, c_string(message.into()));
+    }
+}
+
+impl Drop for PushFileCompletion {
+    fn drop(&mut self) {
+        if !self.done {
+            self.done = true;
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                IrohOperationErrorCode::NodeShutDown,
                 c_string("node shut down".to_string()),
             );
         }

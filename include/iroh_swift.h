@@ -591,7 +591,7 @@ typedef struct IrohDocSubscribeCallback {
 } IrohDocSubscribeCallback;
 
 /**
- * Opaque cancellation token for a spawned operation (fetch).
+ * Opaque cancellation token for a spawned operation (fetch, file push).
  *
  * Create with `iroh_cancel_token_new`, pass to the operation, cancel with
  * `iroh_cancel_token_cancel` (any thread, any number of times), and free with
@@ -632,6 +632,26 @@ typedef struct IrohFetchCallback {
                        uint64_t size,
                        const char *error);
 } IrohFetchCallback;
+
+/**
+ * Callback for `iroh_push_file_to_node`.
+ *
+ * Exactly one of `on_success` / `on_failure` is called, once.
+ */
+typedef struct IrohPushFileCallback {
+    /**
+     * Opaque pointer passed back to Swift.
+     */
+    void *userdata;
+    /**
+     * Called with the blob hash as 64 lowercase hex (free with `iroh_string_free`).
+     */
+    void (*on_success)(void *userdata, const char *hash);
+    /**
+     * Called on failure. `error` must be freed with `iroh_string_free`.
+     */
+    void (*on_failure)(void *userdata, enum IrohOperationErrorCode code, const char *error);
+} IrohPushFileCallback;
 
 /**
  * Create a new Iroh node asynchronously.
@@ -1174,5 +1194,34 @@ void iroh_fetch_from_node(const struct IrohNodeHandle *handle,
                           uint64_t maxSize,
                           const struct IrohCancelToken *cancelToken,
                           struct IrohFetchCallback callback);
+
+/**
+ * Push the file at `file_path` to a remote node without loading it into memory.
+ *
+ * The file is streamed into the local store (copied, BLAKE3/bao-encoded), then
+ * pushed exactly like `iroh_push_to_node`. On success the callback receives the
+ * blob hash (64 lowercase hex). The blob stays in the local store, tagged, like
+ * the bytes pushed by `iroh_push_to_node`.
+ *
+ * Returns immediately; the work runs on the node's runtime. Cancel it with
+ * `iroh_cancel_token_cancel(cancel_token)`.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle that outlives the operation's callback
+ * - `remote_node_id_hex` and `file_path` must be valid null-terminated UTF-8 strings
+ * - `relay_url` is nullable; if non-null must be a valid null-terminated UTF-8 string
+ * - `direct_addrs` is nullable; if non-null must point to `direct_addrs_len`
+ *   valid null-terminated UTF-8 strings
+ * - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+ * - `callback` must have valid function pointers
+ */
+void iroh_push_file_to_node(const struct IrohNodeHandle *handle,
+                            const char *remoteNodeIdHex,
+                            const char *relayUrl,
+                            const char *const *directAddrs,
+                            uintptr_t directAddrsLen,
+                            const char *filePath,
+                            const struct IrohCancelToken *cancelToken,
+                            struct IrohPushFileCallback callback);
 
 #endif  /* IROH_SWIFT_H */

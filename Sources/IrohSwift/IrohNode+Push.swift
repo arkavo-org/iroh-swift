@@ -237,3 +237,98 @@ extension IrohNode {
         }
     }
 }
+
+extension IrohNode {
+    /// Push a file directly to a remote node without loading it into memory.
+    ///
+    /// The file is streamed into this node's blob store (copied, so the store
+    /// needs free space for it; the original file is not modified or kept open
+    /// afterwards), then pushed to the remote node exactly like
+    /// `pushToNode(nodeId:relayUrl:directAddrs:data:)`. Works on client-only
+    /// nodes (`servesBlobs: false`). Like the `Data` variant, the blob stays in
+    /// this node's store afterwards.
+    ///
+    /// Cancelling the calling task aborts the import or push and throws
+    /// `CancellationError`.
+    ///
+    /// - Parameters:
+    ///   - nodeId: The remote node ID as a hex string.
+    ///   - relayUrl: Optional relay URL to assist with connectivity.
+    ///   - directAddrs: Optional list of direct addresses for the remote node.
+    ///   - fileURL: File URL of the file to push.
+    /// - Returns: The blob hash (BLAKE3 of the file contents) as 64 lowercase hex characters.
+    /// - Throws: `IrohError.nodeClosed` if the node is or gets closed,
+    ///           `IrohError.pushFailed` if the import or push fails,
+    ///           `CancellationError` if the task was cancelled.
+    public func pushToNode(
+        nodeId: String,
+        relayUrl: String? = nil,
+        directAddrs: [String] = [],
+        fileURL: URL
+    ) async throws -> String {
+        try ensureNotClosed()
+        try Task.checkCancellation()
+        guard fileURL.isFileURL else {
+            throw IrohError.pushFailed("fileURL must be a file URL: \(fileURL)")
+        }
+
+        let token = CancelTokenBox()
+        let filePath = fileURL.standardizedFileURL.path
+        let handle = self.handle
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+                let userdata = Unmanaged.passRetained(
+                    ContinuationBox<String>(continuation)
+                ).toOpaque()
+
+                let callback = IrohPushFileCallback(
+                    userdata: userdata,
+                    on_success: { userdata, hashPtr in
+                        let box = Unmanaged<ContinuationBox<String>>
+                            .fromOpaque(userdata!)
+                            .takeRetainedValue()
+                        box.continuation.resume(returning: takeFFIString(hashPtr))
+                    },
+                    on_failure: { userdata, code, errorPtr in
+                        let box = Unmanaged<ContinuationBox<String>>
+                            .fromOpaque(userdata!)
+                            .takeRetainedValue()
+                        let message = takeFFIString(errorPtr)
+                        let error: Error
+                        switch code {
+                        case IrohOperationErrorCode_Cancelled:
+                            error = CancellationError()
+                        case IrohOperationErrorCode_NodeShutDown:
+                            error = IrohError.nodeClosed
+                        default:
+                            error = IrohError.pushFailed(message)
+                        }
+                        box.continuation.resume(throwing: error)
+                    }
+                )
+
+                nodeId.withCString { nodeIdPtr in
+                    filePath.withCString { filePtr in
+                        withOptionalCString(relayUrl) { relayPtr in
+                            withCStringArray(directAddrs) { addrs, count in
+                                iroh_push_file_to_node(
+                                    handle.pointer,
+                                    nodeIdPtr,
+                                    relayPtr,
+                                    addrs,
+                                    UInt(count),
+                                    filePtr,
+                                    token.pointer,
+                                    callback
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        } onCancel: {
+            token.cancel()
+        }
+    }
+}
