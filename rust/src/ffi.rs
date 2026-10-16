@@ -2288,3 +2288,80 @@ pub unsafe extern "C" fn iroh_blob_tag_delete(
         }
     }
 }
+
+// ============================================================================
+// Endpoint Identity
+// ============================================================================
+
+/// Get this node's endpoint id: the Ed25519 public key as 64 lowercase hex characters.
+///
+/// Same string as `IrohNodeInfo.node_id`. Returns null if `handle` is null.
+/// The caller must free the result with `iroh_string_free`.
+///
+/// # Safety
+/// - `handle` must be a valid node handle (or null)
+#[unsafe(no_mangle)]
+pub extern "C" fn iroh_node_endpoint_id(handle: *const IrohNodeHandle) -> *mut c_char {
+    if handle.is_null() {
+        return std::ptr::null_mut();
+    }
+    let node = unsafe { &*(handle as *const IrohNode) };
+    c_string(node.endpoint_id())
+}
+
+/// Sign `message` with this node's endpoint secret key (Ed25519).
+///
+/// Writes the 64-byte signature to `signature_out` and returns true. Returns
+/// false (writing nothing) if `handle` or `signature_out` is null. The
+/// signature verifies, including under `verify_strict`, against the public key
+/// returned by `iroh_node_endpoint_id`.
+///
+/// # Safety
+/// - `handle` must be a valid node handle (or null)
+/// - `message.data` must point to valid memory for `message.len` bytes (or be null with len 0)
+/// - `signature_out` must point to 64 writable bytes (or be null)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_node_sign(
+    handle: *const IrohNodeHandle,
+    message: IrohBytes,
+    signature_out: *mut u8,
+) -> bool {
+    if handle.is_null() || signature_out.is_null() {
+        return false;
+    }
+    let node = unsafe { &*(handle as *const IrohNode) };
+    let message = unsafe { borrowed_bytes(&message) };
+    let signature = node.sign(message);
+    unsafe { std::ptr::copy_nonoverlapping(signature.as_ptr(), signature_out, signature.len()) };
+    true
+}
+
+/// BLAKE3 hash of `bytes` as 64 lowercase hex characters.
+///
+/// The caller must free the result with `iroh_string_free`.
+///
+/// # Safety
+/// - `bytes.data` must point to valid memory for `bytes.len` bytes (or be null with len 0)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_blake3_hex(bytes: IrohBytes) -> *mut c_char {
+    let data = unsafe { borrowed_bytes(&bytes) };
+    c_string(crate::node::blake3_hex(data))
+}
+
+unsafe fn borrowed_bytes<'a>(bytes: &IrohBytes) -> &'a [u8] {
+    if bytes.data.is_null() || bytes.len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes.data, bytes.len) }
+    }
+}
+
+/// A C string for Swift to free with `iroh_string_free` (interior NULs are dropped).
+fn c_string(s: String) -> *mut c_char {
+    let s = if s.contains('\0') {
+        s.replace('\0', "")
+    } else {
+        s
+    };
+    CString::new(s).unwrap().into_raw()
+}

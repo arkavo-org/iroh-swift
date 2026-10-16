@@ -23,12 +23,16 @@ anyhow = "1"
 futures-lite = "2"
 hex = "0.4"
 rand = "0.10"
+# BLAKE3 for `iroh_blake3_hex` (same crate iroh-blobs hashes with).
+blake3 = "1.8"
 
 [build-dependencies]
 cbindgen = "0.28"
 
 [dev-dependencies]
 tempfile = "3"
+# Verify endpoint signatures the way the tdf-iroh-s3 server does (verify_strict).
+ed25519-dalek = "3"
 
 [profile.release]
 opt-level = "z"

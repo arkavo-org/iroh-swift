@@ -214,6 +214,23 @@ impl IrohNode {
         &self.endpoint
     }
 
+    /// This endpoint's id: the Ed25519 public key as 64 lowercase hex characters.
+    ///
+    /// Same string as [`NodeInfo::node_id`] and as `EndpointId`'s `Display`,
+    /// which is what a peer (e.g. tdf-iroh-s3) puts in a signed message.
+    pub fn endpoint_id(&self) -> String {
+        self.endpoint.id().to_string()
+    }
+
+    /// Sign `message` with this endpoint's Ed25519 secret key.
+    ///
+    /// Returns the 64-byte signature. It verifies (strictly) against the public
+    /// key in [`Self::endpoint_id`]. The key is generated when the node is
+    /// created and is not persisted, so it changes with every node.
+    pub fn sign(&self, message: &[u8]) -> [u8; 64] {
+        self.endpoint.secret_key().sign(message).to_bytes()
+    }
+
     /// Add bytes to the blob store and return a shareable ticket.
     ///
     /// The ticket can be used by other nodes to download the blob.
@@ -589,6 +606,11 @@ impl IrohNode {
     }
 }
 
+/// BLAKE3 hash of `data` as 64 lowercase hex characters.
+pub fn blake3_hex(data: &[u8]) -> String {
+    blake3::hash(data).to_hex().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,6 +633,85 @@ mod tests {
         }
 
         node.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_endpoint_id_is_lowercase_hex_and_matches_info() {
+        let dir = tempdir().unwrap();
+        let node = local_node(&dir, true);
+
+        let id = node.endpoint_id();
+        assert_eq!(id.len(), 64);
+        assert!(id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
+        assert_eq!(id, node.info().unwrap().node_id);
+        assert_eq!(id, hex::encode(node.endpoint().id().as_bytes()));
+
+        node.shutdown().unwrap();
+    }
+
+    /// The publish-session message tdf-iroh-s3 verifies with `verify_strict`.
+    #[test]
+    fn test_sign_verifies_strict_against_endpoint_id() {
+        let dir = tempdir().unwrap();
+        let node = local_node(&dir, false);
+
+        let endpoint_id = node.endpoint_id();
+        let message = format!(
+            "tdf-iroh-s3 publish-session v1\n{endpoint_id}\n{}\n{}",
+            blake3_hex(b"bearer-token"),
+            1_760_000_000
+        );
+        let signature = node.sign(message.as_bytes());
+
+        // Exactly what the server does: parse the id, verify (verify_strict inside).
+        let public: iroh::EndpointId = endpoint_id.parse().unwrap();
+        public
+            .verify(message.as_bytes(), &iroh::Signature::from_bytes(&signature))
+            .expect("iroh verify (verify_strict)");
+
+        // And with ed25519-dalek directly.
+        let key_bytes: [u8; 32] = hex::decode(&endpoint_id).unwrap().try_into().unwrap();
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).unwrap();
+        let dalek_sig = ed25519_dalek::Signature::from_bytes(&signature);
+        verifying_key
+            .verify_strict(message.as_bytes(), &dalek_sig)
+            .expect("ed25519-dalek verify_strict");
+
+        // A different message must not verify.
+        assert!(
+            verifying_key
+                .verify_strict(b"something else", &dalek_sig)
+                .is_err()
+        );
+
+        node.shutdown().unwrap();
+    }
+
+    /// Official BLAKE3 test vectors (BLAKE3-team/BLAKE3 test_vectors.json:
+    /// input is bytes `i % 251`), plus "abc"; all cross-checked with b3sum.
+    #[test]
+    fn test_blake3_hex_vectors() {
+        let pattern = |len: usize| (0..len).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+        assert_eq!(
+            blake3_hex(b""),
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        );
+        assert_eq!(
+            blake3_hex(&pattern(1)),
+            "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213"
+        );
+        assert_eq!(
+            blake3_hex(&pattern(1024)),
+            "42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af7"
+        );
+        assert_eq!(
+            blake3_hex(&pattern(1025)),
+            "d00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444"
+        );
+        assert_eq!(
+            blake3_hex(b"abc"),
+            "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+        );
     }
 
     #[test]

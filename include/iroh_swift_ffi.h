@@ -1002,4 +1002,42 @@ void iroh_blob_tag_delete(const struct IrohNodeHandle *handle,
                           const char *tagName,
                           struct IrohCloseCallback callback);
 
+/**
+ * Get this node's endpoint id: the Ed25519 public key as 64 lowercase hex characters.
+ *
+ * Same string as `IrohNodeInfo.node_id`. Returns null if `handle` is null.
+ * The caller must free the result with `iroh_string_free`.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle (or null)
+ */
+char *iroh_node_endpoint_id(const struct IrohNodeHandle *handle);
+
+/**
+ * Sign `message` with this node's endpoint secret key (Ed25519).
+ *
+ * Writes the 64-byte signature to `signature_out` and returns true. Returns
+ * false (writing nothing) if `handle` or `signature_out` is null. The
+ * signature verifies, including under `verify_strict`, against the public key
+ * returned by `iroh_node_endpoint_id`.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle (or null)
+ * - `message.data` must point to valid memory for `message.len` bytes (or be null with len 0)
+ * - `signature_out` must point to 64 writable bytes (or be null)
+ */
+bool iroh_node_sign(const struct IrohNodeHandle *handle,
+                    struct IrohBytes message,
+                    uint8_t *signatureOut);
+
+/**
+ * BLAKE3 hash of `bytes` as 64 lowercase hex characters.
+ *
+ * The caller must free the result with `iroh_string_free`.
+ *
+ * # Safety
+ * - `bytes.data` must point to valid memory for `bytes.len` bytes (or be null with len 0)
+ */
+char *iroh_blake3_hex(struct IrohBytes bytes);
+
 #endif  /* IROH_SWIFT_H */
