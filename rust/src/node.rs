@@ -3,7 +3,10 @@
 //! Provides a minimal interface for blob storage and retrieval,
 //! with optional Docs (syncing key-value documents) support.
 
-use crate::resolve::{HostResolver, HostResolverConfig, RemoteTarget};
+use crate::resolve::{
+    DEFAULT_DHT_BOOTSTRAP, DHT_BOOTSTRAP_RESOLVE_BOUND, HostResolver, HostResolverConfig,
+    RemoteTarget,
+};
 use anyhow::{Context, Result};
 use bao_tree::io::BaoContentItem;
 use futures_lite::StreamExt;
@@ -55,6 +58,10 @@ pub struct NodeInfo {
     pub is_connected: bool,
     /// Direct `ip:port` socket addresses this node is reachable on.
     pub direct_addrs: Vec<String>,
+    /// Whether the Mainline DHT address lookup is running. False when
+    /// `dht_lookup` was not requested, or was but no bootstrap node resolved
+    /// at creation (offline): recreate the node to get it.
+    pub dht_active: bool,
 }
 
 /// Minimal Iroh node for blob operations.
@@ -83,6 +90,9 @@ pub struct IrohNode {
     operations: CancellationToken,
     /// Resolves hostnames in direct addresses (DoH first, then the system resolver).
     host_resolver: HostResolver,
+    /// Whether the DHT address lookup is installed (`dht_lookup` asked for it
+    /// and at least one bootstrap node resolved).
+    dht_active: bool,
 }
 
 impl IrohNode {
@@ -145,134 +155,164 @@ impl IrohNode {
         if options.dht_publish && !serves_blobs {
             anyhow::bail!("dht_publish requires serves_blobs");
         }
-        // With DHT lookup on, unresolvable hostnames must not stop a dial by ID.
         let host_resolver = HostResolver::new(HostResolverConfig {
-            fall_through_to_lookup: options.dht_lookup,
+            fall_through_to_lookup: false,
             ..options.host_resolver.clone()
         });
 
         // Create dedicated runtime for this node
         let runtime = Runtime::new().context("Failed to create Tokio runtime")?;
 
-        let (endpoint, store, router, gossip, docs, event_handler) = runtime.block_on(async {
-            // Create or load the persistent store
-            let store = FsStore::load(&storage_path)
-                .await
-                .context("Failed to load blob store")?;
-
-            // Build endpoint with relay configuration
-            let mut builder = Endpoint::builder(presets::N0);
-            if !relay_enabled {
-                builder = builder.relay_mode(RelayMode::Disabled);
-            } else if let Some(url) = custom_relay_url {
-                // Parse and use custom relay
-                let relay_url: RelayUrl = url.parse().context("Invalid relay URL")?;
-                let relay_map = RelayMap::from(relay_url);
-                builder = builder.relay_mode(RelayMode::Custom(relay_map));
-            }
-            // else: n0 public relays are default when relay_enabled=true
-
-            if options.dht_lookup {
-                let mut lookup = DhtAddressLookup::builder();
-                if let Some(bootstrap) = &options.dht_bootstrap {
-                    let mut dht = n0_mainline::Dht::builder();
-                    dht.bootstrap(bootstrap);
-                    lookup = lookup.dht_builder(dht);
-                }
-                if options.dht_publish {
-                    if !relay_enabled {
-                        // Without a relay URL there is nothing to publish under
-                        // the default relay-only filter; the node is only
-                        // reachable on its direct addresses.
-                        lookup = lookup.addr_filter(AddrFilter::unfiltered());
-                    }
-                } else {
-                    lookup = lookup.no_publish();
-                }
-                builder = builder.address_lookup(lookup);
-            }
-
-            let endpoint = builder.bind().await.context("Failed to bind endpoint")?;
-
-            // Wait for relay connection if enabled (with timeout to avoid hanging in CI)
-            if relay_enabled {
-                let _ = tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await;
-            }
-
-            // Set up the blobs protocol handler, unless the node is client-only.
-            // Fetching (`store.remote()`, the downloader) and pushing only need the
-            // store and the endpoint, not the handler.
-            let (blobs, event_handler) = if serves_blobs {
-                // Gets are always served. Pushes write to this node's store, so they
-                // are refused (`Disabled`, the iroh-blobs default) unless the app
-                // opts in; `Notify` processes them without asking a handler.
-                let mask = EventMask {
-                    push: if accepts_pushes {
-                        RequestMode::Notify
-                    } else {
-                        RequestMode::Disabled
-                    },
-                    ..EventMask::DEFAULT
-                };
-                let (event_sender, mut event_rx) = EventSender::channel(64, mask);
-
-                // Nothing here needs an answer (no Intercept modes), but the provider
-                // awaits each send (push notifications, connection-closed events), so
-                // drain the channel to keep it from filling up.
-                let event_handler =
-                    tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
-
-                let blobs = BlobsProtocol::new(&store, Some(event_sender));
-                (Some(blobs), Some(event_handler))
-            } else {
-                (None, None)
-            };
-
-            // Conditionally set up Docs protocol
-            let (gossip, docs) = if docs_enabled {
-                // Create gossip protocol (synchronous - returns Gossip directly)
-                let gossip = Gossip::builder().spawn(endpoint.clone());
-
-                // Create docs path for persistent storage
-                let docs_path = storage_path.join("docs");
-
-                // Ensure docs directory exists
-                if !docs_path.exists() {
-                    std::fs::create_dir_all(&docs_path)
-                        .context("Failed to create docs directory")?;
-                }
-
-                // Create docs protocol using the builder pattern
-                let docs = Docs::persistent(docs_path)
-                    .spawn(endpoint.clone(), store.clone().into(), gossip.clone())
+        let (endpoint, store, router, gossip, docs, event_handler, dht_active) =
+            runtime.block_on(async {
+                // Create or load the persistent store
+                let store = FsStore::load(&storage_path)
                     .await
-                    .context("Failed to spawn docs protocol")?;
+                    .context("Failed to load blob store")?;
 
-                (Some(gossip), Some(docs))
-            } else {
-                (None, None)
-            };
+                // Build endpoint with relay configuration
+                let mut builder = Endpoint::builder(presets::N0);
+                if !relay_enabled {
+                    builder = builder.relay_mode(RelayMode::Disabled);
+                } else if let Some(url) = custom_relay_url {
+                    // Parse and use custom relay
+                    let relay_url: RelayUrl = url.parse().context("Invalid relay URL")?;
+                    let relay_map = RelayMap::from(relay_url);
+                    builder = builder.relay_mode(RelayMode::Custom(relay_map));
+                }
+                // else: n0 public relays are default when relay_enabled=true
 
-            // Build router with all protocols. A client-only node registers no
-            // blobs ALPN, so incoming blobs connections fail the TLS/ALPN handshake.
-            let mut router_builder = Router::builder(endpoint.clone());
+                // n0-mainline resolves its bootstrap hostnames with blocking DNS on the
+                // thread that builds the DHT, once, and drops failures silently. So
+                // resolve them here instead (bounded, DoH first, then the OS) and hand
+                // it IP addresses. If none resolve the DHT would stay empty for the
+                // node's whole life, so start without it (see `NodeInfo::dht_active`).
+                let mut dht_active = false;
+                if options.dht_lookup {
+                    let bootstrap = match &options.dht_bootstrap {
+                        Some(bootstrap) => bootstrap.clone(),
+                        None => {
+                            host_resolver
+                                .resolve_bootstrap(
+                                    &DEFAULT_DHT_BOOTSTRAP,
+                                    DHT_BOOTSTRAP_RESOLVE_BOUND,
+                                )
+                                .await
+                        }
+                    };
+                    if bootstrap.is_empty() {
+                        tracing::warn!(
+                            "no DHT bootstrap node resolved (offline?): starting without DHT \
+                         lookup; recreate the node once the network is up to get it"
+                        );
+                    } else {
+                        let mut dht = n0_mainline::Dht::builder();
+                        dht.bootstrap(&bootstrap);
+                        let mut lookup = DhtAddressLookup::builder().dht_builder(dht);
+                        if options.dht_publish {
+                            if !relay_enabled {
+                                // Without a relay URL there is nothing to publish under
+                                // the default relay-only filter; the node is only
+                                // reachable on its direct addresses.
+                                lookup = lookup.addr_filter(AddrFilter::unfiltered());
+                            }
+                        } else {
+                            lookup = lookup.no_publish();
+                        }
+                        builder = builder.address_lookup(lookup);
+                        dht_active = true;
+                    }
+                }
 
-            if let Some(blobs) = blobs {
-                router_builder = router_builder.accept(BLOBS_ALPN, blobs);
-            }
+                let endpoint = builder.bind().await.context("Failed to bind endpoint")?;
 
-            if let Some(ref g) = gossip {
-                router_builder = router_builder.accept(GOSSIP_ALPN, g.clone());
-            }
+                // Wait for relay connection if enabled (with timeout to avoid hanging in CI)
+                if relay_enabled {
+                    let _ = tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await;
+                }
 
-            if let Some(ref d) = docs {
-                router_builder = router_builder.accept(iroh_docs::ALPN, d.clone());
-            }
+                // Set up the blobs protocol handler, unless the node is client-only.
+                // Fetching (`store.remote()`, the downloader) and pushing only need the
+                // store and the endpoint, not the handler.
+                let (blobs, event_handler) = if serves_blobs {
+                    // Gets are always served. Pushes write to this node's store, so they
+                    // are refused (`Disabled`, the iroh-blobs default) unless the app
+                    // opts in; `Notify` processes them without asking a handler.
+                    let mask = EventMask {
+                        push: if accepts_pushes {
+                            RequestMode::Notify
+                        } else {
+                            RequestMode::Disabled
+                        },
+                        ..EventMask::DEFAULT
+                    };
+                    let (event_sender, mut event_rx) = EventSender::channel(64, mask);
 
-            let router = router_builder.spawn();
+                    // Nothing here needs an answer (no Intercept modes), but the provider
+                    // awaits each send (push notifications, connection-closed events), so
+                    // drain the channel to keep it from filling up.
+                    let event_handler =
+                        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
 
-            Ok::<_, anyhow::Error>((endpoint, store, router, gossip, docs, event_handler))
-        })?;
+                    let blobs = BlobsProtocol::new(&store, Some(event_sender));
+                    (Some(blobs), Some(event_handler))
+                } else {
+                    (None, None)
+                };
+
+                // Conditionally set up Docs protocol
+                let (gossip, docs) = if docs_enabled {
+                    // Create gossip protocol (synchronous - returns Gossip directly)
+                    let gossip = Gossip::builder().spawn(endpoint.clone());
+
+                    // Create docs path for persistent storage
+                    let docs_path = storage_path.join("docs");
+
+                    // Ensure docs directory exists
+                    if !docs_path.exists() {
+                        std::fs::create_dir_all(&docs_path)
+                            .context("Failed to create docs directory")?;
+                    }
+
+                    // Create docs protocol using the builder pattern
+                    let docs = Docs::persistent(docs_path)
+                        .spawn(endpoint.clone(), store.clone().into(), gossip.clone())
+                        .await
+                        .context("Failed to spawn docs protocol")?;
+
+                    (Some(gossip), Some(docs))
+                } else {
+                    (None, None)
+                };
+
+                // Build router with all protocols. A client-only node registers no
+                // blobs ALPN, so incoming blobs connections fail the TLS/ALPN handshake.
+                let mut router_builder = Router::builder(endpoint.clone());
+
+                if let Some(blobs) = blobs {
+                    router_builder = router_builder.accept(BLOBS_ALPN, blobs);
+                }
+
+                if let Some(ref g) = gossip {
+                    router_builder = router_builder.accept(GOSSIP_ALPN, g.clone());
+                }
+
+                if let Some(ref d) = docs {
+                    router_builder = router_builder.accept(iroh_docs::ALPN, d.clone());
+                }
+
+                let router = router_builder.spawn();
+
+                Ok::<_, anyhow::Error>((
+                    endpoint,
+                    store,
+                    router,
+                    gossip,
+                    docs,
+                    event_handler,
+                    dht_active,
+                ))
+            })?;
 
         Ok(Self {
             runtime,
@@ -283,7 +323,9 @@ impl IrohNode {
             docs,
             event_handler,
             operations: CancellationToken::new(),
-            host_resolver,
+            // With the DHT active, unresolvable hostnames must not stop a dial by ID.
+            host_resolver: host_resolver.with_fall_through_to_lookup(dht_active),
+            dht_active,
         })
     }
 
@@ -613,6 +655,7 @@ impl IrohNode {
                 relay_url,
                 is_connected,
                 direct_addrs,
+                dht_active: self.dht_active,
             })
         })
     }
@@ -637,6 +680,7 @@ impl IrohNode {
             event_handler,
             operations,
             host_resolver,
+            dht_active: _,
         } = self;
         drop(host_resolver);
 
@@ -711,6 +755,8 @@ pub enum OperationError {
     Cancelled,
     /// The node shut down while the operation was in flight.
     NodeShutDown,
+    /// The caller's time limit elapsed.
+    TimedOut,
     /// Anything else: bad arguments, connection, protocol, verification or I/O.
     Failed(anyhow::Error),
 }
@@ -730,6 +776,7 @@ impl std::fmt::Display for OperationError {
             }
             OperationError::Cancelled => write!(f, "operation cancelled"),
             OperationError::NodeShutDown => write!(f, "node shut down"),
+            OperationError::TimedOut => write!(f, "operation timed out"),
             OperationError::Failed(e) => write!(f, "{e:#}"),
         }
     }
@@ -1033,6 +1080,35 @@ pub async fn push_path(
         .with_context(|| format!("Failed to import {} into the store", path.display()))?;
     push_hash(endpoint, store, tag.hash, remote).await?;
     Ok(tag.hash)
+}
+
+/// Add `data` to the store and push it to a remote node, resolving the target's
+/// hostnames first (so a cancel during DNS also stops the push). `timeout_ms` of 0
+/// means no timeout; it covers DNS, import and transfer. Returns the blob hash.
+pub async fn push_bytes(
+    endpoint: &Endpoint,
+    store: &FsStore,
+    resolver: &HostResolver,
+    target: RemoteTarget,
+    data: &[u8],
+    timeout_ms: u64,
+) -> Result<Hash, OperationError> {
+    let work = async {
+        let remote = resolver.resolve_target(target).await?;
+        let tag = store
+            .add_slice(data)
+            .await
+            .context("Failed to add bytes to store")?;
+        push_hash(endpoint, store, tag.hash, remote).await?;
+        Ok::<_, OperationError>(tag.hash)
+    };
+    if timeout_ms == 0 {
+        work.await
+    } else {
+        tokio::time::timeout(Duration::from_millis(timeout_ms), work)
+            .await
+            .map_err(|_| OperationError::TimedOut)?
+    }
 }
 
 /// BLAKE3 hash of `data` as 64 lowercase hex characters.
@@ -1818,6 +1894,135 @@ mod tests {
         client.shutdown().unwrap();
         server.shutdown().unwrap();
         drop(testnet);
+    }
+
+    #[test]
+    fn test_dht_active_reports_whether_the_lookup_started() {
+        let dht_runtime = tokio::runtime::Runtime::new().unwrap();
+        let testnet = dht_runtime
+            .block_on(n0_mainline::Testnet::new(3))
+            .expect("local DHT testnet");
+
+        let dir = tempdir().unwrap();
+        let node = dht_node(&dir, &testnet.bootstrap, true, false);
+        assert!(node.info().unwrap().dht_active);
+        node.shutdown().unwrap();
+
+        // No bootstrap node resolved (what an offline start sees): the node
+        // starts without the DHT, does not hang, and says so.
+        let dir = tempdir().unwrap();
+        let start = std::time::Instant::now();
+        let node = dht_node(&dir, &[], true, false);
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(!node.info().unwrap().dht_active);
+        node.put(b"still works").unwrap();
+        node.shutdown().unwrap();
+
+        // Not requested: not active.
+        let dir = tempdir().unwrap();
+        let node = local_node(&dir, true);
+        assert!(!node.info().unwrap().dht_active);
+        node.shutdown().unwrap();
+        drop(testnet);
+    }
+
+    /// Default bootstrap hostnames are resolved by us, bounded, never by the
+    /// DHT crate's blocking DNS. With DoH dead and the OS resolver answering
+    /// nothing for them, creation still returns within the bound.
+    #[test]
+    fn test_default_bootstrap_resolution_is_bounded() {
+        use crate::resolve::HostResolverConfig;
+        let dir = tempdir().unwrap();
+        let start = std::time::Instant::now();
+        let node = IrohNode::new_with_options(
+            dir.path().to_path_buf(),
+            false,
+            None,
+            false,
+            false,
+            false,
+            NodeOptions {
+                dht_lookup: true,
+                host_resolver: HostResolverConfig {
+                    // Nothing to ask over DoH, and a tiny OS budget.
+                    doh_nameservers: Vec::new(),
+                    system_timeout: Duration::from_millis(1),
+                    ..HostResolverConfig::default()
+                },
+                ..NodeOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            start.elapsed() < crate::resolve::DHT_BOOTSTRAP_RESOLVE_BOUND + Duration::from_secs(4)
+        );
+        node.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_push_bytes_by_hostname_cancel_and_timeout() {
+        let (dir_a, dir_b) = (tempdir().unwrap(), tempdir().unwrap());
+        let server = push_receiver(&dir_a);
+        let client = node_with_dead_doh(&dir_b, false);
+        let target = |host: &str| {
+            RemoteTarget::parse(&server.endpoint_id(), None, &[host.to_string()]).unwrap()
+        };
+        let run =
+            |target: RemoteTarget, data: &[u8], timeout_ms: u64, token: &CancellationToken| {
+                let shutdown = client.shutdown_token();
+                client.runtime().block_on(run_cancellable(
+                    push_bytes(
+                        client.endpoint(),
+                        client.store(),
+                        client.host_resolver(),
+                        target,
+                        data,
+                        timeout_ms,
+                    ),
+                    token,
+                    &shutdown,
+                ))
+            };
+
+        // By hostname.
+        let data = test_bytes(5_000);
+        let by_host = format!("localhost:{}", server_port(&server));
+        let hash = run(target(&by_host), &data, 0, &CancellationToken::new()).unwrap();
+        assert_eq!(hash.to_hex().to_string(), blake3_hex(&data));
+        assert!(server.runtime().block_on(server.store().has(hash)).unwrap());
+
+        // Cancelled before it starts: nothing is imported or sent.
+        let other = b"cancelled before sending".to_vec();
+        let token = CancellationToken::new();
+        token.cancel();
+        let result = run(target(&by_host), &other, 0, &token);
+        assert!(
+            matches!(result, Err(OperationError::Cancelled)),
+            "{result:?}"
+        );
+        let other_hash = Hash::from_bytes(*blake3::hash(&other).as_bytes());
+        assert!(
+            !server
+                .runtime()
+                .block_on(server.store().has(other_hash))
+                .unwrap()
+        );
+        assert!(
+            !client
+                .runtime()
+                .block_on(client.store().has(other_hash))
+                .unwrap()
+        );
+
+        // A blackholed address (TEST-NET-1) runs into the time limit.
+        let result = run(target("192.0.2.1:9"), b"x", 400, &CancellationToken::new());
+        assert!(
+            matches!(result, Err(OperationError::TimedOut)),
+            "{result:?}"
+        );
+
+        client.shutdown().unwrap();
+        server.shutdown().unwrap();
     }
 
     /// DHT lookup on, and the only direct address is a hostname that does not

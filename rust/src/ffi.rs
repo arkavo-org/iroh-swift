@@ -289,6 +289,9 @@ pub struct IrohNodeInfo {
     /// Direct `ip:port` addresses, separated by `\n` (caller must free with
     /// `iroh_string_free`). Null if the node has no direct addresses.
     pub direct_addrs: *const c_char,
+    /// Whether the Mainline DHT address lookup is running (false if not
+    /// requested, or if no bootstrap node resolved at creation).
+    pub dht_active: bool,
 }
 
 /// Callback for node info retrieval.
@@ -771,6 +774,7 @@ pub extern "C" fn iroh_node_info(handle: *const IrohNodeHandle, callback: IrohNo
                 relay_url,
                 is_connected: info.is_connected,
                 direct_addrs,
+                dht_active: info.dht_active,
             };
             (callback.on_success)(callback.userdata, ffi_info);
         }
@@ -916,6 +920,9 @@ pub extern "C" fn iroh_put_with_options(
 
 /// Push bytes to a remote node identified by its node ID.
 ///
+/// Blocks the calling thread and cannot be cancelled (hostname resolution
+/// included); `iroh_push_bytes_to_node` is the cancellable form Swift uses.
+///
 /// Adds the data to the local store, connects to the remote node,
 /// and pushes the blob. Returns the blob hash as a hex string on success.
 ///
@@ -1023,7 +1030,8 @@ pub unsafe extern "C" fn iroh_push_to_node(
 
 /// Push bytes to a remote node with options (e.g., timeout).
 ///
-/// Same as `iroh_push_to_node` but with configurable operation options.
+/// Same as `iroh_push_to_node` but with configurable operation options. Also
+/// blocking and not cancellable; see `iroh_push_bytes_to_node`.
 ///
 /// # Safety
 /// - `handle` must be a valid node handle
@@ -2402,6 +2410,8 @@ pub enum IrohOperationErrorCode {
     Cancelled = 3,
     /// The node shut down while the operation was in flight.
     NodeShutDown = 4,
+    /// The operation's time limit (`timeout_ms`) elapsed.
+    TimedOut = 5,
 }
 
 /// Callback for `iroh_fetch_from_node`.
@@ -2666,6 +2676,92 @@ pub unsafe extern "C" fn iroh_push_file_to_node(
     });
 }
 
+/// Push `bytes` to a remote node: the cancellable form of `iroh_push_to_node` and
+/// `iroh_push_to_node_with_options`, which Swift uses.
+///
+/// Returns immediately; the work (hostname resolution, import into the store, the
+/// transfer) runs on the node's runtime. Cancel it with
+/// `iroh_cancel_token_cancel(cancel_token)`: a cancel during DNS resolution or
+/// the transfer stops it, and nothing is sent after a cancel. `timeout_ms` (0 = none)
+/// bounds the whole operation and fails with `TimedOut`. The bytes are copied
+/// before this returns. The callback is `IrohPushFileCallback`: on success the
+/// blob hash (64 lowercase hex).
+///
+/// # Safety
+/// - `handle` must be a valid node handle that outlives the operation's callback
+/// - `remote_node_id_hex` must be a valid null-terminated UTF-8 string
+/// - `relay_url` is nullable; if non-null must be a valid null-terminated UTF-8 string
+/// - `direct_addrs` is nullable; if non-null must point to `direct_addrs_len`
+///   valid null-terminated UTF-8 strings
+/// - `bytes.data` must point to `bytes.len` readable bytes (copied before return)
+/// - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_push_bytes_to_node(
+    handle: *const IrohNodeHandle,
+    remote_node_id_hex: *const c_char,
+    relay_url: *const c_char,
+    direct_addrs: *const *const c_char,
+    direct_addrs_len: usize,
+    bytes: IrohBytes,
+    timeout_ms: u64,
+    cancel_token: *const IrohCancelToken,
+    callback: IrohPushFileCallback,
+) {
+    let completion = PushFileCompletion {
+        userdata: callback.userdata as usize,
+        on_success: callback.on_success,
+        on_failure: callback.on_failure,
+        done: false,
+    };
+
+    let parsed = (|| {
+        if handle.is_null() {
+            return Err("handle cannot be null".to_string());
+        }
+        let node_id = unsafe { required_str(remote_node_id_hex, "remote_node_id_hex") }?;
+        let relay = unsafe { optional_str(relay_url, "relay_url") }?;
+        let addrs = unsafe { str_array(direct_addrs, direct_addrs_len) }?;
+        crate::resolve::RemoteTarget::parse(node_id, relay, &addrs).map_err(|e| format!("{:#}", e))
+    })();
+
+    let target = match parsed {
+        Ok(target) => target,
+        Err(message) => {
+            completion.fail(IrohOperationErrorCode::Failed, message);
+            return;
+        }
+    };
+
+    let node = unsafe { &*(handle as *const IrohNode) };
+    if node.is_shutting_down() {
+        completion.fail(IrohOperationErrorCode::NodeShutDown, "node shut down");
+        return;
+    }
+    // Swift's memory may not be stable after we return.
+    let data = unsafe { borrowed_bytes(&bytes) }.to_vec();
+    let token = operation_token(cancel_token);
+    let endpoint = node.endpoint().clone();
+    let store = node.store().clone();
+    let shutdown = node.shutdown_token();
+    let resolver = node.host_resolver().clone();
+    node.runtime().spawn(async move {
+        let result = crate::node::run_cancellable(
+            crate::node::push_bytes(&endpoint, &store, &resolver, target, &data, timeout_ms),
+            &token,
+            &shutdown,
+        )
+        .await;
+        match result {
+            Ok(hash) => completion.succeed(hash.to_hex().to_string()),
+            Err(e) => {
+                let (code, _) = operation_error_code(&e);
+                completion.fail(code, e.to_string());
+            }
+        }
+    });
+}
+
 /// Delivers the outcome of a fetch to its callback exactly once.
 ///
 /// If the task is dropped before completing (the runtime shut down), `Drop`
@@ -2763,6 +2859,7 @@ fn operation_error_code(e: &crate::node::OperationError) -> (IrohOperationErrorC
         }
         OperationError::Cancelled => (IrohOperationErrorCode::Cancelled, 0),
         OperationError::NodeShutDown => (IrohOperationErrorCode::NodeShutDown, 0),
+        OperationError::TimedOut => (IrohOperationErrorCode::TimedOut, 0),
         OperationError::Failed(_) => (IrohOperationErrorCode::Failed, 0),
     }
 }

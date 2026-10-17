@@ -64,22 +64,77 @@ impl Default for HostResolverConfig {
     }
 }
 
+/// The default Mainline DHT bootstrap nodes of n0-mainline 0.7 (its
+/// `DEFAULT_BOOTSTRAP_NODES`, which it does not export). n0-mainline resolves
+/// them with blocking `to_socket_addrs` on the thread that builds the DHT, once,
+/// so we resolve them ourselves (bounded, asynchronous) and hand it IP addresses.
+pub(crate) const DEFAULT_DHT_BOOTSTRAP: [&str; 4] = [
+    "router.bittorrent.com:6881",
+    "dht.transmissionbt.com:6881",
+    "dht.libtorrent.org:25401",
+    "relay.pkarr.org:6881",
+];
+
+/// Total time [`HostResolver::resolve_bootstrap`] gets for all names together.
+pub(crate) const DHT_BOOTSTRAP_RESOLVE_BOUND: Duration = Duration::from_secs(8);
+
+/// The second resolution stage.
+#[derive(Debug, Clone)]
+enum SystemStage {
+    /// The OS resolver (`getaddrinfo` through `tokio::net::lookup_host`): always
+    /// the current configuration (network changes, VPN), scoped per-domain
+    /// resolvers, the hosts file and mDNS.
+    Os,
+    /// A stand-in resolver (tests).
+    #[cfg(test)]
+    Custom(Arc<DnsResolver>),
+}
+
+impl SystemStage {
+    async fn lookup(&self, host: &str, timeout: Duration) -> Vec<IpAddr> {
+        match self {
+            SystemStage::Os => {
+                // getaddrinfo cannot be interrupted: on timeout the blocking
+                // thread is abandoned and finishes on its own.
+                let lookup = tokio::net::lookup_host((host.to_string(), 0));
+                match tokio::time::timeout(timeout, lookup).await {
+                    Ok(Ok(addrs)) => dedup(addrs.map(|a| a.ip()).collect()),
+                    _ => Vec::new(),
+                }
+            }
+            #[cfg(test)]
+            SystemStage::Custom(resolver) => lookup(resolver, host, timeout).await,
+        }
+    }
+}
+
+fn dedup(ips: Vec<IpAddr>) -> Vec<IpAddr> {
+    let mut seen = Vec::with_capacity(ips.len());
+    for ip in ips {
+        if !seen.contains(&ip) {
+            seen.push(ip);
+        }
+    }
+    seen
+}
+
 /// Resolves hostnames: public DNS-over-HTTPS resolvers first, then, only if
-/// none of them gives an answer, the system resolver (which also reads the
-/// hosts file, so `localhost` and VPN/enterprise names work).
+/// none of them gives an answer, the operating system's resolver (which also
+/// reads the hosts file, so `localhost` and VPN/enterprise names work).
 ///
-/// Cheap to clone; clones share the resolvers and their caches.
+/// Cheap to clone; clones share the DoH resolver and its cache. The OS stage
+/// has no cache of its own, so it always sees the current network configuration.
 #[derive(Debug, Clone)]
 pub struct HostResolver {
     doh: Option<Arc<DnsResolver>>,
-    system: Arc<DnsResolver>,
+    system: SystemStage,
     doh_timeout: Duration,
     system_timeout: Duration,
     fall_through_to_lookup: bool,
 }
 
 impl HostResolver {
-    /// Build both resolvers (no network traffic until the first lookup).
+    /// Build the resolvers (no network traffic until the first lookup).
     pub fn new(config: HostResolverConfig) -> Self {
         let doh = if config.doh_nameservers.is_empty() {
             None
@@ -93,17 +148,19 @@ impl HostResolver {
                     .build(),
             ))
         };
-        let system = DnsResolver::builder()
-            .with_system_defaults()
-            .with_fallback_mode(FallbackMode::Never)
-            .build();
         Self {
             doh,
-            system: Arc::new(system),
+            system: SystemStage::Os,
             doh_timeout: config.doh_timeout,
             system_timeout: config.system_timeout,
             fall_through_to_lookup: config.fall_through_to_lookup,
         }
+    }
+
+    /// The same resolver with `fall_through_to_lookup` set.
+    pub(crate) fn with_fall_through_to_lookup(mut self, on: bool) -> Self {
+        self.fall_through_to_lookup = on;
+        self
     }
 
     /// Use these resolvers instead of the built ones (tests).
@@ -121,7 +178,7 @@ impl HostResolver {
         Self {
             fall_through_to_lookup,
             doh: doh.map(Arc::new),
-            system: Arc::new(system),
+            system: SystemStage::Custom(Arc::new(system)),
             doh_timeout: Duration::from_secs(2),
             system_timeout: Duration::from_secs(2),
         }
@@ -136,7 +193,36 @@ impl HostResolver {
                 return ips;
             }
         }
-        lookup(&self.system, host, self.system_timeout).await
+        self.system.lookup(host, self.system_timeout).await
+    }
+
+    /// Resolve `host:port` bootstrap names to IPv4 `ip:port` strings (the only
+    /// family the Mainline DHT uses), all names concurrently, within `bound`
+    /// in total. Names that did not answer in time are left out.
+    pub(crate) async fn resolve_bootstrap(&self, names: &[&str], bound: Duration) -> Vec<String> {
+        let mut tasks = tokio::task::JoinSet::new();
+        for name in names {
+            let Ok(DirectAddr::Host(host, port)) = parse_direct_addr(name) else {
+                continue;
+            };
+            let resolver = self.clone();
+            tasks.spawn(async move {
+                let ips = resolver.resolve_host(&host).await;
+                (port, ips)
+            });
+        }
+        let deadline = tokio::time::Instant::now() + bound;
+        let mut out = Vec::new();
+        while let Ok(Some(Ok((port, ips)))) =
+            tokio::time::timeout_at(deadline, tasks.join_next()).await
+        {
+            for ip in ips {
+                if let IpAddr::V4(ip) = ip {
+                    out.push(format!("{ip}:{port}"));
+                }
+            }
+        }
+        out
     }
 
     /// Turn a parsed target into an [`EndpointAddr`], resolving its hostnames.
@@ -202,11 +288,7 @@ impl HostResolver {
 /// Both address families of `host`, never failing: an error counts as no answer.
 async fn lookup(resolver: &DnsResolver, host: &str, timeout: Duration) -> Vec<IpAddr> {
     match resolver.lookup_ipv4_ipv6(host, timeout).await {
-        Ok(ips) => {
-            let mut ips: Vec<IpAddr> = ips.collect();
-            ips.dedup();
-            ips
-        }
+        Ok(ips) => dedup(ips.collect()),
         Err(_) => Vec::new(),
     }
 }
@@ -498,6 +580,45 @@ mod tests {
         );
         assert_eq!(doh_queries.load(Ordering::SeqCst), 1);
         assert_eq!(system_queries.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn os_resolver_fallback_resolves_localhost() {
+        let resolver = HostResolver::new(HostResolverConfig {
+            // No DoH: straight to the OS resolver, no network needed.
+            doh_nameservers: Vec::new(),
+            ..HostResolverConfig::default()
+        });
+        let ips = block_on(resolver.resolve_host("localhost"));
+        assert!(!ips.is_empty());
+        assert!(ips.iter().all(|ip| ip.is_loopback()), "{ips:?}");
+        // And a name that does not exist gives nothing, not an error.
+        assert!(block_on(resolver.resolve_host("no-such-host.invalid")).is_empty());
+    }
+
+    #[test]
+    fn bootstrap_names_resolve_to_ipv4_and_respect_the_bound() {
+        let (doh, _) = fixed(&["192.0.2.1", "2001:db8::1"]);
+        let (system, _) = fixed(&[]);
+        let resolver = HostResolver::from_resolvers(Some(doh), system);
+        let got = block_on(resolver.resolve_bootstrap(
+            &["a.example:6881", "b.example:25401"],
+            Duration::from_secs(2),
+        ));
+        assert_eq!(got, vec!["192.0.2.1:6881", "192.0.2.1:25401"]);
+
+        // Nothing resolves: empty, and well within the bound.
+        let resolver = HostResolver::new(HostResolverConfig {
+            doh_nameservers: Vec::new(),
+            system_timeout: Duration::from_secs(5),
+            ..HostResolverConfig::default()
+        });
+        let start = std::time::Instant::now();
+        let got = block_on(
+            resolver.resolve_bootstrap(&["no-such-host.invalid:6881"], Duration::from_secs(3)),
+        );
+        assert!(got.is_empty());
+        assert!(start.elapsed() < Duration::from_secs(4));
     }
 
     #[test]
