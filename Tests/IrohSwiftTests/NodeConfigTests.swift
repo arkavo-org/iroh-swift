@@ -78,6 +78,19 @@ struct NodeConfigTests {
         )
         let data = Data("kept locally".utf8)
         #expect(try await node.get(ticket: try await node.put(data)) == data)
+        // Online the DHT starts; offline the bootstrap names do not resolve and
+        // the node starts without it (never stalling beyond the resolution bound).
+        _ = try await node.info().dhtActive
+        try await node.close()
+    }
+
+    @Test("dhtActive is false unless dhtLookup is requested")
+    func dhtInactiveByDefault() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let node = try await IrohNode(config: IrohConfig(storagePath: dir, relayEnabled: false))
+        #expect(try await node.info().dhtActive == false)
         try await node.close()
     }
 

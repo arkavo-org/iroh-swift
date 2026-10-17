@@ -27,6 +27,11 @@ public struct NodeInfo: Sendable {
     /// network). Pass them as `directAddrs` to `fetch(hash:fromNode:...)` or
     /// `pushToNode(...)` on another node when relays are disabled.
     public let directAddrs: [String]
+    /// Whether the Mainline DHT address lookup is running. `false` unless
+    /// `IrohConfig.dhtLookup` is set, and also `false` if it is but none of the
+    /// DHT bootstrap nodes could be resolved when the node was created (for
+    /// example, started offline): recreate the node once the network is up.
+    public let dhtActive: Bool
 }
 
 /// Parsed ticket information.

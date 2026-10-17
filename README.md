@@ -121,9 +121,10 @@ resolved to all its A and AAAA records and every `IP:port` is dialled; literal
 
 Resolution order, per host: the public DNS-over-HTTPS resolvers first
 (Cloudflare 1.1.1.1 / 1.0.0.1 and Quad9 9.9.9.9, up to 5 s), and only if none of
-them returns an address, the device's system resolver (up to 5 s; it also honours
-the hosts file, so `localhost` and VPN/enterprise names work). Each node builds
-the resolvers once and reuses them. Hostnames must be ASCII (use punycode for
+them returns an address, the operating system's resolver (`getaddrinfo`, up to 5 s;
+it always uses the current network configuration, scoped VPN / split-DNS resolvers
+and the hosts file, so `localhost` and enterprise names work). Each node builds
+the DoH resolver once and reuses it; the OS stage is not cached by us. Hostnames must be ASCII (use punycode for
 internationalized names).
 
 A hostname cannot impersonate a node: you pin the endpoint ID and the QUIC
@@ -166,6 +167,16 @@ lookup. The DHT client opens its own UDP socket and contacts public bootstrap
 nodes, which is why both flags default to `false`. Note that the endpoint key is
 random per node instance (not persisted), so a publishing node's ID changes
 whenever it is recreated.
+
+At creation the node resolves the DHT bootstrap hostnames itself (DoH first, then
+the OS, all names in parallel, at most about 8 seconds in total), so node creation
+never blocks on unbounded DNS. If none resolves (started offline), the node starts
+*without* DHT lookup, logs a warning, and reports `info().dhtActive == false`; it
+does not retry, so recreate the node once the network is up. Two library caveats:
+`n0-mainline` 0.7.1's `get_mutable_most_recent` keeps the first record any replica
+answers with (a later, higher-`seq` record is ignored), so right after a node's
+address changes a stale replica can win; and cancelling a fetch does not stop an
+in-flight DHT traversal, which runs to its own bound (harmless, but not free).
 
 ### Receive Pushes
 

@@ -46,7 +46,8 @@ extension IrohNode {
                         nodeId: nodeId,
                         relayUrl: relayUrl,
                         isConnected: info.is_connected,
-                        directAddrs: directAddrs
+                        directAddrs: directAddrs,
+                        dhtActive: info.dht_active
                     )
                     box.continuation.resume(returning: nodeInfo)
                 },

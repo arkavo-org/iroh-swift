@@ -560,6 +560,40 @@ struct FetchFromNodeTests {
         await server.close()
     }
 
+    @Test("a Data push to an unreachable address hits its time limit, and can be cancelled")
+    func dataPushTimeoutAndCancel() async throws {
+        let server = try await makeNode(servesBlobs: true, acceptsPushes: true)
+        let client = try await makeNode(servesBlobs: false)
+        let serverID = try await server.node.endpointID()
+        let blackhole = ["192.0.2.1:9"]  // TEST-NET-1: nothing answers
+
+        let timeoutError = await #expect(throws: IrohError.self) {
+            try await client.node.pushToNode(
+                nodeId: serverID,
+                directAddrs: blackhole,
+                data: Data("x".utf8),
+                options: OperationOptions(timeout: .milliseconds(500))
+            )
+        }
+        if case .timeout? = timeoutError {} else {
+            Issue.record("expected .timeout, got \(String(describing: timeoutError))")
+        }
+
+        let node = client.node
+        let task = Task {
+            try await node.pushToNode(nodeId: serverID, directAddrs: blackhole, data: Data("x".utf8))
+        }
+        try await Task.sleep(for: .milliseconds(300))
+        task.cancel()
+        let result = await task.result
+        if case .failure(let error) = result, error is CancellationError {} else {
+            Issue.record("expected CancellationError, got \(result)")
+        }
+
+        await client.close()
+        await server.close()
+    }
+
     @Test("pushToNode(fileURL:) with a missing file throws pushFailed")
     func pushMissingFile() async throws {
         let server = try await makeNode(servesBlobs: true)

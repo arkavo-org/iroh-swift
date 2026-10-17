@@ -28,104 +28,17 @@ extension IrohNode {
     ///           direct address or hostnames that resolve to nothing with no relay
     ///           URL or other address to fall back on (unless `IrohConfig.dhtLookup`
     ///           is on: then the push dials by `nodeId` alone),
-    ///           `CancellationError` if the task was cancelled.
+    ///           `CancellationError` if the task was cancelled (also during hostname
+    ///           resolution; nothing is sent after a cancel).
     public func pushToNode(
         nodeId: String,
         relayUrl: String? = nil,
         directAddrs: [String] = [],
         data: Data
     ) async throws -> String {
-        try ensureNotClosed()
-        try Task.checkCancellation()
-        return try await withCheckedThrowingContinuation { continuation in
-            nodeId.withCString { nodeIdPtr in
-                data.withUnsafeBytes { buffer in
-                    let bytes = IrohBytes(
-                        data: buffer.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                        len: UInt(buffer.count)
-                    )
-
-                    let box = Unmanaged.passRetained(
-                        ContinuationBox<String>(continuation)
-                    ).toOpaque()
-
-                    let callback = IrohCallback(
-                        userdata: box,
-                        on_success: { userdata, hashPtr in
-                            let box = Unmanaged<ContinuationBox<String>>
-                                .fromOpaque(userdata!)
-                                .takeRetainedValue()
-                            let hash = String(cString: hashPtr!)
-                            iroh_string_free(UnsafeMutablePointer(mutating: hashPtr))
-                            box.continuation.resume(returning: hash)
-                        },
-                        on_failure: { userdata, errorPtr in
-                            let box = Unmanaged<ContinuationBox<String>>
-                                .fromOpaque(userdata!)
-                                .takeRetainedValue()
-                            let message = String(cString: errorPtr!)
-                            iroh_string_free(UnsafeMutablePointer(mutating: errorPtr))
-                            box.continuation.resume(throwing: IrohError.pushFailed(message))
-                        }
-                    )
-
-                    if directAddrs.isEmpty {
-                        if let relayUrl = relayUrl {
-                            relayUrl.withCString { relayUrlPtr in
-                                iroh_push_to_node(
-                                    handle.pointer,
-                                    nodeIdPtr,
-                                    relayUrlPtr,
-                                    nil,
-                                    0,
-                                    bytes,
-                                    callback
-                                )
-                            }
-                        } else {
-                            iroh_push_to_node(
-                                handle.pointer,
-                                nodeIdPtr,
-                                nil,
-                                nil,
-                                0,
-                                bytes,
-                                callback
-                            )
-                        }
-                    } else {
-                        let cAddrs = directAddrs.map { strdup($0) }
-                        defer { cAddrs.forEach { free($0) } }
-                        let constAddrs = cAddrs.map { UnsafePointer($0) }
-                        constAddrs.withUnsafeBufferPointer { addrBuffer in
-                            if let relayUrl = relayUrl {
-                                relayUrl.withCString { relayUrlPtr in
-                                    iroh_push_to_node(
-                                        handle.pointer,
-                                        nodeIdPtr,
-                                        relayUrlPtr,
-                                        addrBuffer.baseAddress,
-                                        UInt(directAddrs.count),
-                                        bytes,
-                                        callback
-                                    )
-                                }
-                            } else {
-                                iroh_push_to_node(
-                                    handle.pointer,
-                                    nodeIdPtr,
-                                    nil,
-                                    addrBuffer.baseAddress,
-                                    UInt(directAddrs.count),
-                                    bytes,
-                                    callback
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        try await pushBytes(
+            nodeId: nodeId, relayUrl: relayUrl, directAddrs: directAddrs, data: data, timeoutMs: 0
+        )
     }
 
     /// Push bytes directly to a remote node with options (e.g., timeout).
@@ -146,8 +59,10 @@ extension IrohNode {
     ///   - options: Operation options including timeout.
     /// - Returns: The blob hash as a hex string.
     /// - Throws: `IrohError.nodeClosed` if the node is closed,
-    ///           `IrohError.timeout` if the operation times out,
-    ///           `IrohError.pushFailed` if the push fails.
+    ///           `IrohError.timeout` if the operation times out (the limit covers
+    ///           hostname resolution, import and transfer),
+    ///           `IrohError.pushFailed` if the push fails,
+    ///           `CancellationError` if the task was cancelled.
     public func pushToNode(
         nodeId: String,
         relayUrl: String? = nil,
@@ -155,99 +70,83 @@ extension IrohNode {
         data: Data,
         options: OperationOptions
     ) async throws -> String {
+        try await pushBytes(
+            nodeId: nodeId,
+            relayUrl: relayUrl,
+            directAddrs: directAddrs,
+            data: data,
+            timeoutMs: options.timeoutMs
+        )
+    }
+
+    /// Shared implementation of the `Data` pushes: cancellable like the file push,
+    /// so cancelling the task also stops hostname resolution and nothing is sent
+    /// after a cancel. `timeoutMs` of 0 means no timeout.
+    private func pushBytes(
+        nodeId: String,
+        relayUrl: String?,
+        directAddrs: [String],
+        data: Data,
+        timeoutMs: UInt64
+    ) async throws -> String {
         try ensureNotClosed()
         try Task.checkCancellation()
-        return try await withCheckedThrowingContinuation { continuation in
-            nodeId.withCString { nodeIdPtr in
-                data.withUnsafeBytes { buffer in
-                    let bytes = IrohBytes(
-                        data: buffer.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                        len: UInt(buffer.count)
-                    )
 
-                    let ffiOptions = IrohOperationOptions(timeout_ms: options.timeoutMs)
+        let token = CancelTokenBox()
+        let handle = self.handle
 
-                    let box = Unmanaged.passRetained(
-                        ContinuationBox<String>(continuation)
-                    ).toOpaque()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+                let userdata = Unmanaged.passRetained(
+                    ContinuationBox<String>(continuation)
+                ).toOpaque()
 
-                    let callback = IrohCallback(
-                        userdata: box,
-                        on_success: { userdata, hashPtr in
-                            let box = Unmanaged<ContinuationBox<String>>
-                                .fromOpaque(userdata!)
-                                .takeRetainedValue()
-                            let hash = String(cString: hashPtr!)
-                            iroh_string_free(UnsafeMutablePointer(mutating: hashPtr))
-                            box.continuation.resume(returning: hash)
-                        },
-                        on_failure: { userdata, errorPtr in
-                            let box = Unmanaged<ContinuationBox<String>>
-                                .fromOpaque(userdata!)
-                                .takeRetainedValue()
-                            let message = String(cString: errorPtr!)
-                            iroh_string_free(UnsafeMutablePointer(mutating: errorPtr))
-                            if message.contains("timed out") {
-                                box.continuation.resume(throwing: IrohError.timeout)
-                            } else {
-                                box.continuation.resume(throwing: IrohError.pushFailed(message))
-                            }
+                let callback = IrohPushFileCallback(
+                    userdata: userdata,
+                    on_success: { userdata, hashPtr in
+                        let box = Unmanaged<ContinuationBox<String>>
+                            .fromOpaque(userdata!)
+                            .takeRetainedValue()
+                        box.continuation.resume(returning: takeFFIString(hashPtr))
+                    },
+                    on_failure: { userdata, code, errorPtr in
+                        let box = Unmanaged<ContinuationBox<String>>
+                            .fromOpaque(userdata!)
+                            .takeRetainedValue()
+                        let message = takeFFIString(errorPtr)
+                        let error: Error
+                        switch code {
+                        case IrohOperationErrorCode_Cancelled:
+                            error = CancellationError()
+                        case IrohOperationErrorCode_NodeShutDown:
+                            error = IrohError.nodeClosed
+                        case IrohOperationErrorCode_TimedOut:
+                            error = IrohError.timeout
+                        default:
+                            error = IrohError.pushFailed(message)
                         }
-                    )
+                        box.continuation.resume(throwing: error)
+                    }
+                )
 
-                    if directAddrs.isEmpty {
-                        if let relayUrl = relayUrl {
-                            relayUrl.withCString { relayUrlPtr in
-                                iroh_push_to_node_with_options(
-                                    handle.pointer,
-                                    nodeIdPtr,
-                                    relayUrlPtr,
-                                    nil,
-                                    0,
-                                    bytes,
-                                    ffiOptions,
-                                    callback
+                nodeId.withCString { nodeIdPtr in
+                    withOptionalCString(relayUrl) { relayPtr in
+                        withCStringArray(directAddrs) { addrs, count in
+                            data.withUnsafeBytes { buffer in
+                                let bytes = IrohBytes(
+                                    data: buffer.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                    len: UInt(buffer.count)
                                 )
-                            }
-                        } else {
-                            iroh_push_to_node_with_options(
-                                handle.pointer,
-                                nodeIdPtr,
-                                nil,
-                                nil,
-                                0,
-                                bytes,
-                                ffiOptions,
-                                callback
-                            )
-                        }
-                    } else {
-                        let cAddrs = directAddrs.map { strdup($0) }
-                        defer { cAddrs.forEach { free($0) } }
-                        let constAddrs = cAddrs.map { UnsafePointer($0) }
-                        constAddrs.withUnsafeBufferPointer { addrBuffer in
-                            if let relayUrl = relayUrl {
-                                relayUrl.withCString { relayUrlPtr in
-                                    iroh_push_to_node_with_options(
-                                        handle.pointer,
-                                        nodeIdPtr,
-                                        relayUrlPtr,
-                                        addrBuffer.baseAddress,
-                                        UInt(directAddrs.count),
-                                        bytes,
-                                        ffiOptions,
-                                        callback
-                                    )
-                                }
-                            } else {
-                                iroh_push_to_node_with_options(
+                                // The bytes are copied before this returns.
+                                iroh_push_bytes_to_node(
                                     handle.pointer,
                                     nodeIdPtr,
-                                    nil,
-                                    addrBuffer.baseAddress,
-                                    UInt(directAddrs.count),
+                                    relayPtr,
+                                    addrs,
+                                    UInt(count),
                                     bytes,
-                                    ffiOptions,
+                                    timeoutMs,
+                                    token.pointer,
                                     callback
                                 )
                             }
@@ -255,11 +154,11 @@ extension IrohNode {
                     }
                 }
             }
+        } onCancel: {
+            token.cancel()
         }
     }
-}
 
-extension IrohNode {
     /// Push a file directly to a remote node without loading it into memory.
     ///
     /// The file is streamed into this node's blob store (copied, so the store

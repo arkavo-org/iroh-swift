@@ -49,6 +49,12 @@ public struct IrohConfig: Sendable {
     /// alongside. This node only reads from the DHT; it publishes nothing
     /// unless `dhtPublish` is also set. The DHT client opens its own UDP socket
     /// and contacts public bootstrap nodes, so it is off by default.
+    ///
+    /// Creating the node resolves the bootstrap hostnames first (up to about 8
+    /// seconds in total, never blocking DNS inside the DHT library). If none
+    /// resolves, for example when started offline, the node starts without the
+    /// DHT and `info().dhtActive` is `false`; it is not retried, so recreate the
+    /// node to get DHT lookup.
     /// Default: false
     public var dhtLookup: Bool
 
