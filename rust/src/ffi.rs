@@ -46,6 +46,21 @@ pub struct IrohNodeConfig {
     /// Whether to enable the Docs engine (default: false).
     /// When enabled, the node can create, join, and sync documents.
     pub docs_enabled: bool,
+    /// Whether to accept the iroh-blobs protocol (default: true).
+    /// When false the node is client-only: it can fetch and push blobs, but
+    /// peers cannot download blobs from it or push blobs to it.
+    pub serves_blobs: bool,
+    /// Whether peers may push blobs into this node's store (default: false).
+    /// Only meaningful with `serves_blobs`; setting it without `serves_blobs`
+    /// fails node creation. When false, a serving node refuses push requests
+    /// and writes nothing; peers can still download blobs from it.
+    pub accepts_pushes: bool,
+    /// Whether to resolve endpoint IDs on the BitTorrent Mainline DHT, so a
+    /// node can be fetched from or pushed to by ID alone (default: false).
+    pub dht_lookup: bool,
+    /// Whether to also publish this node's address to the DHT (default: false).
+    /// Requires `dht_lookup` and `serves_blobs`; otherwise node creation fails.
+    pub dht_publish: bool,
 }
 
 /// Options for put/get operations.
@@ -271,6 +286,12 @@ pub struct IrohNodeInfo {
     pub relay_url: *const c_char,
     /// Whether the node is connected to the network.
     pub is_connected: bool,
+    /// Direct `ip:port` addresses, separated by `\n` (caller must free with
+    /// `iroh_string_free`). Null if the node has no direct addresses.
+    pub direct_addrs: *const c_char,
+    /// Whether the Mainline DHT address lookup is running (false if not
+    /// requested, or if no bootstrap node resolved at creation).
+    pub dht_active: bool,
 }
 
 /// Callback for node info retrieval.
@@ -459,10 +480,25 @@ pub extern "C" fn iroh_node_create(config: IrohNodeConfig, callback: IrohNodeCre
 
     let relay_enabled = config.relay_enabled;
     let docs_enabled = config.docs_enabled;
+    let serves_blobs = config.serves_blobs;
+    let accepts_pushes = config.accepts_pushes;
+    let options = crate::node::NodeOptions {
+        dht_lookup: config.dht_lookup,
+        dht_publish: config.dht_publish,
+        ..Default::default()
+    };
 
     // Create the node synchronously
     // Note: Swift should call this from a background thread/task
-    match IrohNode::new(storage_path, relay_enabled, custom_relay_url, docs_enabled) {
+    match IrohNode::new_with_options(
+        storage_path,
+        relay_enabled,
+        custom_relay_url,
+        docs_enabled,
+        serves_blobs,
+        accepts_pushes,
+        options,
+    ) {
         Ok(node) => {
             // Box the node and convert to raw pointer
             let boxed = Box::new(node);
@@ -725,10 +761,20 @@ pub extern "C" fn iroh_node_info(handle: *const IrohNodeHandle, callback: IrohNo
                 .map(|url| CString::new(url).unwrap().into_raw())
                 .unwrap_or(std::ptr::null_mut());
 
+            let direct_addrs = if info.direct_addrs.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                CString::new(info.direct_addrs.join("\n"))
+                    .unwrap()
+                    .into_raw()
+            };
+
             let ffi_info = IrohNodeInfo {
                 node_id,
                 relay_url,
                 is_connected: info.is_connected,
+                direct_addrs,
+                dht_active: info.dht_active,
             };
             (callback.on_success)(callback.userdata, ffi_info);
         }
@@ -874,8 +920,15 @@ pub extern "C" fn iroh_put_with_options(
 
 /// Push bytes to a remote node identified by its node ID.
 ///
+/// Blocks the calling thread and cannot be cancelled (hostname resolution
+/// included); `iroh_push_bytes_to_node` is the cancellable form Swift uses.
+///
 /// Adds the data to the local store, connects to the remote node,
 /// and pushes the blob. Returns the blob hash as a hex string on success.
+///
+/// The remote must accept pushes (`accepts_pushes` on an iroh-swift node). A
+/// node that refuses them stores nothing; the pusher is not reliably told (a
+/// small blob can still report success, a larger one fails).
 ///
 /// # Safety
 /// - `handle` must be a valid node handle
@@ -977,7 +1030,8 @@ pub unsafe extern "C" fn iroh_push_to_node(
 
 /// Push bytes to a remote node with options (e.g., timeout).
 ///
-/// Same as `iroh_push_to_node` but with configurable operation options.
+/// Same as `iroh_push_to_node` but with configurable operation options. Also
+/// blocking and not cancellable; see `iroh_push_bytes_to_node`.
 ///
 /// # Safety
 /// - `handle` must be a valid node handle
@@ -2263,5 +2317,668 @@ pub unsafe extern "C" fn iroh_blob_tag_delete(
             let error = CString::new(format!("{:#}", e)).unwrap();
             (callback.on_failure)(callback.userdata, error.into_raw());
         }
+    }
+}
+
+// ============================================================================
+// Endpoint Identity
+// ============================================================================
+
+/// Get this node's endpoint id: the Ed25519 public key as 64 lowercase hex characters.
+///
+/// Same string as `IrohNodeInfo.node_id`. Returns null if `handle` is null.
+/// The caller must free the result with `iroh_string_free`.
+///
+/// # Safety
+/// - `handle` must be a valid node handle (or null)
+#[unsafe(no_mangle)]
+pub extern "C" fn iroh_node_endpoint_id(handle: *const IrohNodeHandle) -> *mut c_char {
+    if handle.is_null() {
+        return std::ptr::null_mut();
+    }
+    let node = unsafe { &*(handle as *const IrohNode) };
+    c_string(node.endpoint_id())
+}
+
+/// Sign `message` with this node's endpoint secret key (Ed25519).
+///
+/// Writes the 64-byte signature to `signature_out` and returns true. Returns
+/// false (writing nothing) if `handle` or `signature_out` is null. The
+/// signature verifies, including under `verify_strict`, against the public key
+/// returned by `iroh_node_endpoint_id`.
+///
+/// # Safety
+/// - `handle` must be a valid node handle (or null)
+/// - `message.data` must point to valid memory for `message.len` bytes (or be null with len 0)
+/// - `signature_out` must point to 64 writable bytes (or be null)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_node_sign(
+    handle: *const IrohNodeHandle,
+    message: IrohBytes,
+    signature_out: *mut u8,
+) -> bool {
+    if handle.is_null() || signature_out.is_null() {
+        return false;
+    }
+    let node = unsafe { &*(handle as *const IrohNode) };
+    let message = unsafe { borrowed_bytes(&message) };
+    let signature = node.sign(message);
+    unsafe { std::ptr::copy_nonoverlapping(signature.as_ptr(), signature_out, signature.len()) };
+    true
+}
+
+/// BLAKE3 hash of `bytes` as 64 lowercase hex characters.
+///
+/// The caller must free the result with `iroh_string_free`.
+///
+/// # Safety
+/// - `bytes.data` must point to valid memory for `bytes.len` bytes (or be null with len 0)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_blake3_hex(bytes: IrohBytes) -> *mut c_char {
+    let data = unsafe { borrowed_bytes(&bytes) };
+    c_string(crate::node::blake3_hex(data))
+}
+
+// ============================================================================
+// Cancellable Operations
+// ============================================================================
+
+/// Opaque cancellation token for a spawned operation (fetch, file push).
+///
+/// Create with `iroh_cancel_token_new`, pass to the operation, cancel with
+/// `iroh_cancel_token_cancel` (any thread, any number of times), and free with
+/// `iroh_cancel_token_free` once nothing will cancel it any more. The operation
+/// keeps its own reference, so freeing the token early is safe.
+#[repr(C)]
+pub struct IrohCancelToken {
+    _private: [u8; 0],
+}
+
+/// Why a spawned operation failed.
+///
+/// cbindgen:prefix-with-name
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IrohOperationErrorCode {
+    /// Any other failure; see the message.
+    Failed = 0,
+    /// The remote node does not have the requested blob.
+    NotFound = 1,
+    /// The remote announced a blob larger than the size limit (`size` carries it).
+    SizeLimitExceeded = 2,
+    /// The operation was cancelled through its cancel token.
+    Cancelled = 3,
+    /// The node shut down while the operation was in flight.
+    NodeShutDown = 4,
+    /// The operation's time limit (`timeout_ms`) elapsed.
+    TimedOut = 5,
+}
+
+/// Callback for `iroh_fetch_from_node`.
+///
+/// Exactly one of `on_success` / `on_failure` is called, once. `on_progress`
+/// (nullable) is only called before that. Callbacks may run on a Tokio worker
+/// thread, or synchronously inside `iroh_fetch_from_node` for argument errors.
+#[repr(C)]
+pub struct IrohFetchCallback {
+    /// Opaque pointer passed back to Swift.
+    pub userdata: *mut c_void,
+    /// Cumulative progress: `(0, total)` once the size is accepted, then
+    /// periodically, ending with `(total, total)`. Null to skip progress.
+    pub on_progress: Option<extern "C" fn(userdata: *mut c_void, downloaded: u64, total: u64)>,
+    /// Called once the verified blob has been moved to the destination path.
+    pub on_success: extern "C" fn(userdata: *mut c_void, size: u64),
+    /// Called on failure. `size` is the announced size for `SizeLimitExceeded`,
+    /// else 0. `error` must be freed with `iroh_string_free`.
+    pub on_failure: extern "C" fn(
+        userdata: *mut c_void,
+        code: IrohOperationErrorCode,
+        size: u64,
+        error: *const c_char,
+    ),
+}
+
+/// Callback for `iroh_push_file_to_node`.
+///
+/// Exactly one of `on_success` / `on_failure` is called, once.
+#[repr(C)]
+pub struct IrohPushFileCallback {
+    /// Opaque pointer passed back to Swift.
+    pub userdata: *mut c_void,
+    /// Called with the blob hash as 64 lowercase hex (free with `iroh_string_free`).
+    pub on_success: extern "C" fn(userdata: *mut c_void, hash: *const c_char),
+    /// Called on failure. `error` must be freed with `iroh_string_free`.
+    pub on_failure:
+        extern "C" fn(userdata: *mut c_void, code: IrohOperationErrorCode, error: *const c_char),
+}
+
+/// Create a cancellation token. Free with `iroh_cancel_token_free`.
+#[unsafe(no_mangle)]
+pub extern "C" fn iroh_cancel_token_new() -> *mut IrohCancelToken {
+    Box::into_raw(Box::new(tokio_util::sync::CancellationToken::new())) as *mut IrohCancelToken
+}
+
+/// Cancel the operation(s) using this token. Idempotent and thread-safe.
+///
+/// # Safety
+/// - `token` must be a live pointer from `iroh_cancel_token_new` (or null)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_cancel_token_cancel(token: *const IrohCancelToken) {
+    if let Some(token) = unsafe { cancel_token_ref(token) } {
+        token.cancel();
+    }
+}
+
+/// Free a cancellation token. Does not cancel anything.
+///
+/// # Safety
+/// - `token` must come from `iroh_cancel_token_new` (or be null) and must not
+///   be used after this call
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_cancel_token_free(token: *mut IrohCancelToken) {
+    if !token.is_null() {
+        drop(unsafe { Box::from_raw(token as *mut tokio_util::sync::CancellationToken) });
+    }
+}
+
+/// Fetch the raw blob `hash_hex` from one remote node into the file at `destination_path`.
+///
+/// Connects to `remote_node_id_hex` (64 hex) only — never to other providers —
+/// using `relay_url` and/or `direct_addrs` as address hints, and streams the
+/// blob with BLAKE3 verification straight to a temporary sibling of
+/// `destination_path`, which is renamed into place only after the full blob is
+/// verified. The blob is not added to the local store. If the remote announces
+/// a size above `max_size` the fetch fails with `SizeLimitExceeded` before any
+/// content is read. On failure or cancellation no file is left at
+/// `destination_path` (an existing file there is left untouched; on success it
+/// is replaced).
+///
+/// Returns immediately; the transfer runs on the node's runtime. Cancel it with
+/// `iroh_cancel_token_cancel(cancel_token)`.
+///
+/// # Safety
+/// - `handle` must be a valid node handle that outlives the operation's callback
+/// - `hash_hex`, `remote_node_id_hex`, `destination_path` must be valid
+///   null-terminated UTF-8 strings
+/// - `relay_url` is nullable; if non-null must be a valid null-terminated UTF-8 string
+/// - `direct_addrs` is nullable; if non-null must point to `direct_addrs_len`
+///   valid null-terminated UTF-8 strings
+/// - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_fetch_from_node(
+    handle: *const IrohNodeHandle,
+    hash_hex: *const c_char,
+    remote_node_id_hex: *const c_char,
+    relay_url: *const c_char,
+    direct_addrs: *const *const c_char,
+    direct_addrs_len: usize,
+    destination_path: *const c_char,
+    max_size: u64,
+    cancel_token: *const IrohCancelToken,
+    callback: IrohFetchCallback,
+) {
+    let completion = FetchCompletion {
+        userdata: callback.userdata as usize,
+        on_progress: callback.on_progress,
+        on_success: callback.on_success,
+        on_failure: callback.on_failure,
+        done: false,
+    };
+
+    let parsed = (|| {
+        if handle.is_null() {
+            return Err("handle cannot be null".to_string());
+        }
+        let hash = parse_blob_hash(unsafe { required_str(hash_hex, "hash_hex") }?)?;
+        let node_id = unsafe { required_str(remote_node_id_hex, "remote_node_id_hex") }?;
+        let relay = unsafe { optional_str(relay_url, "relay_url") }?;
+        let addrs = unsafe { str_array(direct_addrs, direct_addrs_len) }?;
+        let destination =
+            PathBuf::from(unsafe { required_str(destination_path, "destination_path") }?);
+        let remote = crate::resolve::RemoteTarget::parse(node_id, relay, &addrs)
+            .map_err(|e| format!("{:#}", e))?;
+        Ok((hash, remote, destination))
+    })();
+
+    let (hash, target, destination) = match parsed {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            completion.fail(IrohOperationErrorCode::Failed, 0, message);
+            return;
+        }
+    };
+
+    let node = unsafe { &*(handle as *const IrohNode) };
+    if node.is_shutting_down() {
+        completion.fail(IrohOperationErrorCode::NodeShutDown, 0, "node shut down");
+        return;
+    }
+    let token = operation_token(cancel_token);
+    let endpoint = node.endpoint().clone();
+    let shutdown = node.shutdown_token();
+    let resolver = node.host_resolver().clone();
+    node.runtime().spawn(async move {
+        // Hostnames are resolved inside the cancellable future, so a cancel or
+        // a node shutdown also ends a slow DNS lookup.
+        let result = crate::node::run_cancellable(
+            async {
+                let remote = resolver.resolve_target(target).await?;
+                crate::node::fetch_to_path(
+                    &endpoint,
+                    hash,
+                    remote,
+                    &destination,
+                    max_size,
+                    &token,
+                    |downloaded, total| completion.progress(downloaded, total),
+                )
+                .await
+            },
+            &token,
+            &shutdown,
+        )
+        .await;
+        match result {
+            Ok(size) => completion.succeed(size),
+            Err(e) => {
+                let (code, size) = operation_error_code(&e);
+                completion.fail(code, size, e.to_string());
+            }
+        }
+    });
+}
+
+/// Push the file at `file_path` to a remote node without loading it into memory.
+///
+/// The file is streamed into the local store (copied, BLAKE3/bao-encoded), then
+/// pushed exactly like `iroh_push_to_node`. On success the callback receives the
+/// blob hash (64 lowercase hex). The blob stays in the local store, tagged, like
+/// the bytes pushed by `iroh_push_to_node`.
+///
+/// Returns immediately; the work runs on the node's runtime. Cancel it with
+/// `iroh_cancel_token_cancel(cancel_token)`.
+///
+/// # Safety
+/// - `handle` must be a valid node handle that outlives the operation's callback
+/// - `remote_node_id_hex` and `file_path` must be valid null-terminated UTF-8 strings
+/// - `relay_url` is nullable; if non-null must be a valid null-terminated UTF-8 string
+/// - `direct_addrs` is nullable; if non-null must point to `direct_addrs_len`
+///   valid null-terminated UTF-8 strings
+/// - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_push_file_to_node(
+    handle: *const IrohNodeHandle,
+    remote_node_id_hex: *const c_char,
+    relay_url: *const c_char,
+    direct_addrs: *const *const c_char,
+    direct_addrs_len: usize,
+    file_path: *const c_char,
+    cancel_token: *const IrohCancelToken,
+    callback: IrohPushFileCallback,
+) {
+    let completion = PushFileCompletion {
+        userdata: callback.userdata as usize,
+        on_success: callback.on_success,
+        on_failure: callback.on_failure,
+        done: false,
+    };
+
+    let parsed = (|| {
+        if handle.is_null() {
+            return Err("handle cannot be null".to_string());
+        }
+        let node_id = unsafe { required_str(remote_node_id_hex, "remote_node_id_hex") }?;
+        let relay = unsafe { optional_str(relay_url, "relay_url") }?;
+        let addrs = unsafe { str_array(direct_addrs, direct_addrs_len) }?;
+        let path = PathBuf::from(unsafe { required_str(file_path, "file_path") }?);
+        let remote = crate::resolve::RemoteTarget::parse(node_id, relay, &addrs)
+            .map_err(|e| format!("{:#}", e))?;
+        Ok((remote, path))
+    })();
+
+    let (target, path) = match parsed {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            completion.fail(IrohOperationErrorCode::Failed, message);
+            return;
+        }
+    };
+
+    let node = unsafe { &*(handle as *const IrohNode) };
+    if node.is_shutting_down() {
+        completion.fail(IrohOperationErrorCode::NodeShutDown, "node shut down");
+        return;
+    }
+    let token = operation_token(cancel_token);
+    let endpoint = node.endpoint().clone();
+    let store = node.store().clone();
+    let shutdown = node.shutdown_token();
+    let resolver = node.host_resolver().clone();
+    node.runtime().spawn(async move {
+        let result = crate::node::run_cancellable(
+            async {
+                let remote = resolver.resolve_target(target).await?;
+                crate::node::push_path(&endpoint, &store, &path, remote).await
+            },
+            &token,
+            &shutdown,
+        )
+        .await;
+        match result {
+            Ok(hash) => completion.succeed(hash.to_hex().to_string()),
+            Err(e) => {
+                let (code, _) = operation_error_code(&e);
+                completion.fail(code, e.to_string());
+            }
+        }
+    });
+}
+
+/// Push `bytes` to a remote node: the cancellable form of `iroh_push_to_node` and
+/// `iroh_push_to_node_with_options`, which Swift uses.
+///
+/// Returns immediately; the work (hostname resolution, import into the store, the
+/// transfer) runs on the node's runtime. Cancel it with
+/// `iroh_cancel_token_cancel(cancel_token)`: a cancel during DNS resolution or
+/// the transfer stops it, and nothing is sent after a cancel. `timeout_ms` (0 = none)
+/// bounds the whole operation and fails with `TimedOut`. The bytes are copied
+/// before this returns. The callback is `IrohPushFileCallback`: on success the
+/// blob hash (64 lowercase hex).
+///
+/// # Safety
+/// - `handle` must be a valid node handle that outlives the operation's callback
+/// - `remote_node_id_hex` must be a valid null-terminated UTF-8 string
+/// - `relay_url` is nullable; if non-null must be a valid null-terminated UTF-8 string
+/// - `direct_addrs` is nullable; if non-null must point to `direct_addrs_len`
+///   valid null-terminated UTF-8 strings
+/// - `bytes.data` must point to `bytes.len` readable bytes (copied before return)
+/// - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_push_bytes_to_node(
+    handle: *const IrohNodeHandle,
+    remote_node_id_hex: *const c_char,
+    relay_url: *const c_char,
+    direct_addrs: *const *const c_char,
+    direct_addrs_len: usize,
+    bytes: IrohBytes,
+    timeout_ms: u64,
+    cancel_token: *const IrohCancelToken,
+    callback: IrohPushFileCallback,
+) {
+    let completion = PushFileCompletion {
+        userdata: callback.userdata as usize,
+        on_success: callback.on_success,
+        on_failure: callback.on_failure,
+        done: false,
+    };
+
+    let parsed = (|| {
+        if handle.is_null() {
+            return Err("handle cannot be null".to_string());
+        }
+        let node_id = unsafe { required_str(remote_node_id_hex, "remote_node_id_hex") }?;
+        let relay = unsafe { optional_str(relay_url, "relay_url") }?;
+        let addrs = unsafe { str_array(direct_addrs, direct_addrs_len) }?;
+        crate::resolve::RemoteTarget::parse(node_id, relay, &addrs).map_err(|e| format!("{:#}", e))
+    })();
+
+    let target = match parsed {
+        Ok(target) => target,
+        Err(message) => {
+            completion.fail(IrohOperationErrorCode::Failed, message);
+            return;
+        }
+    };
+
+    let node = unsafe { &*(handle as *const IrohNode) };
+    if node.is_shutting_down() {
+        completion.fail(IrohOperationErrorCode::NodeShutDown, "node shut down");
+        return;
+    }
+    // Swift's memory may not be stable after we return.
+    let data = unsafe { borrowed_bytes(&bytes) }.to_vec();
+    let token = operation_token(cancel_token);
+    let endpoint = node.endpoint().clone();
+    let store = node.store().clone();
+    let shutdown = node.shutdown_token();
+    let resolver = node.host_resolver().clone();
+    node.runtime().spawn(async move {
+        let result = crate::node::run_cancellable(
+            crate::node::push_bytes(&endpoint, &store, &resolver, target, &data, timeout_ms),
+            &token,
+            &shutdown,
+        )
+        .await;
+        match result {
+            Ok(hash) => completion.succeed(hash.to_hex().to_string()),
+            Err(e) => {
+                let (code, _) = operation_error_code(&e);
+                completion.fail(code, e.to_string());
+            }
+        }
+    });
+}
+
+/// Delivers the outcome of a fetch to its callback exactly once.
+///
+/// If the task is dropped before completing (the runtime shut down), `Drop`
+/// reports `NodeShutDown`, so the Swift continuation is always resumed.
+struct FetchCompletion {
+    userdata: usize,
+    on_progress: Option<extern "C" fn(userdata: *mut c_void, downloaded: u64, total: u64)>,
+    on_success: extern "C" fn(userdata: *mut c_void, size: u64),
+    on_failure: extern "C" fn(
+        userdata: *mut c_void,
+        code: IrohOperationErrorCode,
+        size: u64,
+        error: *const c_char,
+    ),
+    done: bool,
+}
+
+impl FetchCompletion {
+    fn progress(&self, downloaded: u64, total: u64) {
+        if let Some(on_progress) = self.on_progress {
+            on_progress(self.userdata as *mut c_void, downloaded, total);
+        }
+    }
+
+    fn succeed(mut self, size: u64) {
+        self.done = true;
+        (self.on_success)(self.userdata as *mut c_void, size);
+    }
+
+    fn fail(mut self, code: IrohOperationErrorCode, size: u64, message: impl Into<String>) {
+        self.done = true;
+        (self.on_failure)(
+            self.userdata as *mut c_void,
+            code,
+            size,
+            c_string(message.into()),
+        );
+    }
+}
+
+impl Drop for FetchCompletion {
+    fn drop(&mut self) {
+        if !self.done {
+            self.done = true;
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                IrohOperationErrorCode::NodeShutDown,
+                0,
+                c_string("node shut down".to_string()),
+            );
+        }
+    }
+}
+
+/// Delivers the outcome of a file push to its callback exactly once (see `FetchCompletion`).
+struct PushFileCompletion {
+    userdata: usize,
+    on_success: extern "C" fn(userdata: *mut c_void, hash: *const c_char),
+    on_failure:
+        extern "C" fn(userdata: *mut c_void, code: IrohOperationErrorCode, error: *const c_char),
+    done: bool,
+}
+
+impl PushFileCompletion {
+    fn succeed(mut self, hash_hex: String) {
+        self.done = true;
+        (self.on_success)(self.userdata as *mut c_void, c_string(hash_hex));
+    }
+
+    fn fail(mut self, code: IrohOperationErrorCode, message: impl Into<String>) {
+        self.done = true;
+        (self.on_failure)(self.userdata as *mut c_void, code, c_string(message.into()));
+    }
+}
+
+impl Drop for PushFileCompletion {
+    fn drop(&mut self) {
+        if !self.done {
+            self.done = true;
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                IrohOperationErrorCode::NodeShutDown,
+                c_string("node shut down".to_string()),
+            );
+        }
+    }
+}
+
+fn operation_error_code(e: &crate::node::OperationError) -> (IrohOperationErrorCode, u64) {
+    use crate::node::OperationError;
+    match e {
+        OperationError::NotFound => (IrohOperationErrorCode::NotFound, 0),
+        OperationError::SizeLimitExceeded(size) => {
+            (IrohOperationErrorCode::SizeLimitExceeded, *size)
+        }
+        OperationError::Cancelled => (IrohOperationErrorCode::Cancelled, 0),
+        OperationError::NodeShutDown => (IrohOperationErrorCode::NodeShutDown, 0),
+        OperationError::TimedOut => (IrohOperationErrorCode::TimedOut, 0),
+        OperationError::Failed(_) => (IrohOperationErrorCode::Failed, 0),
+    }
+}
+
+/// The token one operation watches: a child of the caller's token, so
+/// `iroh_cancel_token_cancel` reaches it synchronously (a child of an already
+/// cancelled token starts cancelled). Without a caller token it never fires.
+fn operation_token(cancel_token: *const IrohCancelToken) -> tokio_util::sync::CancellationToken {
+    match unsafe { cancel_token_ref(cancel_token) } {
+        Some(caller) => caller.child_token(),
+        None => tokio_util::sync::CancellationToken::new(),
+    }
+}
+
+unsafe fn cancel_token_ref<'a>(
+    token: *const IrohCancelToken,
+) -> Option<&'a tokio_util::sync::CancellationToken> {
+    if token.is_null() {
+        None
+    } else {
+        Some(unsafe { &*(token as *const tokio_util::sync::CancellationToken) })
+    }
+}
+
+/// Parse a blob hash given as 64 hex characters.
+fn parse_blob_hash(s: &str) -> Result<Hash, String> {
+    let mut bytes = [0u8; 32];
+    if s.len() != 64 {
+        return Err(format!(
+            "Invalid hash: expected 64 hex characters, got {}",
+            s.len()
+        ));
+    }
+    hex::decode_to_slice(s, &mut bytes).map_err(|e| format!("Invalid hash: {}", e))?;
+    Ok(Hash::from_bytes(bytes))
+}
+
+unsafe fn required_str<'a>(ptr: *const c_char, name: &str) -> Result<&'a str, String> {
+    if ptr.is_null() {
+        return Err(format!("{} cannot be null", name));
+    }
+    unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .map_err(|e| format!("Invalid {} string: {}", name, e))
+}
+
+unsafe fn optional_str<'a>(ptr: *const c_char, name: &str) -> Result<Option<&'a str>, String> {
+    if ptr.is_null() {
+        Ok(None)
+    } else {
+        unsafe { required_str(ptr, name) }.map(Some)
+    }
+}
+
+unsafe fn str_array(ptr: *const *const c_char, len: usize) -> Result<Vec<String>, String> {
+    if ptr.is_null() || len == 0 {
+        return Ok(Vec::new());
+    }
+    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let mut result = Vec::with_capacity(len);
+    for &item in slice {
+        if item.is_null() {
+            continue;
+        }
+        result.push(unsafe { required_str(item, "direct address") }?.to_string());
+    }
+    Ok(result)
+}
+
+unsafe fn borrowed_bytes<'a>(bytes: &IrohBytes) -> &'a [u8] {
+    if bytes.data.is_null() || bytes.len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes.data, bytes.len) }
+    }
+}
+
+/// A C string for Swift to free with `iroh_string_free` (interior NULs are dropped).
+fn c_string(s: String) -> *mut c_char {
+    let s = if s.contains('\0') {
+        s.replace('\0', "")
+    } else {
+        s
+    };
+    CString::new(s).unwrap().into_raw()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_caller_cancel_reaches_operation_synchronously() {
+        let caller = iroh_cancel_token_new();
+        let operation = operation_token(caller);
+        assert!(!operation.is_cancelled());
+        unsafe { iroh_cancel_token_cancel(caller) };
+        // No task has to run in between: the operation sees it immediately.
+        assert!(operation.is_cancelled());
+        unsafe { iroh_cancel_token_free(caller) };
+        assert!(operation.is_cancelled());
+
+        // Already-cancelled caller: the operation starts cancelled.
+        let caller = iroh_cancel_token_new();
+        unsafe { iroh_cancel_token_cancel(caller) };
+        assert!(operation_token(caller).is_cancelled());
+        unsafe { iroh_cancel_token_free(caller) };
+
+        // No caller token: never cancelled by the caller.
+        assert!(!operation_token(std::ptr::null()).is_cancelled());
+    }
+
+    #[test]
+    fn test_parse_blob_hash_requires_64_hex() {
+        let hash = Hash::new(b"abc");
+        let hex = hash.to_hex().to_string();
+        assert_eq!(parse_blob_hash(&hex).unwrap(), hash);
+        assert_eq!(parse_blob_hash(&hex.to_uppercase()).unwrap(), hash);
+        assert!(parse_blob_hash(&hex[..63]).is_err());
+        assert!(parse_blob_hash(&"z".repeat(64)).is_err());
     }
 }

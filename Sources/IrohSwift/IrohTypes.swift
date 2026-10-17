@@ -16,12 +16,22 @@ public struct DownloadProgress: Sendable {
 
 /// Information about an Iroh node.
 public struct NodeInfo: Sendable {
-    /// The node's unique identifier.
+    /// The node's unique identifier: its endpoint id, the Ed25519 public key as
+    /// 64 lowercase hex characters (same as `IrohNode.endpointID()`).
     public let nodeId: String
     /// The relay server URL, if connected.
     public let relayUrl: String?
     /// Whether the node is connected to the network.
     public let isConnected: Bool
+    /// Direct `ip:port` addresses the node is reachable on (e.g. on the local
+    /// network). Pass them as `directAddrs` to `fetch(hash:fromNode:...)` or
+    /// `pushToNode(...)` on another node when relays are disabled.
+    public let directAddrs: [String]
+    /// Whether the Mainline DHT address lookup is running. `false` unless
+    /// `IrohConfig.dhtLookup` is set, and also `false` if it is but none of the
+    /// DHT bootstrap nodes could be resolved when the node was created (for
+    /// example, started offline): recreate the node once the network is up.
+    public let dhtActive: Bool
 }
 
 /// Parsed ticket information.

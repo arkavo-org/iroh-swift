@@ -11,6 +11,12 @@
 #include <stdlib.h>
 
 /**
+ * How often (in downloaded bytes) a fetch reports progress, besides the
+ * first report (0 bytes, once the size is known) and the final one.
+ */
+#define FETCH_PROGRESS_STEP (256 * 1024)
+
+/**
  * Share mode for document tickets.
  */
 typedef enum IrohDocShareMode {
@@ -73,6 +79,37 @@ typedef enum IrohBlobFormat {
 } IrohBlobFormat;
 
 /**
+ * Why a spawned operation failed.
+ *
+ */
+typedef enum IrohOperationErrorCode {
+    /**
+     * Any other failure; see the message.
+     */
+    IrohOperationErrorCode_Failed = 0,
+    /**
+     * The remote node does not have the requested blob.
+     */
+    IrohOperationErrorCode_NotFound = 1,
+    /**
+     * The remote announced a blob larger than the size limit (`size` carries it).
+     */
+    IrohOperationErrorCode_SizeLimitExceeded = 2,
+    /**
+     * The operation was cancelled through its cancel token.
+     */
+    IrohOperationErrorCode_Cancelled = 3,
+    /**
+     * The node shut down while the operation was in flight.
+     */
+    IrohOperationErrorCode_NodeShutDown = 4,
+    /**
+     * The operation's time limit (`timeout_ms`) elapsed.
+     */
+    IrohOperationErrorCode_TimedOut = 5,
+} IrohOperationErrorCode;
+
+/**
  * Configuration for creating a node.
  */
 typedef struct IrohNodeConfig {
@@ -94,6 +131,29 @@ typedef struct IrohNodeConfig {
      * When enabled, the node can create, join, and sync documents.
      */
     bool docs_enabled;
+    /**
+     * Whether to accept the iroh-blobs protocol (default: true).
+     * When false the node is client-only: it can fetch and push blobs, but
+     * peers cannot download blobs from it or push blobs to it.
+     */
+    bool serves_blobs;
+    /**
+     * Whether peers may push blobs into this node's store (default: false).
+     * Only meaningful with `serves_blobs`; setting it without `serves_blobs`
+     * fails node creation. When false, a serving node refuses push requests
+     * and writes nothing; peers can still download blobs from it.
+     */
+    bool accepts_pushes;
+    /**
+     * Whether to resolve endpoint IDs on the BitTorrent Mainline DHT, so a
+     * node can be fetched from or pushed to by ID alone (default: false).
+     */
+    bool dht_lookup;
+    /**
+     * Whether to also publish this node's address to the DHT (default: false).
+     * Requires `dht_lookup` and `serves_blobs`; otherwise node creation fails.
+     */
+    bool dht_publish;
 } IrohNodeConfig;
 
 /**
@@ -233,6 +293,16 @@ typedef struct IrohNodeInfo {
      * Whether the node is connected to the network.
      */
     bool is_connected;
+    /**
+     * Direct `ip:port` addresses, separated by `\n` (caller must free with
+     * `iroh_string_free`). Null if the node has no direct addresses.
+     */
+    const char *direct_addrs;
+    /**
+     * Whether the Mainline DHT address lookup is running (false if not
+     * requested, or if no bootstrap node resolved at creation).
+     */
+    bool dht_active;
 } IrohNodeInfo;
 
 /**
@@ -547,6 +617,69 @@ typedef struct IrohDocSubscribeCallback {
 } IrohDocSubscribeCallback;
 
 /**
+ * Opaque cancellation token for a spawned operation (fetch, file push).
+ *
+ * Create with `iroh_cancel_token_new`, pass to the operation, cancel with
+ * `iroh_cancel_token_cancel` (any thread, any number of times), and free with
+ * `iroh_cancel_token_free` once nothing will cancel it any more. The operation
+ * keeps its own reference, so freeing the token early is safe.
+ */
+typedef struct IrohCancelToken {
+    uint8_t _private[0];
+} IrohCancelToken;
+
+/**
+ * Callback for `iroh_fetch_from_node`.
+ *
+ * Exactly one of `on_success` / `on_failure` is called, once. `on_progress`
+ * (nullable) is only called before that. Callbacks may run on a Tokio worker
+ * thread, or synchronously inside `iroh_fetch_from_node` for argument errors.
+ */
+typedef struct IrohFetchCallback {
+    /**
+     * Opaque pointer passed back to Swift.
+     */
+    void *userdata;
+    /**
+     * Cumulative progress: `(0, total)` once the size is accepted, then
+     * periodically, ending with `(total, total)`. Null to skip progress.
+     */
+    void (*on_progress)(void *userdata, uint64_t downloaded, uint64_t total);
+    /**
+     * Called once the verified blob has been moved to the destination path.
+     */
+    void (*on_success)(void *userdata, uint64_t size);
+    /**
+     * Called on failure. `size` is the announced size for `SizeLimitExceeded`,
+     * else 0. `error` must be freed with `iroh_string_free`.
+     */
+    void (*on_failure)(void *userdata,
+                       enum IrohOperationErrorCode code,
+                       uint64_t size,
+                       const char *error);
+} IrohFetchCallback;
+
+/**
+ * Callback for `iroh_push_file_to_node`.
+ *
+ * Exactly one of `on_success` / `on_failure` is called, once.
+ */
+typedef struct IrohPushFileCallback {
+    /**
+     * Opaque pointer passed back to Swift.
+     */
+    void *userdata;
+    /**
+     * Called with the blob hash as 64 lowercase hex (free with `iroh_string_free`).
+     */
+    void (*on_success)(void *userdata, const char *hash);
+    /**
+     * Called on failure. `error` must be freed with `iroh_string_free`.
+     */
+    void (*on_failure)(void *userdata, enum IrohOperationErrorCode code, const char *error);
+} IrohPushFileCallback;
+
+/**
  * Create a new Iroh node asynchronously.
  *
  * # Safety
@@ -559,7 +692,8 @@ void iroh_node_create(struct IrohNodeConfig config, struct IrohNodeCreateCallbac
 /**
  * Destroy an Iroh node and free its resources.
  *
- * This performs a graceful shutdown, ensuring pending writes are flushed.
+ * Performs shutdown on a background thread to avoid blocking Swift's
+ * cooperative thread pool (which can deadlock if called from deinit).
  *
  * # Safety
  * - `handle` must be a valid pointer returned by `iroh_node_create`
@@ -670,8 +804,15 @@ void iroh_put_with_options(const struct IrohNodeHandle *handle,
 /**
  * Push bytes to a remote node identified by its node ID.
  *
+ * Blocks the calling thread and cannot be cancelled (hostname resolution
+ * included); `iroh_push_bytes_to_node` is the cancellable form Swift uses.
+ *
  * Adds the data to the local store, connects to the remote node,
  * and pushes the blob. Returns the blob hash as a hex string on success.
+ *
+ * The remote must accept pushes (`accepts_pushes` on an iroh-swift node). A
+ * node that refuses them stores nothing; the pusher is not reliably told (a
+ * small blob can still report success, a larger one fails).
  *
  * # Safety
  * - `handle` must be a valid node handle
@@ -693,7 +834,8 @@ void iroh_push_to_node(const struct IrohNodeHandle *handle,
 /**
  * Push bytes to a remote node with options (e.g., timeout).
  *
- * Same as `iroh_push_to_node` but with configurable operation options.
+ * Same as `iroh_push_to_node` but with configurable operation options. Also
+ * blocking and not cancellable; see `iroh_push_bytes_to_node`.
  *
  * # Safety
  * - `handle` must be a valid node handle
@@ -989,5 +1131,163 @@ void iroh_blob_ticket_create(const struct IrohNodeHandle *handle,
 void iroh_blob_tag_delete(const struct IrohNodeHandle *handle,
                           const char *tagName,
                           struct IrohCloseCallback callback);
+
+/**
+ * Get this node's endpoint id: the Ed25519 public key as 64 lowercase hex characters.
+ *
+ * Same string as `IrohNodeInfo.node_id`. Returns null if `handle` is null.
+ * The caller must free the result with `iroh_string_free`.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle (or null)
+ */
+char *iroh_node_endpoint_id(const struct IrohNodeHandle *handle);
+
+/**
+ * Sign `message` with this node's endpoint secret key (Ed25519).
+ *
+ * Writes the 64-byte signature to `signature_out` and returns true. Returns
+ * false (writing nothing) if `handle` or `signature_out` is null. The
+ * signature verifies, including under `verify_strict`, against the public key
+ * returned by `iroh_node_endpoint_id`.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle (or null)
+ * - `message.data` must point to valid memory for `message.len` bytes (or be null with len 0)
+ * - `signature_out` must point to 64 writable bytes (or be null)
+ */
+bool iroh_node_sign(const struct IrohNodeHandle *handle,
+                    struct IrohBytes message,
+                    uint8_t *signatureOut);
+
+/**
+ * BLAKE3 hash of `bytes` as 64 lowercase hex characters.
+ *
+ * The caller must free the result with `iroh_string_free`.
+ *
+ * # Safety
+ * - `bytes.data` must point to valid memory for `bytes.len` bytes (or be null with len 0)
+ */
+char *iroh_blake3_hex(struct IrohBytes bytes);
+
+/**
+ * Create a cancellation token. Free with `iroh_cancel_token_free`.
+ */
+struct IrohCancelToken *iroh_cancel_token_new(void);
+
+/**
+ * Cancel the operation(s) using this token. Idempotent and thread-safe.
+ *
+ * # Safety
+ * - `token` must be a live pointer from `iroh_cancel_token_new` (or null)
+ */
+void iroh_cancel_token_cancel(const struct IrohCancelToken *token);
+
+/**
+ * Free a cancellation token. Does not cancel anything.
+ *
+ * # Safety
+ * - `token` must come from `iroh_cancel_token_new` (or be null) and must not
+ *   be used after this call
+ */
+void iroh_cancel_token_free(struct IrohCancelToken *token);
+
+/**
+ * Fetch the raw blob `hash_hex` from one remote node into the file at `destination_path`.
+ *
+ * Connects to `remote_node_id_hex` (64 hex) only — never to other providers —
+ * using `relay_url` and/or `direct_addrs` as address hints, and streams the
+ * blob with BLAKE3 verification straight to a temporary sibling of
+ * `destination_path`, which is renamed into place only after the full blob is
+ * verified. The blob is not added to the local store. If the remote announces
+ * a size above `max_size` the fetch fails with `SizeLimitExceeded` before any
+ * content is read. On failure or cancellation no file is left at
+ * `destination_path` (an existing file there is left untouched; on success it
+ * is replaced).
+ *
+ * Returns immediately; the transfer runs on the node's runtime. Cancel it with
+ * `iroh_cancel_token_cancel(cancel_token)`.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle that outlives the operation's callback
+ * - `hash_hex`, `remote_node_id_hex`, `destination_path` must be valid
+ *   null-terminated UTF-8 strings
+ * - `relay_url` is nullable; if non-null must be a valid null-terminated UTF-8 string
+ * - `direct_addrs` is nullable; if non-null must point to `direct_addrs_len`
+ *   valid null-terminated UTF-8 strings
+ * - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+ * - `callback` must have valid function pointers
+ */
+void iroh_fetch_from_node(const struct IrohNodeHandle *handle,
+                          const char *hashHex,
+                          const char *remoteNodeIdHex,
+                          const char *relayUrl,
+                          const char *const *directAddrs,
+                          uintptr_t directAddrsLen,
+                          const char *destinationPath,
+                          uint64_t maxSize,
+                          const struct IrohCancelToken *cancelToken,
+                          struct IrohFetchCallback callback);
+
+/**
+ * Push the file at `file_path` to a remote node without loading it into memory.
+ *
+ * The file is streamed into the local store (copied, BLAKE3/bao-encoded), then
+ * pushed exactly like `iroh_push_to_node`. On success the callback receives the
+ * blob hash (64 lowercase hex). The blob stays in the local store, tagged, like
+ * the bytes pushed by `iroh_push_to_node`.
+ *
+ * Returns immediately; the work runs on the node's runtime. Cancel it with
+ * `iroh_cancel_token_cancel(cancel_token)`.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle that outlives the operation's callback
+ * - `remote_node_id_hex` and `file_path` must be valid null-terminated UTF-8 strings
+ * - `relay_url` is nullable; if non-null must be a valid null-terminated UTF-8 string
+ * - `direct_addrs` is nullable; if non-null must point to `direct_addrs_len`
+ *   valid null-terminated UTF-8 strings
+ * - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+ * - `callback` must have valid function pointers
+ */
+void iroh_push_file_to_node(const struct IrohNodeHandle *handle,
+                            const char *remoteNodeIdHex,
+                            const char *relayUrl,
+                            const char *const *directAddrs,
+                            uintptr_t directAddrsLen,
+                            const char *filePath,
+                            const struct IrohCancelToken *cancelToken,
+                            struct IrohPushFileCallback callback);
+
+/**
+ * Push `bytes` to a remote node: the cancellable form of `iroh_push_to_node` and
+ * `iroh_push_to_node_with_options`, which Swift uses.
+ *
+ * Returns immediately; the work (hostname resolution, import into the store, the
+ * transfer) runs on the node's runtime. Cancel it with
+ * `iroh_cancel_token_cancel(cancel_token)`: a cancel during DNS resolution or
+ * the transfer stops it, and nothing is sent after a cancel. `timeout_ms` (0 = none)
+ * bounds the whole operation and fails with `TimedOut`. The bytes are copied
+ * before this returns. The callback is `IrohPushFileCallback`: on success the
+ * blob hash (64 lowercase hex).
+ *
+ * # Safety
+ * - `handle` must be a valid node handle that outlives the operation's callback
+ * - `remote_node_id_hex` must be a valid null-terminated UTF-8 string
+ * - `relay_url` is nullable; if non-null must be a valid null-terminated UTF-8 string
+ * - `direct_addrs` is nullable; if non-null must point to `direct_addrs_len`
+ *   valid null-terminated UTF-8 strings
+ * - `bytes.data` must point to `bytes.len` readable bytes (copied before return)
+ * - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+ * - `callback` must have valid function pointers
+ */
+void iroh_push_bytes_to_node(const struct IrohNodeHandle *handle,
+                             const char *remoteNodeIdHex,
+                             const char *relayUrl,
+                             const char *const *directAddrs,
+                             uintptr_t directAddrsLen,
+                             struct IrohBytes bytes,
+                             uint64_t timeoutMs,
+                             const struct IrohCancelToken *cancelToken,
+                             struct IrohPushFileCallback callback);
 
 #endif  /* IROH_SWIFT_H */
