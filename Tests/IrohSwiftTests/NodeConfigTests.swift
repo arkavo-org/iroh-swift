@@ -36,6 +36,51 @@ struct NodeConfigTests {
         #expect(initError?.isInvalidConfiguration == true, "got \(String(describing: initError))")
     }
 
+    @Test("DHT lookup and publishing are off by default")
+    func dhtDefaults() {
+        #expect(!IrohConfig().dhtLookup)
+        #expect(!IrohConfig().dhtPublish)
+        #expect(IrohConfig(dhtLookup: true).dhtLookup)
+        #expect(!IrohConfig(dhtLookup: true).dhtPublish)
+    }
+
+    @Test("dhtPublish needs dhtLookup and a serving node")
+    func dhtPublishValidation() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        for config in [
+            IrohConfig(storagePath: dir, relayEnabled: false, dhtPublish: true),
+            IrohConfig(
+                storagePath: dir, relayEnabled: false, servesBlobs: false,
+                dhtLookup: true, dhtPublish: true
+            ),
+        ] {
+            let error = #expect(throws: IrohError.self) { try config.validate() }
+            #expect(error?.isInvalidConfiguration == true, "got \(String(describing: error))")
+            // Rejected before anything is created on disk.
+            #expect(!FileManager.default.fileExists(atPath: dir.path))
+            let initError = await #expect(throws: IrohError.self) { try await IrohNode(config: config) }
+            #expect(initError?.isInvalidConfiguration == true)
+        }
+    }
+
+    @Test("a node with dhtLookup starts and stores blobs")
+    func dhtLookupNodeStarts() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let node = try await IrohNode(
+            config: IrohConfig(
+                storagePath: dir, relayEnabled: false, servesBlobs: false, dhtLookup: true
+            )
+        )
+        let data = Data("kept locally".utf8)
+        #expect(try await node.get(ticket: try await node.put(data)) == data)
+        try await node.close()
+    }
+
     @Test("a client-only node starts, stores blobs and reports its direct addresses")
     func clientOnlyNode() async throws {
         let dir = FileManager.default.temporaryDirectory

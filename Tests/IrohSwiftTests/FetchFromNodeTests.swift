@@ -485,6 +485,81 @@ struct FetchFromNodeTests {
         await server.close()
     }
 
+    /// Port of the node's first IPv4 direct address (`"ip:port"`).
+    private func ipv4Port(of node: IrohNode) async throws -> String {
+        let addrs = try await node.info().directAddrs
+        let v4 = try #require(addrs.first { !$0.hasPrefix("[") })
+        return String(try #require(v4.split(separator: ":").last))
+    }
+
+    @Test("fetch and push accept host:port direct addresses")
+    func hostnameDirectAddress() async throws {
+        let server = try await makeNode(servesBlobs: true, acceptsPushes: true)
+        let client = try await makeNode(servesBlobs: false)
+        let out = try makeOutputDir()
+        defer { try? FileManager.default.removeItem(at: out) }
+
+        let serverID = try await server.node.endpointID()
+        let hostAddr = "localhost:\(try await ipv4Port(of: server.node))"
+
+        let data = testData(count: 200_000)
+        let hash = IrohBLAKE3.hex(data)
+        _ = try await server.node.put(data)
+        let destination = out.appendingPathComponent("by-host.bin")
+        let size = try await client.node.fetch(
+            hash: hash,
+            fromNode: serverID,
+            directAddrs: [hostAddr],
+            to: destination,
+            maxSize: .max
+        )
+        #expect(size == UInt64(data.count))
+        #expect(try Data(contentsOf: destination) == data)
+
+        let pushed = testData(count: 1_000)
+        let pushedHash = try await client.node.pushToNode(
+            nodeId: serverID, directAddrs: [hostAddr], data: pushed
+        )
+        #expect(pushedHash == IrohBLAKE3.hex(pushed))
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("a host that does not resolve, or a malformed address, fails cleanly")
+    func badHostDirectAddress() async throws {
+        let server = try await makeNode(servesBlobs: true, acceptsPushes: true)
+        let client = try await makeNode(servesBlobs: false)
+        let out = try makeOutputDir()
+        defer { try? FileManager.default.removeItem(at: out) }
+        let serverID = try await server.node.endpointID()
+        let destination = out.appendingPathComponent("never.bin")
+
+        for bad in ["no-such-host.invalid:11204", "host-without-port", "host:0", "::1"] {
+            let fetchError = await #expect(throws: IrohError.self) {
+                try await client.node.fetch(
+                    hash: IrohBLAKE3.hex(Data("x".utf8)),
+                    fromNode: serverID,
+                    directAddrs: [bad],
+                    to: destination,
+                    maxSize: .max
+                )
+            }
+            #expect(fetchError?.isFetchFailed == true, "\(bad): \(String(describing: fetchError))")
+
+            let pushError = await #expect(throws: IrohError.self) {
+                try await client.node.pushToNode(
+                    nodeId: serverID, directAddrs: [bad], data: Data("x".utf8)
+                )
+            }
+            #expect(pushError?.isPushFailed == true, "\(bad): \(String(describing: pushError))")
+        }
+        #expect(!FileManager.default.fileExists(atPath: destination.path))
+
+        await client.close()
+        await server.close()
+    }
+
     @Test("pushToNode(fileURL:) with a missing file throws pushFailed")
     func pushMissingFile() async throws {
         let server = try await makeNode(servesBlobs: true)

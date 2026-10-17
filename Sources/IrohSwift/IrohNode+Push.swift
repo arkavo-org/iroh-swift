@@ -15,11 +15,18 @@ extension IrohNode {
     /// - Parameters:
     ///   - nodeId: The remote node ID as a hex string.
     ///   - relayUrl: Optional relay URL to assist with connectivity.
-    ///   - directAddrs: Optional list of direct addresses for the remote node.
+    ///   - directAddrs: Optional direct addresses of the remote node: `"ip:port"`
+    ///     (`"[ipv6]:port"` for IPv6) or `"host:port"`. A hostname resolves to
+    ///     all its A and AAAA records, through public DNS-over-HTTPS resolvers
+    ///     first and the device's system resolver only if none answers; a
+    ///     literal IP is used without any DNS. DNS cannot impersonate the node,
+    ///     since the QUIC handshake checks `nodeId`.
     ///   - data: The data to push.
     /// - Returns: The blob hash as a hex string.
     /// - Throws: `IrohError.nodeClosed` if the node is closed,
-    ///           `IrohError.pushFailed` if the push fails,
+    ///           `IrohError.pushFailed` if the push fails, including a malformed
+    ///           direct address or hostnames that resolve to nothing with no relay
+    ///           URL or other address to fall back on,
     ///           `CancellationError` if the task was cancelled.
     public func pushToNode(
         nodeId: String,
@@ -128,7 +135,12 @@ extension IrohNode {
     /// - Parameters:
     ///   - nodeId: The remote node ID as a hex string.
     ///   - relayUrl: Optional relay URL to assist with connectivity.
-    ///   - directAddrs: Optional list of direct addresses for the remote node.
+    ///   - directAddrs: Optional direct addresses of the remote node: `"ip:port"`
+    ///     (`"[ipv6]:port"` for IPv6) or `"host:port"`. A hostname resolves to
+    ///     all its A and AAAA records, through public DNS-over-HTTPS resolvers
+    ///     first and the device's system resolver only if none answers; a
+    ///     literal IP is used without any DNS. DNS cannot impersonate the node,
+    ///     since the QUIC handshake checks `nodeId`.
     ///   - data: The data to push.
     ///   - options: Operation options including timeout.
     /// - Returns: The blob hash as a hex string.
@@ -262,7 +274,12 @@ extension IrohNode {
     /// - Parameters:
     ///   - nodeId: The remote node ID as a hex string.
     ///   - relayUrl: Optional relay URL to assist with connectivity.
-    ///   - directAddrs: Optional list of direct addresses for the remote node.
+    ///   - directAddrs: Optional direct addresses of the remote node: `"ip:port"`
+    ///     (`"[ipv6]:port"` for IPv6) or `"host:port"`. A hostname resolves to
+    ///     all its A and AAAA records, through public DNS-over-HTTPS resolvers
+    ///     first and the device's system resolver only if none answers; a
+    ///     literal IP is used without any DNS. DNS cannot impersonate the node,
+    ///     since the QUIC handshake checks `nodeId`.
     ///   - fileURL: File URL of the file to push.
     /// - Returns: The blob hash (BLAKE3 of the file contents) as 64 lowercase hex characters.
     /// - Throws: `IrohError.nodeClosed` if the node is or gets closed,

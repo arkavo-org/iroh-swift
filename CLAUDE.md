@@ -82,9 +82,30 @@ Swift Layer (IrohSwift)           Rust FFI Layer                Iroh Libraries
 - Pushes (Data and file) leave a tagged blob in the local store; file push imports
   with `ImportMode::Copy` (needs free space for a copy).
 
+## Addressing a remote node
+
+- `rust/src/resolve.rs`: `RemoteTarget::parse` validates the node id, relay URL and every
+  direct address (`IP:port`, `[IPv6]:port` or `host:port`) synchronously, so argument errors
+  still fail before anything is spawned. `HostResolver::resolve_target` then resolves
+  hostnames (all A + AAAA records) inside the cancellable future, so cancel and shutdown also
+  stop a slow lookup. Order per host: public DoH resolvers (Cloudflare, Quad9; DoH-only,
+  `FallbackMode::Never`, 5 s), then only if they return no address the system resolver
+  (`with_system_defaults()`, also reads the hosts file, 5 s). Literal `IP:port` does no DNS.
+  Hostnames that fail are ignored unless nothing else is left (no relay, no literal address),
+  then the call fails with `Failed` (Swift `fetchFailed` / `pushFailed`); no direct addresses
+  at all is left to address lookup. Both resolvers live on `IrohNode` (`NodeOptions.host_resolver`
+  overrides the DoH list and timeouts, Rust only; tests point it at `127.0.0.1:1`).
+- `IrohConfig.dhtLookup` / `dhtPublish` -> `NodeOptions` -> `DhtAddressLookup` on the endpoint
+  builder (`iroh-mainline-address-lookup`). Lookup alone uses `no_publish()`. `dhtPublish`
+  requires `dhtLookup` and `servesBlobs` (Swift `validate()` and Rust both reject otherwise);
+  published addresses are relay-only unless relays are disabled, then unfiltered.
+  `NodeOptions.dht_bootstrap` swaps the bootstrap nodes: the Rust tests run a local
+  `n0_mainline::Testnet` (a DHT cannot be exercised from Swift tests offline).
+
 ## Key Files
 
 - `rust/src/ffi.rs` - C ABI exports: `iroh_node_create()`, `iroh_put()`, `iroh_get()`, `iroh_fetch_from_node()`, `iroh_push_file_to_node()`, cancel tokens
+- `rust/src/resolve.rs` - `host:port` parsing, `HostResolver` (DoH then system DNS)
 - `rust/src/node.rs` - Rust IrohNode managing Endpoint, FsStore, Router; `fetch_to_path`, `push_path`
 - `Sources/IrohSwift/IrohNode.swift` - Swift actor with async/await API
 - `Sources/IrohSwift/IrohNode+Fetch.swift`, `IrohNode+Push.swift`, `IrohNode+Identity.swift` - fetch-from-node, push, endpoint id / signing / BLAKE3

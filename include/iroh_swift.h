@@ -140,6 +140,16 @@ typedef struct IrohNodeConfig {
      * and writes nothing; peers can still download blobs from it.
      */
     bool accepts_pushes;
+    /**
+     * Whether to resolve endpoint IDs on the BitTorrent Mainline DHT, so a
+     * node can be fetched from or pushed to by ID alone (default: false).
+     */
+    bool dht_lookup;
+    /**
+     * Whether to also publish this node's address to the DHT (default: false).
+     * Requires `dht_lookup` and `serves_blobs`; otherwise node creation fails.
+     */
+    bool dht_publish;
 } IrohNodeConfig;
 
 /**

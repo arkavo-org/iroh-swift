@@ -78,6 +78,12 @@ let task = Task {
 // task.cancel() aborts the transfer and throws CancellationError.
 ```
 
+`directAddrs` entries are `"ip:port"` (`"[ipv6]:port"` for IPv6), used as is, or
+`"host:port"`, for example `"iroh.arkavo.net:11204"` (see
+[Hostnames in direct addresses](#hostnames-in-direct-addresses)). With neither
+`directAddrs` nor `relayUrl` the node is looked up by its ID (see
+[Find a node by ID on the DHT](#find-a-node-by-id-on-the-dht)).
+
 Errors: `IrohError.notFound` (the node does not have the blob),
 `IrohError.sizeLimitExceeded(size)`, `CancellationError`, `IrohError.nodeClosed`,
 and `IrohError.fetchFailed` for everything else. On any error no file is left at
@@ -104,6 +110,59 @@ let hash = try await publisher.pushToNode(
     fileURL: tdfFileURL                             // streamed, never loaded into memory
 )
 ```
+
+### Hostnames in direct addresses
+
+Any `directAddrs` entry that is not a literal `ip:port` must be `host:port` (port
+1 to 65535; IPv6 literals go in brackets: `[2001:db8::1]:11204`). The host is
+resolved to all its A and AAAA records and every `IP:port` is dialled; literal
+`ip:port` entries do no DNS at all. This applies to `fetch(...)` and every
+`pushToNode(...)`.
+
+Resolution order, per host: the public DNS-over-HTTPS resolvers first
+(Cloudflare 1.1.1.1 / 1.0.0.1 and Quad9 9.9.9.9, up to 5 s), and only if none of
+them returns an address, the device's system resolver (up to 5 s; it also honours
+the hosts file, so `localhost` and VPN/enterprise names work). Each node builds
+the resolvers once and reuses them. Hostnames must be ASCII (use punycode for
+internationalized names).
+
+A hostname cannot impersonate a node: you pin the endpoint ID and the QUIC
+handshake checks it, so a wrong or poisoned DNS answer only makes the connection
+fail. That makes a CNAME that follows a redeploy, such as `iroh.arkavo.net`, safe
+to use.
+
+Failure: a malformed entry (`host-without-port`, `host:0`, an unbracketed IPv6
+address) fails the call before anything is sent. If hostnames were given, none
+resolved, and there is no `relayUrl` and no literal address left, the call fails
+with a message naming the hosts: `IrohError.fetchFailed` for `fetch`,
+`IrohError.pushFailed` for `pushToNode`. A hostname that fails is ignored when a
+relay URL or another address is available. Cancelling the task also cancels a
+slow lookup.
+
+### Find a Node by ID on the DHT
+
+Opt in with `IrohConfig.dhtLookup` to resolve endpoint IDs on the BitTorrent
+Mainline DHT (pkarr, via `iroh-mainline-address-lookup`), in addition to the
+default n0 lookups. A node you only know by its ID can then be reached with no
+relay URL and no addresses:
+
+```swift
+let viewer = try await IrohNode(config: IrohConfig(servesBlobs: false, dhtLookup: true))
+try await viewer.fetch(hash: blobHash, fromNode: serverNodeId, to: cacheURL, maxSize: limit)
+```
+
+`dhtLookup` only reads from the DHT; a node never publishes unless you also set
+`dhtPublish: true`, which requires `dhtLookup` and `servesBlobs` (a client-only
+node is never dialled, so `IrohConfig.validate()` rejects `dhtPublish` on one with
+`IrohError.invalidConfiguration`). A publishing node signs its address with its
+endpoint key and republishes hourly. While relays are enabled only the relay URL
+is published, not IP addresses, because the DHT is public; with
+`relayEnabled: false` the direct addresses are published, because a peer could
+use nothing else. Explicit `relayUrl` / `directAddrs` still apply alongside the
+lookup. The DHT client opens its own UDP socket and contacts public bootstrap
+nodes, which is why both flags default to `false`. Note that the endpoint key is
+random per node instance (not persisted), so a publishing node's ID changes
+whenever it is recreated.
 
 ### Receive Pushes
 
@@ -220,7 +279,7 @@ if IrohAuthor.exists(identifier: "default") {
 | `put(_:)` | Store data, return shareable ticket |
 | `get(ticket:)` | Download data using a ticket |
 | `fetch(hash:fromNode:relayUrl:directAddrs:to:maxSize:progress:)` | Download a blob by hash from one node into a file (verified, size-limited, cancellable) |
-| `pushToNode(nodeId:relayUrl:directAddrs:data:)` | Push bytes to a node, return the blob hash |
+| `pushToNode(nodeId:relayUrl:directAddrs:data:)` | Push bytes to a node, return the blob hash (`directAddrs`: `ip:port` or `host:port`) |
 | `pushToNode(nodeId:relayUrl:directAddrs:fileURL:)` | Push a file to a node without loading it into memory, return the blob hash |
 | `endpointID()` | This node's Ed25519 public key, 64 lowercase hex (same as `info().nodeId`) |
 | `sign(_:)` | 64-byte Ed25519 signature with the endpoint secret key |
@@ -265,6 +324,8 @@ if IrohAuthor.exists(identifier: "default") {
 | `customRelayUrl` | `String?` | `nil` | Custom relay server URL |
 | `servesBlobs` | `Bool` | `true` | Serve blobs to peers; `false` makes a client-only node (fetch and push still work) |
 | `acceptsPushes` | `Bool` | `false` | Let peers push blobs into this node's store; requires `servesBlobs` |
+| `dhtLookup` | `Bool` | `false` | Resolve endpoint IDs on the Mainline DHT, so `fetch` / `pushToNode` work with an ID alone |
+| `dhtPublish` | `Bool` | `false` | Also publish this node's address to the DHT; requires `dhtLookup` and `servesBlobs` |
 
 ### IrohBLAKE3
 
@@ -340,11 +401,16 @@ store. If your app receives pushes from other iroh-swift nodes, create the
 receiving node with `acceptsPushes: true`. Pushing *to* other nodes, fetching and
 serving blobs are unchanged.
 
+Also new in 0.6.0: `directAddrs` accepts `host:port` (resolved over
+DNS-over-HTTPS first, then the system resolver), and `IrohConfig.dhtLookup` /
+`dhtPublish` opt in to endpoint-ID lookup on the Mainline DHT. Both are additive;
+existing `ip:port` addresses behave as before.
+
 ## Version Compatibility
 
 | iroh-swift | iroh | iroh-blobs | iroh-docs |
 |------------|------|------------|-----------|
-| 0.6.x | 1.3.0 | 0.103.1 | 0.101 |
+| 0.6.x | 1.3.0 (+ iroh-mainline-address-lookup 0.6) | 0.103.1 | 0.101 |
 | 0.5.x | 1.1.0 | 0.103 | 0.101 |
 | 0.4.x | 0.97 | 0.99 | 0.97 |
 | 0.3.x | 0.95 | 0.97 | 0.32 |

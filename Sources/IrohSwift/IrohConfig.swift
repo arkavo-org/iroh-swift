@@ -40,6 +40,30 @@ public struct IrohConfig: Sendable {
     /// node write to its disk.
     public var acceptsPushes: Bool
 
+    /// Whether this node resolves endpoint IDs on the BitTorrent Mainline DHT
+    /// (pkarr), in addition to the default n0 lookups.
+    ///
+    /// With it on, `fetch(hash:fromNode:...)` and `pushToNode(...)` can reach a
+    /// node by its endpoint ID alone: pass no `relayUrl` and no `directAddrs`,
+    /// and the node is looked up on the DHT. Explicit addresses still apply
+    /// alongside. This node only reads from the DHT; it publishes nothing
+    /// unless `dhtPublish` is also set. The DHT client opens its own UDP socket
+    /// and contacts public bootstrap nodes, so it is off by default.
+    /// Default: false
+    public var dhtLookup: Bool
+
+    /// Whether this node also publishes its own address to the DHT, so peers
+    /// with `dhtLookup` can find it by endpoint ID.
+    ///
+    /// Requires `dhtLookup` and `servesBlobs`: a client-only node is not
+    /// dialled, so it never publishes, and setting this on one fails
+    /// `validate()` with `IrohError.invalidConfiguration`. While relays are
+    /// enabled only the relay URL is published, not IP addresses (the DHT is
+    /// public). With `relayEnabled: false` the node's direct addresses are
+    /// published instead, because they are all a peer could use.
+    /// Default: false
+    public var dhtPublish: Bool
+
     /// Create a new IrohConfig with the specified options.
     ///
     /// - Parameters:
@@ -54,13 +78,20 @@ public struct IrohConfig: Sendable {
     ///                    Only meaningful when `servesBlobs` is true. Default: false,
     ///                    because accepting pushes lets any peer that can reach the
     ///                    node write to its disk.
+    ///   - dhtLookup: Whether to resolve endpoint IDs on the Mainline DHT, so a
+    ///                node can be fetched from or pushed to by ID alone.
+    ///                Default: false.
+    ///   - dhtPublish: Whether to also publish this node's address to the DHT.
+    ///                 Requires `dhtLookup` and `servesBlobs`. Default: false.
     public init(
         storagePath: URL? = nil,
         relayEnabled: Bool = true,
         customRelayUrl: String? = nil,
         docsEnabled: Bool = false,
         servesBlobs: Bool = true,
-        acceptsPushes: Bool = false
+        acceptsPushes: Bool = false,
+        dhtLookup: Bool = false,
+        dhtPublish: Bool = false
     ) {
         self.storagePath = storagePath ?? Self.defaultStoragePath()
         self.relayEnabled = relayEnabled
@@ -68,6 +99,8 @@ public struct IrohConfig: Sendable {
         self.docsEnabled = docsEnabled
         self.servesBlobs = servesBlobs
         self.acceptsPushes = acceptsPushes
+        self.dhtLookup = dhtLookup
+        self.dhtPublish = dhtPublish
     }
 
     /// Validate the configuration before node creation.
@@ -78,6 +111,15 @@ public struct IrohConfig: Sendable {
         if acceptsPushes && !servesBlobs {
             throw IrohError.invalidConfiguration(
                 "acceptsPushes requires servesBlobs: a client-only node cannot receive pushes"
+            )
+        }
+
+        if dhtPublish && !dhtLookup {
+            throw IrohError.invalidConfiguration("dhtPublish requires dhtLookup")
+        }
+        if dhtPublish && !servesBlobs {
+            throw IrohError.invalidConfiguration(
+                "dhtPublish requires servesBlobs: a client-only node is not dialled, so it has nothing to publish"
             )
         }
 

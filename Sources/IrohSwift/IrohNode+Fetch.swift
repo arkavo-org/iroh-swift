@@ -20,15 +20,26 @@ extension IrohNode {
     /// left at `destination`; an existing file there is left untouched. On
     /// success an existing file at `destination` is replaced.
     ///
-    /// Addressing: `directAddrs` (`"ip:port"`) and `relayUrl` are hints for
-    /// reaching `nodeId`. With neither, the node is looked up through the
-    /// endpoint's address lookup (n0 DNS), which needs relays/network enabled.
+    /// Addressing: `directAddrs` and `relayUrl` are hints for reaching `nodeId`.
+    /// A direct address is `"ip:port"` (`"[ipv6]:port"` for IPv6), used as is, or
+    /// `"host:port"`: the host resolves to all its A and AAAA records, through
+    /// public DNS-over-HTTPS resolvers (Cloudflare, Quad9) first and the
+    /// device's system resolver only if none answers, and each becomes one
+    /// address to dial. DNS cannot impersonate the node: the QUIC handshake
+    /// checks `nodeId`, so a wrong answer only fails the connection. If hostnames
+    /// are all that was given and none resolves, the fetch fails with
+    /// `IrohError.fetchFailed`.
+    ///
+    /// With no `directAddrs` and no `relayUrl`, the node is looked up through the
+    /// endpoint's address lookup: n0 DNS (needs relays/network enabled), plus the
+    /// Mainline DHT when this node was created with `IrohConfig.dhtLookup`.
     ///
     /// - Parameters:
     ///   - hash: The blob's BLAKE3 hash, 64 hex characters.
     ///   - nodeId: The endpoint id of the node to fetch from, 64 hex characters.
     ///   - relayUrl: Optional relay URL of the remote node.
-    ///   - directAddrs: Optional direct `ip:port` addresses of the remote node.
+    ///   - directAddrs: Optional direct addresses of the remote node, `"ip:port"` or
+    ///     `"host:port"` (see above).
     ///   - destination: File URL to write the blob to. Its directory must exist.
     ///   - maxSize: Largest blob size, in bytes, to accept.
     ///   - progress: Called with cumulative `(downloaded, total)` byte counts:
