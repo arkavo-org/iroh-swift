@@ -55,6 +55,12 @@ pub struct IrohNodeConfig {
     /// fails node creation. When false, a serving node refuses push requests
     /// and writes nothing; peers can still download blobs from it.
     pub accepts_pushes: bool,
+    /// Whether to resolve endpoint IDs on the BitTorrent Mainline DHT, so a
+    /// node can be fetched from or pushed to by ID alone (default: false).
+    pub dht_lookup: bool,
+    /// Whether to also publish this node's address to the DHT (default: false).
+    /// Requires `dht_lookup` and `serves_blobs`; otherwise node creation fails.
+    pub dht_publish: bool,
 }
 
 /// Options for put/get operations.
@@ -473,16 +479,22 @@ pub extern "C" fn iroh_node_create(config: IrohNodeConfig, callback: IrohNodeCre
     let docs_enabled = config.docs_enabled;
     let serves_blobs = config.serves_blobs;
     let accepts_pushes = config.accepts_pushes;
+    let options = crate::node::NodeOptions {
+        dht_lookup: config.dht_lookup,
+        dht_publish: config.dht_publish,
+        ..Default::default()
+    };
 
     // Create the node synchronously
     // Note: Swift should call this from a background thread/task
-    match IrohNode::new(
+    match IrohNode::new_with_options(
         storage_path,
         relay_enabled,
         custom_relay_url,
         docs_enabled,
         serves_blobs,
         accepts_pushes,
+        options,
     ) {
         Ok(node) => {
             // Box the node and convert to raw pointer
@@ -2514,12 +2526,12 @@ pub unsafe extern "C" fn iroh_fetch_from_node(
         let addrs = unsafe { str_array(direct_addrs, direct_addrs_len) }?;
         let destination =
             PathBuf::from(unsafe { required_str(destination_path, "destination_path") }?);
-        let remote = crate::node::remote_endpoint_addr(node_id, relay, &addrs)
+        let remote = crate::resolve::RemoteTarget::parse(node_id, relay, &addrs)
             .map_err(|e| format!("{:#}", e))?;
         Ok((hash, remote, destination))
     })();
 
-    let (hash, remote, destination) = match parsed {
+    let (hash, target, destination) = match parsed {
         Ok(parsed) => parsed,
         Err(message) => {
             completion.fail(IrohOperationErrorCode::Failed, 0, message);
@@ -2535,17 +2547,24 @@ pub unsafe extern "C" fn iroh_fetch_from_node(
     let token = operation_token(cancel_token);
     let endpoint = node.endpoint().clone();
     let shutdown = node.shutdown_token();
+    let resolver = node.host_resolver().clone();
     node.runtime().spawn(async move {
+        // Hostnames are resolved inside the cancellable future, so a cancel or
+        // a node shutdown also ends a slow DNS lookup.
         let result = crate::node::run_cancellable(
-            crate::node::fetch_to_path(
-                &endpoint,
-                hash,
-                remote,
-                &destination,
-                max_size,
-                &token,
-                |downloaded, total| completion.progress(downloaded, total),
-            ),
+            async {
+                let remote = resolver.resolve_target(target).await?;
+                crate::node::fetch_to_path(
+                    &endpoint,
+                    hash,
+                    remote,
+                    &destination,
+                    max_size,
+                    &token,
+                    |downloaded, total| completion.progress(downloaded, total),
+                )
+                .await
+            },
             &token,
             &shutdown,
         )
@@ -2604,12 +2623,12 @@ pub unsafe extern "C" fn iroh_push_file_to_node(
         let relay = unsafe { optional_str(relay_url, "relay_url") }?;
         let addrs = unsafe { str_array(direct_addrs, direct_addrs_len) }?;
         let path = PathBuf::from(unsafe { required_str(file_path, "file_path") }?);
-        let remote = crate::node::remote_endpoint_addr(node_id, relay, &addrs)
+        let remote = crate::resolve::RemoteTarget::parse(node_id, relay, &addrs)
             .map_err(|e| format!("{:#}", e))?;
         Ok((remote, path))
     })();
 
-    let (remote, path) = match parsed {
+    let (target, path) = match parsed {
         Ok(parsed) => parsed,
         Err(message) => {
             completion.fail(IrohOperationErrorCode::Failed, message);
@@ -2626,9 +2645,13 @@ pub unsafe extern "C" fn iroh_push_file_to_node(
     let endpoint = node.endpoint().clone();
     let store = node.store().clone();
     let shutdown = node.shutdown_token();
+    let resolver = node.host_resolver().clone();
     node.runtime().spawn(async move {
         let result = crate::node::run_cancellable(
-            crate::node::push_path(&endpoint, &store, &path, remote),
+            async {
+                let remote = resolver.resolve_target(target).await?;
+                crate::node::push_path(&endpoint, &store, &path, remote).await
+            },
             &token,
             &shutdown,
         )

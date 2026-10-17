@@ -8,5 +8,6 @@
 
 mod ffi;
 mod node;
+mod resolve;
 
 pub use ffi::*;

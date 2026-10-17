@@ -3,9 +3,11 @@
 //! Provides a minimal interface for blob storage and retrieval,
 //! with optional Docs (syncing key-value documents) support.
 
+use crate::resolve::{HostResolver, HostResolverConfig, RemoteTarget};
 use anyhow::{Context, Result};
 use bao_tree::io::BaoContentItem;
 use futures_lite::StreamExt;
+use iroh::address_lookup::AddrFilter;
 use iroh::endpoint::{Connection, ReadError, RelayMode, VarInt, presets};
 use iroh::{Endpoint, EndpointAddr, RelayMap, RelayUrl, protocol::Router};
 use iroh_blobs::api::downloader::DownloadProgressItem;
@@ -18,11 +20,30 @@ use iroh_blobs::{ALPN as BLOBS_ALPN, BlobsProtocol, Hash, store::fs::FsStore, ti
 use iroh_docs::protocol::Docs;
 use iroh_gossip::ALPN as GOSSIP_ALPN;
 use iroh_gossip::net::Gossip;
+use iroh_mainline_address_lookup::DhtAddressLookup;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
+
+/// Settings beyond the positional arguments of [`IrohNode::new`].
+#[derive(Debug, Clone, Default)]
+pub struct NodeOptions {
+    /// Resolve endpoint IDs on the BitTorrent Mainline DHT (pkarr), in addition
+    /// to the preset's lookups, so a node can be dialled by ID alone.
+    pub dht_lookup: bool,
+    /// Also publish this node's own address to the DHT. Requires `dht_lookup`
+    /// and a serving node (`serves_blobs`). Only the relay URL is published
+    /// while relays are enabled; with relays disabled the direct addresses are
+    /// (there is nothing else a peer could use).
+    pub dht_publish: bool,
+    /// Replace the DHT bootstrap nodes (`host:port`): a private DHT, or a
+    /// local testnet. `None` keeps the public Mainline bootstrap nodes.
+    pub dht_bootstrap: Option<Vec<String>>,
+    /// How hostnames in direct addresses are resolved.
+    pub host_resolver: HostResolverConfig,
+}
 
 /// Information about an Iroh node.
 pub struct NodeInfo {
@@ -60,6 +81,8 @@ pub struct IrohNode {
     /// Cancelled first on shutdown so in-flight operations report
     /// [`OperationError::NodeShutDown`] instead of an opaque connection error.
     operations: CancellationToken,
+    /// Resolves hostnames in direct addresses (DoH first, then the system resolver).
+    host_resolver: HostResolver,
 }
 
 impl IrohNode {
@@ -79,6 +102,7 @@ impl IrohNode {
     ///
     /// # Errors
     /// Fails if `accepts_pushes` is set without `serves_blobs`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(
         storage_path: PathBuf,
         relay_enabled: bool,
@@ -87,9 +111,41 @@ impl IrohNode {
         serves_blobs: bool,
         accepts_pushes: bool,
     ) -> Result<Self> {
+        Self::new_with_options(
+            storage_path,
+            relay_enabled,
+            custom_relay_url,
+            docs_enabled,
+            serves_blobs,
+            accepts_pushes,
+            NodeOptions::default(),
+        )
+    }
+
+    /// [`IrohNode::new`] with [`NodeOptions`].
+    ///
+    /// # Errors
+    /// Fails if `accepts_pushes` is set without `serves_blobs`, or `dht_publish`
+    /// without `dht_lookup` or without `serves_blobs`.
+    pub fn new_with_options(
+        storage_path: PathBuf,
+        relay_enabled: bool,
+        custom_relay_url: Option<String>,
+        docs_enabled: bool,
+        serves_blobs: bool,
+        accepts_pushes: bool,
+        options: NodeOptions,
+    ) -> Result<Self> {
         if accepts_pushes && !serves_blobs {
             anyhow::bail!("accepts_pushes requires serves_blobs");
         }
+        if options.dht_publish && !options.dht_lookup {
+            anyhow::bail!("dht_publish requires dht_lookup");
+        }
+        if options.dht_publish && !serves_blobs {
+            anyhow::bail!("dht_publish requires serves_blobs");
+        }
+        let host_resolver = HostResolver::new(options.host_resolver.clone());
 
         // Create dedicated runtime for this node
         let runtime = Runtime::new().context("Failed to create Tokio runtime")?;
@@ -111,6 +167,26 @@ impl IrohNode {
                 builder = builder.relay_mode(RelayMode::Custom(relay_map));
             }
             // else: n0 public relays are default when relay_enabled=true
+
+            if options.dht_lookup {
+                let mut lookup = DhtAddressLookup::builder();
+                if let Some(bootstrap) = &options.dht_bootstrap {
+                    let mut dht = n0_mainline::Dht::builder();
+                    dht.bootstrap(bootstrap);
+                    lookup = lookup.dht_builder(dht);
+                }
+                if options.dht_publish {
+                    if !relay_enabled {
+                        // Without a relay URL there is nothing to publish under
+                        // the default relay-only filter; the node is only
+                        // reachable on its direct addresses.
+                        lookup = lookup.addr_filter(AddrFilter::unfiltered());
+                    }
+                } else {
+                    lookup = lookup.no_publish();
+                }
+                builder = builder.address_lookup(lookup);
+            }
 
             let endpoint = builder.bind().await.context("Failed to bind endpoint")?;
 
@@ -203,6 +279,7 @@ impl IrohNode {
             docs,
             event_handler,
             operations: CancellationToken::new(),
+            host_resolver,
         })
     }
 
@@ -242,6 +319,11 @@ impl IrohNode {
     /// [`OperationError::NodeShutDown`].
     pub fn shutdown_token(&self) -> CancellationToken {
         self.operations.clone()
+    }
+
+    /// The resolver for hostnames in direct addresses (cheap to clone).
+    pub fn host_resolver(&self) -> &HostResolver {
+        &self.host_resolver
     }
 
     /// This endpoint's id: the Ed25519 public key as 64 lowercase hex characters.
@@ -438,7 +520,8 @@ impl IrohNode {
     /// * `remote_node_id_hex` - The remote node's ID as a hex string
     /// * `relay_url` - Optional relay URL for routing the connection
     /// * `data` - The bytes to push
-    /// * `direct_addrs` - Optional direct IP:port addresses for local / no-relay connections
+    /// * `direct_addrs` - Optional direct addresses, `IP:port` or `host:port`
+    ///   (hostnames resolve through DoH, then the system resolver)
     pub fn push_to_node(
         &self,
         remote_node_id_hex: &str,
@@ -446,6 +529,8 @@ impl IrohNode {
         data: &[u8],
         direct_addrs: &[String],
     ) -> Result<String> {
+        // Argument errors first, before anything is stored.
+        let target = RemoteTarget::parse(remote_node_id_hex, relay_url, direct_addrs)?;
         self.runtime.block_on(async {
             // Add bytes to local store first
             let tag = self
@@ -454,7 +539,7 @@ impl IrohNode {
                 .await
                 .context("Failed to add bytes to store")?;
 
-            let endpoint_addr = remote_endpoint_addr(remote_node_id_hex, relay_url, direct_addrs)?;
+            let endpoint_addr = self.host_resolver.resolve_target(target).await?;
             push_hash(&self.endpoint, &self.store, tag.hash, endpoint_addr).await?;
 
             Ok(hex::encode(tag.hash.as_bytes()))
@@ -467,7 +552,8 @@ impl IrohNode {
     /// * `remote_node_id_hex` - The remote node's ID as a hex string
     /// * `relay_url` - Optional relay URL for routing the connection
     /// * `data` - The bytes to push
-    /// * `direct_addrs` - Optional direct IP:port addresses for local / no-relay connections
+    /// * `direct_addrs` - Optional direct addresses, `IP:port` or `host:port`
+    ///   (hostnames resolve through DoH, then the system resolver)
     /// * `timeout_ms` - Timeout in milliseconds (0 = no timeout)
     pub fn push_to_node_with_timeout(
         &self,
@@ -477,6 +563,7 @@ impl IrohNode {
         direct_addrs: &[String],
         timeout_ms: u64,
     ) -> Result<String> {
+        let target = RemoteTarget::parse(remote_node_id_hex, relay_url, direct_addrs)?;
         self.runtime.block_on(async {
             let fut = async {
                 let tag = self
@@ -485,8 +572,7 @@ impl IrohNode {
                     .await
                     .context("Failed to add bytes to store")?;
 
-                let endpoint_addr =
-                    remote_endpoint_addr(remote_node_id_hex, relay_url, direct_addrs)?;
+                let endpoint_addr = self.host_resolver.resolve_target(target).await?;
                 push_hash(&self.endpoint, &self.store, tag.hash, endpoint_addr).await?;
 
                 Ok::<_, anyhow::Error>(hex::encode(tag.hash.as_bytes()))
@@ -546,7 +632,9 @@ impl IrohNode {
             docs,
             event_handler,
             operations,
+            host_resolver,
         } = self;
+        drop(host_resolver);
 
         // Stop in-flight fetches and file pushes first, before the endpoint goes
         // away: each reports NodeShutDown (a fetch also removes its temp file).
@@ -572,33 +660,6 @@ impl IrohNode {
 
         result
     }
-}
-
-/// Build the address of a remote node from its hex id, an optional relay URL
-/// and optional direct `ip:port` addresses.
-///
-/// With neither a relay URL nor direct addresses, iroh resolves the node
-/// through the endpoint's address lookup (n0 DNS/pkarr with the default preset).
-pub fn remote_endpoint_addr(
-    remote_node_id_hex: &str,
-    relay_url: Option<&str>,
-    direct_addrs: &[String],
-) -> Result<EndpointAddr> {
-    let node_id: iroh::EndpointId = remote_node_id_hex
-        .parse()
-        .context("Failed to parse remote node ID")?;
-
-    let mut endpoint_addr = EndpointAddr::from(node_id);
-    if let Some(url) = relay_url {
-        let relay_url: RelayUrl = url.parse().context("Invalid relay URL")?;
-        endpoint_addr = endpoint_addr.with_relay_url(relay_url);
-    }
-    for addr_str in direct_addrs {
-        let socket_addr: std::net::SocketAddr =
-            addr_str.parse().context("Invalid direct address")?;
-        endpoint_addr = endpoint_addr.with_ip_addr(socket_addr);
-    }
-    Ok(endpoint_addr)
 }
 
 /// Push a blob that is already in `store` to a remote node.
@@ -980,6 +1041,24 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+
+    /// The address of a node from literal `IP:port` entries (no DNS).
+    fn remote_endpoint_addr(
+        id: &str,
+        relay_url: Option<&str>,
+        direct_addrs: &[String],
+    ) -> Result<EndpointAddr> {
+        let target = RemoteTarget::parse(id, relay_url, direct_addrs)?;
+        assert!(target.hosts.is_empty(), "literal addresses only");
+        let mut addr = EndpointAddr::from(target.id);
+        if let Some(relay) = target.relay {
+            addr = addr.with_relay_url(relay);
+        }
+        for socket in target.sockets {
+            addr = addr.with_ip_addr(socket);
+        }
+        Ok(addr)
+    }
 
     fn local_node(dir: &tempfile::TempDir, serves_blobs: bool) -> IrohNode {
         IrohNode::new(
@@ -1468,6 +1547,344 @@ mod tests {
 
         node_a.shutdown().unwrap();
         node_b.shutdown().unwrap();
+    }
+
+    /// A node whose DNS-over-HTTPS list points at a closed local port, so the
+    /// DoH stage answers nothing (fast) and every lookup reaches the system
+    /// resolver, with no dependence on the internet.
+    fn node_with_dead_doh(dir: &tempfile::TempDir, serves_blobs: bool) -> IrohNode {
+        use crate::resolve::HostResolverConfig;
+        use iroh::dns::NameserverConfig;
+        let options = NodeOptions {
+            host_resolver: HostResolverConfig {
+                doh_nameservers: vec![
+                    NameserverConfig::https("127.0.0.1".parse().unwrap())
+                        .with_port(1)
+                        .with_tls_server_name("doh.invalid"),
+                ],
+                doh_timeout: Duration::from_millis(500),
+                system_timeout: Duration::from_secs(3),
+            },
+            ..NodeOptions::default()
+        };
+        IrohNode::new_with_options(
+            dir.path().to_path_buf(),
+            false,
+            None,
+            false,
+            serves_blobs,
+            false,
+            options,
+        )
+        .unwrap()
+    }
+
+    /// Port of the server's first IPv4 direct address.
+    fn server_port(server: &IrohNode) -> u16 {
+        direct_addrs(server)
+            .iter()
+            .filter_map(|a| a.parse::<std::net::SocketAddr>().ok())
+            .find(|a| a.is_ipv4())
+            .expect("an IPv4 direct address")
+            .port()
+    }
+
+    #[test]
+    fn test_localhost_resolves_via_system_when_doh_is_unreachable() {
+        let (dir, dir_server) = (tempdir().unwrap(), tempdir().unwrap());
+        let client = node_with_dead_doh(&dir, false);
+        let server = local_node(&dir_server, true);
+        let port = server_port(&server);
+
+        let target =
+            RemoteTarget::parse(&server.endpoint_id(), None, &[format!("localhost:{port}")])
+                .unwrap();
+        let start = std::time::Instant::now();
+        let addr = client
+            .runtime()
+            .block_on(client.host_resolver().resolve_target(target))
+            .unwrap();
+        assert!(start.elapsed() < Duration::from_secs(3));
+        let ips: Vec<_> = addr.ip_addrs().collect();
+        assert!(!ips.is_empty());
+        assert!(
+            ips.iter().all(|a| a.ip().is_loopback() && a.port() == port),
+            "{ips:?}"
+        );
+
+        client.shutdown().unwrap();
+        server.shutdown().unwrap();
+    }
+
+    /// The node dials a serving node given only `localhost:<port>`, the way an
+    /// app dials `iroh.arkavo.net:11204`.
+    #[test]
+    fn test_fetch_from_serving_node_by_hostname() {
+        let (dir_a, dir_b, out) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let server = local_node(&dir_a, true);
+        let client = node_with_dead_doh(&dir_b, false);
+
+        let data = test_bytes(300_000);
+        let ticket = server.put(&data).unwrap();
+        let hash = ticket.parse::<BlobTicket>().unwrap().hash();
+
+        let target = RemoteTarget::parse(
+            &server.endpoint_id(),
+            None,
+            &[format!("localhost:{}", server_port(&server))],
+        )
+        .unwrap();
+        let dest = out.path().join("by-host.bin");
+        let token = CancellationToken::new();
+        let result = client.runtime().block_on(async {
+            let addr = client.host_resolver().resolve_target(target).await?;
+            fetch_to_path(
+                client.endpoint(),
+                hash,
+                addr,
+                &dest,
+                u64::MAX,
+                &token,
+                |_, _| {},
+            )
+            .await
+        });
+        assert_eq!(result.unwrap(), data.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+
+        client.shutdown().unwrap();
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_push_to_node_by_hostname() {
+        let (dir_a, dir_b) = (tempdir().unwrap(), tempdir().unwrap());
+        let server = push_receiver(&dir_a);
+        let client = node_with_dead_doh(&dir_b, false);
+
+        let data = test_bytes(2_000);
+        let hash = client
+            .push_to_node(
+                &server.endpoint_id(),
+                None,
+                &data,
+                &[format!("localhost:{}", server_port(&server))],
+            )
+            .unwrap();
+        assert_eq!(hash, blake3_hex(&data));
+        let parsed = Hash::from_bytes(hex::decode(&hash).unwrap().try_into().unwrap());
+        assert!(
+            server
+                .runtime()
+                .block_on(server.store().has(parsed))
+                .unwrap()
+        );
+
+        client.shutdown().unwrap();
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_bad_host_fails_cleanly_and_quickly() {
+        let (dir_a, dir_b) = (tempdir().unwrap(), tempdir().unwrap());
+        let server = local_node(&dir_a, true);
+        let client = node_with_dead_doh(&dir_b, false);
+
+        let start = std::time::Instant::now();
+        let err = client
+            .push_to_node(
+                &server.endpoint_id(),
+                None,
+                b"x",
+                &["no-such-host.invalid:11204".to_string()],
+            )
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("Could not resolve"), "{message}");
+        assert!(message.contains("no-such-host.invalid:11204"), "{message}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+
+        // A malformed entry is rejected before any DNS or store work.
+        let err = client
+            .push_to_node(&server.endpoint_id(), None, b"x", &["host:0".to_string()])
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Invalid direct address"),
+            "{err:#}"
+        );
+
+        client.shutdown().unwrap();
+        server.shutdown().unwrap();
+    }
+
+    /// Needs internet: the default public DoH resolvers answer for a real name.
+    /// `cargo test -- --ignored test_default_doh`
+    #[test]
+    #[ignore = "needs internet"]
+    fn test_default_doh_resolves_public_name() {
+        let resolver = HostResolver::new(HostResolverConfig::default());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ips = rt.block_on(resolver.resolve_host("one.one.one.one"));
+        assert!(ips.iter().any(|ip| ip.to_string() == "1.1.1.1"), "{ips:?}");
+    }
+
+    /// A node on a private DHT (the local testnet), relays off.
+    fn dht_node(
+        dir: &tempfile::TempDir,
+        bootstrap: &[String],
+        serves_blobs: bool,
+        publish: bool,
+    ) -> IrohNode {
+        let options = NodeOptions {
+            dht_lookup: true,
+            dht_publish: publish,
+            dht_bootstrap: Some(bootstrap.to_vec()),
+            ..NodeOptions::default()
+        };
+        IrohNode::new_with_options(
+            dir.path().to_path_buf(),
+            false,
+            None,
+            false,
+            serves_blobs,
+            false,
+            options,
+        )
+        .unwrap()
+    }
+
+    /// Node A publishes itself to a local DHT testnet; node B, which knows
+    /// nothing but A's endpoint ID, finds A through the DHT and fetches from it.
+    ///
+    /// Offline-safe: the DHT is 3 local nodes on 127.0.0.1. Polls like
+    /// iroh-mainline-address-lookup's own smoke test, because publishing is
+    /// fire-and-forget.
+    #[test]
+    fn test_fetch_by_endpoint_id_alone_through_dht_testnet() {
+        let dht_runtime = tokio::runtime::Runtime::new().unwrap();
+        let testnet = dht_runtime
+            .block_on(n0_mainline::Testnet::new(3))
+            .expect("local DHT testnet");
+
+        let (dir_a, dir_b, out) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let server = dht_node(&dir_a, &testnet.bootstrap, true, true);
+        let client = dht_node(&dir_b, &testnet.bootstrap, false, false);
+
+        let data = test_bytes(200_000);
+        let hash = server
+            .put(&data)
+            .unwrap()
+            .parse::<BlobTicket>()
+            .unwrap()
+            .hash();
+
+        let id: iroh::EndpointId = server.endpoint_id().parse().unwrap();
+        let dest = out.path().join("via-dht.bin");
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
+        let result = loop {
+            // No relay URL, no direct address: only address lookup can find A.
+            let attempt = client.runtime().block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    fetch_to_path(
+                        client.endpoint(),
+                        hash,
+                        EndpointAddr::from(id),
+                        &dest,
+                        u64::MAX,
+                        &CancellationToken::new(),
+                        |_, _| {},
+                    ),
+                )
+                .await
+            });
+            match attempt {
+                Ok(Ok(size)) => break Ok(size),
+                other if std::time::Instant::now() > deadline => break Err(format!("{other:?}")),
+                _ => std::thread::sleep(Duration::from_millis(500)),
+            }
+        };
+        assert_eq!(result.expect("fetched through the DHT"), data.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+
+        client.shutdown().unwrap();
+        server.shutdown().unwrap();
+        drop(testnet);
+    }
+
+    /// Without `dht_lookup` the same ID-only fetch has no way to find a
+    /// relay-less node on a private DHT and fails (the control for the test above).
+    #[test]
+    fn test_id_only_fetch_fails_without_dht_lookup() {
+        let dht_runtime = tokio::runtime::Runtime::new().unwrap();
+        let testnet = dht_runtime
+            .block_on(n0_mainline::Testnet::new(3))
+            .expect("local DHT testnet");
+
+        let (dir_a, dir_b, out) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let server = dht_node(&dir_a, &testnet.bootstrap, true, true);
+        let client = local_node(&dir_b, false);
+
+        let hash = server
+            .put(b"hello")
+            .unwrap()
+            .parse::<BlobTicket>()
+            .unwrap()
+            .hash();
+        let id: iroh::EndpointId = server.endpoint_id().parse().unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        let result = client.runtime().block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(4),
+                fetch_to_path(
+                    client.endpoint(),
+                    hash,
+                    EndpointAddr::from(id),
+                    &out.path().join("nope.bin"),
+                    u64::MAX,
+                    &CancellationToken::new(),
+                    |_, _| {},
+                ),
+            )
+            .await
+        });
+        assert!(!matches!(result, Ok(Ok(_))), "{result:?}");
+
+        client.shutdown().unwrap();
+        server.shutdown().unwrap();
+        drop(testnet);
+    }
+
+    #[test]
+    fn test_dht_publish_requires_lookup_and_serving() {
+        let dir = tempdir().unwrap();
+        let build = |dht_lookup, dht_publish, serves_blobs| {
+            IrohNode::new_with_options(
+                dir.path().to_path_buf(),
+                false,
+                None,
+                false,
+                serves_blobs,
+                false,
+                NodeOptions {
+                    dht_lookup,
+                    dht_publish,
+                    ..NodeOptions::default()
+                },
+            )
+        };
+        let err = build(false, true, true)
+            .err()
+            .expect("publish without lookup");
+        assert!(err.to_string().contains("dht_publish requires dht_lookup"));
+        let err = build(true, true, false).err().expect("client-only publish");
+        assert!(
+            err.to_string()
+                .contains("dht_publish requires serves_blobs")
+        );
     }
 
     /// Push to a live remote node.

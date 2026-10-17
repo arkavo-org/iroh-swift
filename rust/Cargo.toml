@@ -26,6 +26,10 @@ hex = "0.4"
 rand = "0.10"
 # BLAKE3 for `iroh_blake3_hex` (same crate iroh-blobs hashes with).
 blake3 = "1.8"
+# Pkarr address lookup on the BitTorrent Mainline DHT (opt-in via `dht_lookup`).
+iroh-mainline-address-lookup = "0.6"
+# The DHT client the lookup runs on (bootstrap nodes, `Testnet` in tests).
+n0-mainline = "0.7"
 # Verified-streaming types for fetching a blob straight into a file
 # (`iroh_blobs::get::fsm` yields `bao_tree` content items). Same 0.16 line iroh-blobs uses.
 bao-tree = "0.16"
