@@ -92,8 +92,10 @@ Swift Layer (IrohSwift)           Rust FFI Layer                Iroh Libraries
   `FallbackMode::Never`, 5 s), then only if they return no address the system resolver
   (`with_system_defaults()`, also reads the hosts file, 5 s). Literal `IP:port` does no DNS.
   Hostnames that fail are ignored unless nothing else is left (no relay, no literal address),
-  then the call fails with `Failed` (Swift `fetchFailed` / `pushFailed`); no direct addresses
-  at all is left to address lookup. Both resolvers live on `IrohNode` (`NodeOptions.host_resolver`
+  then the call fails with `Failed` (Swift `fetchFailed` / `pushFailed`), except with
+  `dhtLookup` on (`HostResolverConfig.fall_through_to_lookup`, set by `IrohNode`): then it logs
+  a warning and dials by endpoint ID alone so the DHT / n0 lookup can find the node during a DNS
+  outage. No direct addresses at all is always left to address lookup. Both resolvers live on `IrohNode` (`NodeOptions.host_resolver`
   overrides the DoH list and timeouts, Rust only; tests point it at `127.0.0.1:1`).
 - `IrohConfig.dhtLookup` / `dhtPublish` -> `NodeOptions` -> `DhtAddressLookup` on the endpoint
   builder (`iroh-mainline-address-lookup`). Lookup alone uses `no_publish()`. `dhtPublish`

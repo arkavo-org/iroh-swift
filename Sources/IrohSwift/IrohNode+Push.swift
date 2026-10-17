@@ -26,7 +26,8 @@ extension IrohNode {
     /// - Throws: `IrohError.nodeClosed` if the node is closed,
     ///           `IrohError.pushFailed` if the push fails, including a malformed
     ///           direct address or hostnames that resolve to nothing with no relay
-    ///           URL or other address to fall back on,
+    ///           URL or other address to fall back on (unless `IrohConfig.dhtLookup`
+    ///           is on: then the push dials by `nodeId` alone),
     ///           `CancellationError` if the task was cancelled.
     public func pushToNode(
         nodeId: String,

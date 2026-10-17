@@ -46,6 +46,11 @@ pub struct HostResolverConfig {
     pub doh_timeout: Duration,
     /// Time the system resolver stage gets per host.
     pub system_timeout: Duration,
+    /// When hostnames were given but none resolved and nothing else is left
+    /// (no relay URL, no literal address), carry on with the endpoint ID alone
+    /// so address lookup (the DHT, n0) can find the node, instead of failing.
+    /// [`crate::node::IrohNode`] sets this when `dht_lookup` is on.
+    pub fall_through_to_lookup: bool,
 }
 
 impl Default for HostResolverConfig {
@@ -54,6 +59,7 @@ impl Default for HostResolverConfig {
             doh_nameservers: default_doh_nameservers(),
             doh_timeout: DEFAULT_DOH_TIMEOUT,
             system_timeout: DEFAULT_SYSTEM_TIMEOUT,
+            fall_through_to_lookup: false,
         }
     }
 }
@@ -69,6 +75,7 @@ pub struct HostResolver {
     system: Arc<DnsResolver>,
     doh_timeout: Duration,
     system_timeout: Duration,
+    fall_through_to_lookup: bool,
 }
 
 impl HostResolver {
@@ -95,13 +102,24 @@ impl HostResolver {
             system: Arc::new(system),
             doh_timeout: config.doh_timeout,
             system_timeout: config.system_timeout,
+            fall_through_to_lookup: config.fall_through_to_lookup,
         }
     }
 
     /// Use these resolvers instead of the built ones (tests).
     #[cfg(test)]
     fn from_resolvers(doh: Option<DnsResolver>, system: DnsResolver) -> Self {
+        Self::from_resolvers_with(doh, system, false)
+    }
+
+    #[cfg(test)]
+    fn from_resolvers_with(
+        doh: Option<DnsResolver>,
+        system: DnsResolver,
+        fall_through_to_lookup: bool,
+    ) -> Self {
         Self {
+            fall_through_to_lookup,
             doh: doh.map(Arc::new),
             system: Arc::new(system),
             doh_timeout: Duration::from_secs(2),
@@ -125,8 +143,10 @@ impl HostResolver {
     ///
     /// A hostname that does not resolve contributes nothing. It is an error
     /// only if the caller named hostnames, none resolved, and there is no relay
-    /// URL or literal address left to try; with none of those given at all,
-    /// the endpoint's address lookup (n0 DNS, or the DHT) finds the node.
+    /// URL or literal address left to try, and the resolver was not configured
+    /// to `fall_through_to_lookup` (DHT lookup on); then the address is just
+    /// the endpoint ID and the endpoint's address lookup (n0 DNS, the DHT)
+    /// finds the node, exactly as with no direct addresses at all.
     pub async fn resolve_target(&self, target: RemoteTarget) -> Result<EndpointAddr> {
         let RemoteTarget {
             id,
@@ -163,6 +183,13 @@ impl HostResolver {
 
         if !hosts.is_empty() && !resolved_any && relay.is_none() && sockets.is_empty() {
             let names: Vec<String> = hosts.iter().map(|(h, p)| format!("{h}:{p}")).collect();
+            if self.fall_through_to_lookup {
+                tracing::warn!(
+                    "could not resolve {}; falling back to address lookup by endpoint ID",
+                    names.join(", ")
+                );
+                return Ok(endpoint_addr);
+            }
             anyhow::bail!(
                 "Could not resolve {} to any address (tried DNS-over-HTTPS, then the system resolver)",
                 names.join(", ")
@@ -547,6 +574,15 @@ mod tests {
         .unwrap();
         let addr = block_on(resolver.resolve_target(t)).unwrap();
         assert_eq!(addr.relay_urls().count(), 1);
+
+        // With fall-through (DHT lookup on) the same input is not an error:
+        // the address is the bare endpoint ID, left to address lookup.
+        let (doh, _) = fixed(&[]);
+        let (system, _) = fixed(&[]);
+        let lenient = HostResolver::from_resolvers_with(Some(doh), system, true);
+        let t = target(&["nowhere.invalid:80"]).unwrap();
+        let addr = block_on(lenient.resolve_target(t)).unwrap();
+        assert!(addr.is_empty());
 
         // No direct addresses at all: untouched, left to address lookup.
         let t = target(&[]).unwrap();

@@ -145,7 +145,11 @@ impl IrohNode {
         if options.dht_publish && !serves_blobs {
             anyhow::bail!("dht_publish requires serves_blobs");
         }
-        let host_resolver = HostResolver::new(options.host_resolver.clone());
+        // With DHT lookup on, unresolvable hostnames must not stop a dial by ID.
+        let host_resolver = HostResolver::new(HostResolverConfig {
+            fall_through_to_lookup: options.dht_lookup,
+            ..options.host_resolver.clone()
+        });
 
         // Create dedicated runtime for this node
         let runtime = Runtime::new().context("Failed to create Tokio runtime")?;
@@ -1564,6 +1568,7 @@ mod tests {
                 ],
                 doh_timeout: Duration::from_millis(500),
                 system_timeout: Duration::from_secs(3),
+                ..HostResolverConfig::default()
             },
             ..NodeOptions::default()
         };
@@ -1799,6 +1804,94 @@ mod tests {
                         |_, _| {},
                     ),
                 )
+                .await
+            });
+            match attempt {
+                Ok(Ok(size)) => break Ok(size),
+                other if std::time::Instant::now() > deadline => break Err(format!("{other:?}")),
+                _ => std::thread::sleep(Duration::from_millis(500)),
+            }
+        };
+        assert_eq!(result.expect("fetched through the DHT"), data.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+
+        client.shutdown().unwrap();
+        server.shutdown().unwrap();
+        drop(testnet);
+    }
+
+    /// DHT lookup on, and the only direct address is a hostname that does not
+    /// resolve (a DNS outage): the fetch falls through to address lookup by
+    /// endpoint ID and still finds the node on the DHT.
+    #[test]
+    fn test_unresolvable_host_falls_through_to_dht_lookup() {
+        use crate::resolve::HostResolverConfig;
+        use iroh::dns::NameserverConfig;
+
+        let dht_runtime = tokio::runtime::Runtime::new().unwrap();
+        let testnet = dht_runtime
+            .block_on(n0_mainline::Testnet::new(3))
+            .expect("local DHT testnet");
+
+        let (dir_a, dir_b, out) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let server = dht_node(&dir_a, &testnet.bootstrap, true, true);
+        let client = IrohNode::new_with_options(
+            dir_b.path().to_path_buf(),
+            false,
+            None,
+            false,
+            false,
+            false,
+            NodeOptions {
+                dht_lookup: true,
+                dht_bootstrap: Some(testnet.bootstrap.clone()),
+                host_resolver: HostResolverConfig {
+                    doh_nameservers: vec![
+                        NameserverConfig::https("127.0.0.1".parse().unwrap())
+                            .with_port(1)
+                            .with_tls_server_name("doh.invalid"),
+                    ],
+                    doh_timeout: Duration::from_millis(500),
+                    system_timeout: Duration::from_secs(3),
+                    ..HostResolverConfig::default()
+                },
+                ..NodeOptions::default()
+            },
+        )
+        .unwrap();
+
+        let data = test_bytes(100_000);
+        let hash = server
+            .put(&data)
+            .unwrap()
+            .parse::<BlobTicket>()
+            .unwrap()
+            .hash();
+        let server_id = server.endpoint_id();
+        let dest = out.path().join("fallthrough.bin");
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
+        let result = loop {
+            let attempt = client.runtime().block_on(async {
+                tokio::time::timeout(Duration::from_secs(8), async {
+                    let target = RemoteTarget::parse(
+                        &server_id,
+                        None,
+                        &["no-such-host.invalid:11204".to_string()],
+                    )?;
+                    let addr = client.host_resolver().resolve_target(target).await?;
+                    assert_eq!(addr.ip_addrs().count(), 0, "nothing resolved");
+
+                    fetch_to_path(
+                        client.endpoint(),
+                        hash,
+                        addr,
+                        &dest,
+                        u64::MAX,
+                        &CancellationToken::new(),
+                        |_, _| {},
+                    )
+                    .await
+                })
                 .await
             });
             match attempt {

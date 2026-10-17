@@ -135,9 +135,12 @@ Failure: a malformed entry (`host-without-port`, `host:0`, an unbracketed IPv6
 address) fails the call before anything is sent. If hostnames were given, none
 resolved, and there is no `relayUrl` and no literal address left, the call fails
 with a message naming the hosts: `IrohError.fetchFailed` for `fetch`,
-`IrohError.pushFailed` for `pushToNode`. A hostname that fails is ignored when a
-relay URL or another address is available. Cancelling the task also cancels a
-slow lookup.
+`IrohError.pushFailed` for `pushToNode`. **Unless the node was created with
+`dhtLookup: true`:** then the call does not fail but carries on with the endpoint
+ID alone, exactly like a call with no addresses, so the DHT (and n0's lookups) can
+still find the node when DNS is down (a warning is logged). A hostname that fails
+is also ignored when a relay URL or another address is available. Cancelling the
+task also cancels a slow lookup.
 
 ### Find a Node by ID on the DHT
 

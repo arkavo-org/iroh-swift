@@ -28,7 +28,9 @@ extension IrohNode {
     /// address to dial. DNS cannot impersonate the node: the QUIC handshake
     /// checks `nodeId`, so a wrong answer only fails the connection. If hostnames
     /// are all that was given and none resolves, the fetch fails with
-    /// `IrohError.fetchFailed`.
+    /// `IrohError.fetchFailed`, unless this node has `IrohConfig.dhtLookup`: then
+    /// it carries on with `nodeId` alone and the DHT / n0 lookup can still find
+    /// the node during a DNS outage.
     ///
     /// With no `directAddrs` and no `relayUrl`, the node is looked up through the
     /// endpoint's address lookup: n0 DNS (needs relays/network enabled), plus the
