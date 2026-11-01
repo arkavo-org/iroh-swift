@@ -353,7 +353,10 @@ if IrohAuthor.exists(identifier: "default") {
 |------|-------------|
 | `.afterFirstUnlock` | Available after first unlock (default, recommended) |
 | `.whenUnlocked` | Only when device is unlocked |
-| `.always` | Deprecated: same as `.afterFirstUnlock` (Apple deprecated `kSecAttrAccessibleAlways`) |
+
+`.always` was removed: Apple deprecated `kSecAttrAccessibleAlways`. Use
+`.afterFirstUnlock`. Authors saved with `.always` still load, since lookups do not
+filter on accessibility.
 
 ## CLI Demo
 

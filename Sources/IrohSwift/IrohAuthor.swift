@@ -15,18 +15,9 @@ public enum KeychainAccessibility: Sendable {
     /// The data is only accessible when the device is unlocked.
     case whenUnlocked
 
-    /// Same as `.afterFirstUnlock`.
-    ///
-    /// Apple deprecated `kSecAttrAccessibleAlways` in iOS 12 and names
-    /// `kSecAttrAccessibleAfterFirstUnlock` as its replacement, so new items are
-    /// stored with that level. Items saved earlier with `.always` stay readable:
-    /// lookups do not filter on accessibility.
-    @available(*, deprecated, renamed: "afterFirstUnlock")
-    case always
-
     var secValue: CFString {
         switch self {
-        case .afterFirstUnlock, .always: return kSecAttrAccessibleAfterFirstUnlock
+        case .afterFirstUnlock: return kSecAttrAccessibleAfterFirstUnlock
         case .whenUnlocked: return kSecAttrAccessibleWhenUnlocked
         }
     }

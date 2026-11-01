@@ -79,27 +79,16 @@ final class IrohAuthorTests: XCTestCase {
         XCTAssertEqual(loaded.publicKey, author.publicKey)
     }
 
-    /// `.always` maps to Apple's replacement for the deprecated `kSecAttrAccessibleAlways`.
-    @available(*, deprecated)
-    func testKeychainAccessibilityAlwaysMapsToAfterFirstUnlock() {
+    /// Each accessibility level maps to its Keychain constant.
+    func testKeychainAccessibilityValues() {
         XCTAssertEqual(
-            KeychainAccessibility.always.secValue as String,
+            KeychainAccessibility.afterFirstUnlock.secValue as String,
             kSecAttrAccessibleAfterFirstUnlock as String
         )
-    }
-
-    /// Test KeychainAccessibility enum values.
-    @available(*, deprecated)
-    func testKeychainAccessibilityValues() {
-        // Just verify the enum cases exist and have different secValues
-        let afterFirstUnlock = KeychainAccessibility.afterFirstUnlock
-        let whenUnlocked = KeychainAccessibility.whenUnlocked
-        let always = KeychainAccessibility.always
-
-        // Each should return a CFString
-        XCTAssertNotNil(afterFirstUnlock.secValue)
-        XCTAssertNotNil(whenUnlocked.secValue)
-        XCTAssertNotNil(always.secValue)
+        XCTAssertEqual(
+            KeychainAccessibility.whenUnlocked.secValue as String,
+            kSecAttrAccessibleWhenUnlocked as String
+        )
     }
 
     // Note: Keychain tests (getOrCreate, save, load, delete) require actual Keychain access
