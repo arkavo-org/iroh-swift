@@ -1741,10 +1741,10 @@ pub unsafe extern "C" fn iroh_doc_read_content(
         }
     };
 
-    let hash: iroh_blobs::Hash = match hash_str.parse() {
+    let hash: iroh_blobs::Hash = match parse_hash_str(hash_str) {
         Ok(h) => h,
         Err(e) => {
-            let error = c_string(format!("Invalid hash: {}", e));
+            let error = c_string(e);
             (callback.on_failure)(callback.userdata, error);
             return;
         }
@@ -2161,10 +2161,10 @@ pub unsafe extern "C" fn iroh_blob_tag_set(
         }
     };
 
-    let hash: Hash = match hash_string.parse() {
+    let hash: Hash = match parse_hash_str(&hash_string) {
         Ok(h) => h,
         Err(e) => {
-            let error = c_string(format!("Invalid hash: {}", e));
+            let error = c_string(e);
             (callback.on_failure)(callback.userdata, error);
             return;
         }
@@ -2234,10 +2234,10 @@ pub unsafe extern "C" fn iroh_blob_ticket_create(
         }
     };
 
-    let hash: Hash = match hash_string.parse() {
+    let hash: Hash = match parse_hash_str(&hash_string) {
         Ok(h) => h,
         Err(e) => {
-            let error = c_string(format!("Invalid hash: {}", e));
+            let error = c_string(e);
             (callback.on_failure)(callback.userdata, error);
             return;
         }
@@ -2885,6 +2885,23 @@ fn parse_blob_hash(s: &str) -> Result<Hash, String> {
     Ok(Hash::from_bytes(bytes))
 }
 
+/// Parse a blob hash given as 64 hex or 52 base32 characters.
+///
+/// iroh-blobs 0.103's `Hash::from_str` panics on base32 input that does not
+/// decode to exactly 32 bytes (fixed upstream in 0.104, n0-computer/iroh-blobs#282),
+/// and a panic in an `extern "C" fn` aborts the host app. Checking the length
+/// first keeps every other length away from it.
+fn parse_hash_str(s: &str) -> Result<Hash, String> {
+    match s.len() {
+        64 => parse_blob_hash(s),
+        52 => s.parse().map_err(|e| format!("Invalid hash: {}", e)),
+        n => Err(format!(
+            "Invalid hash: expected 64 hex or 52 base32 characters, got {}",
+            n
+        )),
+    }
+}
+
 unsafe fn required_str<'a>(ptr: *const c_char, name: &str) -> Result<&'a str, String> {
     if ptr.is_null() {
         return Err(format!("{} cannot be null", name));
@@ -2967,6 +2984,57 @@ mod tests {
 
         // No caller token: never cancelled by the caller.
         assert!(!operation_token(std::ptr::null()).is_cancelled());
+    }
+
+    /// RFC 4648 base32 without padding, uppercase.
+    fn base32_nopad(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        let (mut out, mut buf, mut bits) = (String::new(), 0u32, 0u32);
+        for &b in bytes {
+            buf = (buf << 8) | u32::from(b);
+            bits += 8;
+            while bits >= 5 {
+                bits -= 5;
+                out.push(ALPHABET[((buf >> bits) & 31) as usize] as char);
+            }
+        }
+        if bits > 0 {
+            out.push(ALPHABET[((buf << (5 - bits)) & 31) as usize] as char);
+        }
+        out
+    }
+
+    #[test]
+    fn test_parse_hash_str_rejects_bad_input_without_panicking() {
+        for s in [
+            "",
+            "a",
+            "invalid",
+            &"a".repeat(51),
+            &"a".repeat(53),
+            &"!".repeat(52),
+        ] {
+            assert!(parse_hash_str(s).is_err(), "{s:?}");
+        }
+        assert!(parse_hash_str(&"z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn test_parse_hash_str_accepts_hex_and_base32() {
+        let hash = Hash::new(b"hello");
+        let base32 = base32_nopad(hash.as_bytes());
+        assert_eq!(base32.len(), 52);
+        assert_eq!(parse_hash_str(&hash.to_hex()).unwrap(), hash);
+        assert_eq!(parse_hash_str(&base32).unwrap(), hash);
+        assert_eq!(parse_hash_str(&base32.to_lowercase()).unwrap(), hash);
+    }
+
+    /// Canary: once iroh-blobs stops panicking here (0.104+), parse_hash_str's
+    /// length guard can be dropped in favour of `str::parse`.
+    #[test]
+    #[should_panic]
+    fn test_iroh_blobs_hash_from_str_still_panics_on_short_base32() {
+        let _ = "invalid".parse::<Hash>();
     }
 
     #[test]
