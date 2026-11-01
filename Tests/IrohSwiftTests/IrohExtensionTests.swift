@@ -141,6 +141,24 @@ final class IrohExtensionTests: XCTestCase {
         try await node.close()
     }
 
+    /// Sub-second delays must double, not truncate to whole seconds.
+    func testRetryBackoffDoublesSubSecondDelay() async throws {
+        let node = try await createTestNode()
+        try await node.close()  // every put now throws at once
+
+        let start = ContinuousClock.now
+        do {
+            _ = try await node.putWithRetry(
+                Data("x".utf8), maxAttempts: 3, initialDelay: .milliseconds(250))
+            XCTFail("put on a closed node should fail")
+        } catch IrohError.maxRetriesExceeded {
+            // expected
+        }
+        // 250 ms, then 500 ms. Truncating to whole seconds sleeps 250 ms, then 0.
+        let elapsed = ContinuousClock.now - start
+        XCTAssertGreaterThanOrEqual(elapsed, .milliseconds(700))
+    }
+
     // MARK: - Logging Tests
 
     func testPutWithLogging() async throws {

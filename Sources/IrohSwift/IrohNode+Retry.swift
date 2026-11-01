@@ -68,7 +68,7 @@ extension IrohNode {
                 }
                 try await Task.sleep(for: currentDelay)
                 // Exponential backoff: double the delay each time
-                currentDelay = Duration.seconds(currentDelay.components.seconds * 2)
+                currentDelay *= 2
             }
         }
 
