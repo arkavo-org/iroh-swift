@@ -143,6 +143,23 @@ final class IrohDocTests: XCTestCase {
         XCTAssertNil(entry, "Entry should be nil after delete")
     }
 
+    /// delete is a prefix delete: it also removes the author's longer keys.
+    func testDocDeleteRemovesKeysWithThePrefix() async throws {
+        let doc = try await node.createDoc()
+        for key in ["user", "user1", "user/settings", "other"] {
+            _ = try await doc.set(author: author, key: key, value: Data(key.utf8))
+        }
+
+        let count = try await doc.delete(author: author, key: "user")
+        XCTAssertEqual(count, 3)
+
+        var remaining: [String] = []
+        for try await entry in try await doc.getMany(prefix: "") {
+            remaining.append(try XCTUnwrap(entry.keyString))
+        }
+        XCTAssertEqual(remaining, ["other"])
+    }
+
     /// Test getting a share ticket.
     func testDocShare() async throws {
         let doc = try await node.createDoc()

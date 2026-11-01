@@ -269,11 +269,17 @@ public actor IrohDoc {
         }
     }
 
-    /// Delete an entry (creates a tombstone).
+    /// Delete every entry by `author` whose key starts with `key`.
+    ///
+    /// This is a prefix delete: `"user"` also removes `"user1"` and
+    /// `"user/settings"`, and an empty key removes everything `author` wrote.
+    /// It writes an empty entry (a tombstone) at `key`, which also hides older
+    /// entries by other authors for that exact key from `get` and `getMany`.
+    /// Other authors' entries under longer keys are not affected.
     ///
     /// - Parameters:
     ///   - author: The author signing the deletion.
-    ///   - key: The key as a string (UTF-8 encoded).
+    ///   - key: The key prefix as a string (UTF-8 encoded).
     /// - Returns: The number of entries deleted.
     /// - Throws: `IrohError.docClosed` if the document is closed,
     ///           `IrohError.docDeleteFailed` if the operation fails.
@@ -285,11 +291,13 @@ public actor IrohDoc {
         return try await delete(author: author, key: keyData)
     }
 
-    /// Delete an entry using raw key bytes.
+    /// Delete every entry by `author` whose key starts with the `key` bytes.
+    ///
+    /// A prefix delete; see the `String` overload for details.
     ///
     /// - Parameters:
     ///   - author: The author signing the deletion.
-    ///   - key: The key bytes.
+    ///   - key: The key prefix bytes.
     /// - Returns: The number of entries deleted.
     /// - Throws: `IrohError.docClosed` if the document is closed,
     ///           `IrohError.docDeleteFailed` if the operation fails.

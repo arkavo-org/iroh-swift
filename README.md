@@ -313,7 +313,7 @@ if IrohAuthor.exists(identifier: "default") {
 | `set(author:key:value:)` | Write a key-value pair |
 | `get(key:)` | Read a single entry |
 | `getMany(prefix:)` | Query entries by key prefix |
-| `delete(author:key:)` | Delete an entry |
+| `delete(author:key:)` | Delete the author's entries whose key starts with `key` (a prefix delete) |
 | `shareTicket(mode:)` | Get a shareable ticket (.read or .write) |
 | `subscribe()` | Subscribe to live document events |
 
