@@ -76,6 +76,17 @@ final class IrohDocTests: XCTestCase {
         XCTAssertTrue(keys.contains("prefix/b"))
     }
 
+    /// getMany delivers every match, not only the newest 100.
+    func testDocGetManyReturnsMoreThan100Entries() async throws {
+        let doc = try await node.createDoc()
+        for i in 0..<150 {
+            _ = try await doc.set(author: author, key: "bulk/\(i)", value: Data("v\(i)".utf8))
+        }
+        var count = 0
+        for try await _ in try await doc.getMany(prefix: "bulk/") { count += 1 }
+        XCTAssertEqual(count, 150)
+    }
+
     /// Test deleting an entry.
     func testDocDelete() async throws {
         let doc = try await node.createDoc()

@@ -223,7 +223,9 @@ public actor IrohDoc {
     public func getMany(prefix: Data) async throws -> AsyncThrowingStream<DocEntry, Error> {
         try ensureNotClosed()
 
-        return AsyncThrowingStream(bufferingPolicy: .bufferingNewest(100)) { continuation in
+        // Unbounded: iroh_doc_get_many runs to completion inside this closure,
+        // before the caller reads anything, so a bounded buffer would drop entries.
+        return AsyncThrowingStream(bufferingPolicy: .unbounded) { continuation in
             let context = GetManyContext(continuation: continuation)
             let contextPtr = Unmanaged.passRetained(context).toOpaque()
 
