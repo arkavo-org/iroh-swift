@@ -129,34 +129,65 @@ final class IrohExtensionTests: XCTestCase {
     }
 
     func testRetryRejectsNonPositiveMaxAttempts() async throws {
-        let node = try await createTestNode()
         for maxAttempts in [0, -1] {
             do {
-                _ = try await node.putWithRetry(Data("x".utf8), maxAttempts: maxAttempts)
+                _ = try await IrohNode.withRetry(maxAttempts: maxAttempts, initialDelay: .zero) { 1 }
                 XCTFail("maxAttempts \(maxAttempts) should be rejected")
             } catch IrohError.invalidConfiguration {
                 // expected
             }
         }
-        try await node.close()
     }
 
     /// Sub-second delays must double, not truncate to whole seconds.
     func testRetryBackoffDoublesSubSecondDelay() async throws {
-        let node = try await createTestNode()
-        try await node.close()  // every put now throws at once
-
+        let attempts = AttemptCounter()
         let start = ContinuousClock.now
         do {
-            _ = try await node.putWithRetry(
-                Data("x".utf8), maxAttempts: 3, initialDelay: .milliseconds(250))
-            XCTFail("put on a closed node should fail")
-        } catch IrohError.maxRetriesExceeded {
-            // expected
+            _ = try await IrohNode.withRetry(maxAttempts: 3, initialDelay: .milliseconds(250)) {
+                await attempts.increment()
+                throw IrohError.putFailed("transient")
+            } as Int
+            XCTFail("every attempt fails")
+        } catch IrohError.maxRetriesExceeded(let count, _) {
+            XCTAssertEqual(count, 3)
         }
         // 250 ms, then 500 ms. Truncating to whole seconds sleeps 250 ms, then 0.
         let elapsed = ContinuousClock.now - start
         XCTAssertGreaterThanOrEqual(elapsed, .milliseconds(700))
+        let made = await attempts.count
+        XCTAssertEqual(made, 3)
+    }
+
+    /// A closed node cannot recover, so it is reported at once, not retried.
+    func testRetryDoesNotRetryClosedNode() async throws {
+        let node = try await createTestNode()
+        try await node.close()
+
+        let start = ContinuousClock.now
+        do {
+            _ = try await node.putWithRetry(Data("x".utf8), maxAttempts: 3, initialDelay: .seconds(1))
+            XCTFail("put on a closed node should fail")
+        } catch IrohError.nodeClosed {
+            // expected
+        }
+        XCTAssertLessThan(ContinuousClock.now - start, .milliseconds(500))
+    }
+
+    /// Cancellation surfaces as CancellationError on every attempt, the last included.
+    func testRetryDoesNotWrapCancellation() async throws {
+        let attempts = AttemptCounter()
+        do {
+            _ = try await IrohNode.withRetry(maxAttempts: 1, initialDelay: .zero) {
+                await attempts.increment()
+                throw CancellationError()
+            } as Int
+            XCTFail("the operation was cancelled")
+        } catch is CancellationError {
+            // expected
+        }
+        let made = await attempts.count
+        XCTAssertEqual(made, 1)
     }
 
     // MARK: - Logging Tests
@@ -226,4 +257,10 @@ final class IrohExtensionTests: XCTestCase {
 
         try await node.close()
     }
+}
+
+/// Counts operation attempts from a `@Sendable` closure.
+private actor AttemptCounter {
+    private(set) var count = 0
+    func increment() { count += 1 }
 }
