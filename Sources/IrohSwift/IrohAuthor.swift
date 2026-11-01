@@ -209,12 +209,6 @@ public struct IrohAuthor: Sendable, Hashable {
     ///
     /// - Returns: The 64-character hex-encoded secret key.
     public func exportSecretHex() -> String {
-        var ffiSecret = IrohAuthorSecret()
-        secret.withUnsafeBytes { buffer in
-            withUnsafeMutableBytes(of: &ffiSecret.bytes) { destBuffer in
-                destBuffer.copyMemory(from: UnsafeRawBufferPointer(buffer))
-            }
-        }
         let hexPtr = iroh_author_secret_to_hex(ffiSecret)!
         let hex = String(cString: hexPtr)
         iroh_string_free(hexPtr)
@@ -243,10 +237,15 @@ public struct IrohAuthor: Sendable, Hashable {
 
     /// Convert to FFI secret type for document operations.
     internal var ffiSecret: IrohAuthorSecret {
+        Self.ffiSecret(from: secret)
+    }
+
+    /// Copy a 32-byte secret into the FFI type. Callers check the length.
+    private static func ffiSecret(from secretData: Data) -> IrohAuthorSecret {
         var result = IrohAuthorSecret()
-        secret.withUnsafeBytes { buffer in
+        secretData.withUnsafeBytes { buffer in
             withUnsafeMutableBytes(of: &result.bytes) { destBuffer in
-                destBuffer.copyMemory(from: UnsafeRawBufferPointer(buffer))
+                destBuffer.copyMemory(from: buffer)
             }
         }
         return result
@@ -260,13 +259,7 @@ public struct IrohAuthor: Sendable, Hashable {
         guard secretData.count == 32 else {
             throw IrohError.keychainError("Stored author secret is \(secretData.count) bytes, expected 32")
         }
-        var ffiSecret = IrohAuthorSecret()
-        secretData.withUnsafeBytes { buffer in
-            withUnsafeMutableBytes(of: &ffiSecret.bytes) { destBuffer in
-                destBuffer.copyMemory(from: buffer)
-            }
-        }
-        let ffiId = iroh_author_id_from_secret(ffiSecret)
+        let ffiId = iroh_author_id_from_secret(ffiSecret(from: secretData))
         let publicKey = withUnsafeBytes(of: ffiId.bytes) { Data($0) }
         return IrohAuthor(secret: secretData, publicKey: publicKey)
     }
