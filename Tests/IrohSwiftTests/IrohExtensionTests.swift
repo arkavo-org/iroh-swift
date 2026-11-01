@@ -128,6 +128,19 @@ final class IrohExtensionTests: XCTestCase {
         try await node.close()
     }
 
+    func testRetryRejectsNonPositiveMaxAttempts() async throws {
+        let node = try await createTestNode()
+        for maxAttempts in [0, -1] {
+            do {
+                _ = try await node.putWithRetry(Data("x".utf8), maxAttempts: maxAttempts)
+                XCTFail("maxAttempts \(maxAttempts) should be rejected")
+            } catch IrohError.invalidConfiguration {
+                // expected
+            }
+        }
+        try await node.close()
+    }
+
     // MARK: - Logging Tests
 
     func testPutWithLogging() async throws {

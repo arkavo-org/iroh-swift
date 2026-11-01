@@ -10,7 +10,8 @@ extension IrohNode {
     ///   - maxAttempts: Maximum number of attempts. Defaults to 3.
     ///   - initialDelay: Delay before first retry. Defaults to 1 second.
     /// - Returns: A ticket string for retrieving the data.
-    /// - Throws: `IrohError.maxRetriesExceeded` if all attempts fail.
+    /// - Throws: `IrohError.maxRetriesExceeded` if all attempts fail,
+    ///   `IrohError.invalidConfiguration` if `maxAttempts` is less than 1.
     public func putWithRetry(
         _ data: Data,
         maxAttempts: Int = 3,
@@ -30,7 +31,8 @@ extension IrohNode {
     ///   - maxAttempts: Maximum number of attempts. Defaults to 3.
     ///   - initialDelay: Delay before first retry. Defaults to 1 second.
     /// - Returns: The downloaded data.
-    /// - Throws: `IrohError.maxRetriesExceeded` if all attempts fail.
+    /// - Throws: `IrohError.maxRetriesExceeded` if all attempts fail,
+    ///   `IrohError.invalidConfiguration` if `maxAttempts` is less than 1.
     public func getWithRetry(
         ticket: String,
         maxAttempts: Int = 3,
@@ -47,7 +49,11 @@ extension IrohNode {
         initialDelay: Duration,
         operation: @Sendable () async throws -> T
     ) async throws -> T {
-        var lastError: (any Error)?
+        // `1...maxAttempts` traps for values below 1.
+        guard maxAttempts >= 1 else {
+            throw IrohError.invalidConfiguration("maxAttempts must be at least 1, got \(maxAttempts)")
+        }
+
         var currentDelay = initialDelay
 
         for attempt in 1...maxAttempts {
@@ -56,17 +62,17 @@ extension IrohNode {
             do {
                 return try await operation()
             } catch {
-                lastError = error
-
-                // Don't sleep after the last attempt
-                if attempt < maxAttempts {
-                    try await Task.sleep(for: currentDelay)
-                    // Exponential backoff: double the delay each time
-                    currentDelay = Duration.seconds(currentDelay.components.seconds * 2)
+                // The last attempt reports its own error, so none has to be stored
+                guard attempt < maxAttempts else {
+                    throw IrohError.maxRetriesExceeded(attempts: maxAttempts, lastError: error)
                 }
+                try await Task.sleep(for: currentDelay)
+                // Exponential backoff: double the delay each time
+                currentDelay = Duration.seconds(currentDelay.components.seconds * 2)
             }
         }
 
-        throw IrohError.maxRetriesExceeded(attempts: maxAttempts, lastError: lastError!)
+        // Unreachable: the final attempt either returns or throws above.
+        preconditionFailure("withRetry loop exited without a result")
     }
 }
