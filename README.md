@@ -397,7 +397,7 @@ IROH_LOCAL_DEV=1 swift test
 ```
 Swift Layer (IrohSwift)           Rust FFI Layer              Iroh Libraries
 ┌─────────────────────┐          ┌──────────────────┐        ┌────────────────────┐
-│ IrohNode (actor)    │──C ABI──▶│ ffi.rs           │───────▶│ iroh 1.3.0         │
+│ IrohNode (actor)    │──C ABI──▶│ ffi.rs           │───────▶│ iroh 1.4.1         │
 │ IrohDoc (actor)     │          │ node.rs          │        │ iroh-blobs 0.103.1 │
 │ IrohAuthor          │          └──────────────────┘        │ iroh-docs 0.101    │
 └─────────────────────┘                                      └────────────────────┘
