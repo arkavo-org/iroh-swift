@@ -160,6 +160,34 @@ final class IrohDocTests: XCTestCase {
         XCTAssertEqual(remaining, ["other"])
     }
 
+    /// subscribe delivers a local insert, and ending the stream cancels the subscription.
+    func testDocSubscribeDeliversLocalInsert() async throws {
+        let doc = try await node.createDoc()
+        let author = try XCTUnwrap(self.author)
+        let stream = try await doc.subscribe()
+
+        let key = try await withThrowingTaskGroup(of: String?.self) { group in
+            group.addTask {
+                for try await event in stream {
+                    if case .insertLocal(let entry) = event { return entry.keyString }
+                }
+                return nil
+            }
+            // The Rust subscription starts asynchronously: write until an event arrives.
+            group.addTask {
+                for i in 0..<50 {
+                    _ = try await doc.set(author: author, key: "sub/\(i)", value: Data("x".utf8))
+                    try await Task.sleep(for: .milliseconds(100))
+                }
+                return nil
+            }
+            let first = try await group.next() ?? nil
+            group.cancelAll()  // ends the stream, which cancels the subscription
+            return first
+        }
+        XCTAssertEqual(key?.hasPrefix("sub/"), true)
+    }
+
     /// Test getting a share ticket.
     func testDocShare() async throws {
         let doc = try await node.createDoc()
