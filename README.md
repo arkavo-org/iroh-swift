@@ -410,6 +410,22 @@ Swift Layer (IrohSwift)           Rust FFI Layer              Iroh Libraries
 - **Rust FFI**: Callback-based async bridged via `CheckedContinuation`
 - **Storage**: Persistent `FsStore` (excluded from iCloud backup)
 
+## Breaking Changes in 0.7.0
+
+- `KeychainAccessibility.always` is removed (Apple deprecated
+  `kSecAttrAccessibleAlways`). Use `.afterFirstUnlock`. Authors saved with
+  `.always` still load.
+- `IrohDoc.get(key:)` and `getMany(prefix:)` return the latest entry per key
+  across all authors, and hide a key whose latest entry is a deletion. Before,
+  results were sorted by author: `get` could return an older author's value
+  (even after another author deleted the key), and `getMany` returned one entry
+  per author per key and kept only the newest 100 matches.
+- `delete(author:key:)` is documented as what it always was: a prefix delete.
+- `putWithRetry` / `getWithRetry` throw `CancellationError` and `nodeClosed`
+  as they are, without retrying or wrapping them in `maxRetriesExceeded`.
+- `IrohAuthor.getOrCreate` throws `keychainError` when the stored author cannot
+  be read (e.g. the device is locked) instead of replacing it with a new one.
+
 ## Behavior Change in 0.6.0
 
 Serving nodes no longer accept pushes unless `IrohConfig.acceptsPushes` is set
@@ -427,6 +443,7 @@ existing `ip:port` addresses behave as before.
 
 | iroh-swift | iroh | iroh-blobs | iroh-docs |
 |------------|------|------------|-----------|
+| 0.7.x | 1.4.1 (+ iroh-mainline-address-lookup 0.6) | 0.103.1 | 0.101 |
 | 0.6.x | 1.3.0 (+ iroh-mainline-address-lookup 0.6) | 0.103.1 | 0.101 |
 | 0.5.x | 1.1.0 | 0.103 | 0.101 |
 | 0.4.x | 0.97 | 0.99 | 0.97 |
