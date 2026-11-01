@@ -1569,8 +1569,10 @@ pub extern "C" fn iroh_doc_get(
         unsafe { std::slice::from_raw_parts(key.data, key.len).to_vec() }
     };
 
-    // Query for the exact key
-    let query = iroh_docs::store::Query::key_exact(key_bytes);
+    // The latest entry for the key across all authors. A plain key_exact query
+    // sorts by author and skips empty entries first, so it would return an older
+    // author's value, even after a newer delete.
+    let query = iroh_docs::store::Query::single_latest_per_key().key_exact(key_bytes);
 
     match node.runtime().block_on(async {
         use futures_lite::StreamExt;
@@ -1626,8 +1628,8 @@ pub extern "C" fn iroh_doc_get_many(
         unsafe { std::slice::from_raw_parts(prefix.data, prefix.len).to_vec() }
     };
 
-    // Query by prefix
-    let query = iroh_docs::store::Query::key_prefix(prefix_bytes);
+    // One entry per key, the latest across all authors (deleted keys are skipped)
+    let query = iroh_docs::store::Query::single_latest_per_key().key_prefix(prefix_bytes);
 
     match node.runtime().block_on(async {
         use futures_lite::StreamExt;

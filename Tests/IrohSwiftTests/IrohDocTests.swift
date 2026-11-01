@@ -87,6 +87,42 @@ final class IrohDocTests: XCTestCase {
         XCTAssertEqual(count, 150)
     }
 
+    /// Two imported authors, ordered so the first sorts first by author ID.
+    /// A query sorted by author returns the first author's entry before the second's.
+    private func twoAuthorsInIdOrder() async throws -> (IrohAuthor, IrohAuthor) {
+        let other = try await IrohAuthor.create()
+        try await node.importAuthor(other)
+        return author.id < other.id ? (author, other) : (other, author)
+    }
+
+    /// When two authors write the same key, get and getMany return the newer write.
+    func testDocGetReturnsLatestWriteAcrossAuthors() async throws {
+        let doc = try await node.createDoc()
+        let (first, second) = try await twoAuthorsInIdOrder()
+        _ = try await doc.set(author: first, key: "k", value: Data("old".utf8))
+        _ = try await doc.set(author: second, key: "k", value: Data("new".utf8))
+
+        let entry = try await doc.get(key: "k")
+        let content = try await XCTUnwrap(entry).content(from: doc)
+        XCTAssertEqual(content, Data("new".utf8))
+
+        var entries: [DocEntry] = []
+        for try await e in try await doc.getMany(prefix: "k") { entries.append(e) }
+        XCTAssertEqual(entries.count, 1, "one entry per key, the latest")
+        XCTAssertEqual(entries.first?.authorId, second.id)
+    }
+
+    /// A delete by one author hides the key, though another author's older entry remains.
+    func testDocGetAfterDeleteByAnotherAuthorReturnsNil() async throws {
+        let doc = try await node.createDoc()
+        let (first, second) = try await twoAuthorsInIdOrder()
+        _ = try await doc.set(author: first, key: "k", value: Data("old".utf8))
+        _ = try await doc.delete(author: second, key: "k")
+
+        let entry = try await doc.get(key: "k")
+        XCTAssertNil(entry)
+    }
+
     /// Test deleting an entry.
     func testDocDelete() async throws {
         let doc = try await node.createDoc()
