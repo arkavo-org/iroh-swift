@@ -60,7 +60,17 @@ final class IrohAuthorTests: XCTestCase {
         XCTAssertEqual(set.count, 1, "Set should contain only one author")
     }
 
+    /// `.always` maps to Apple's replacement for the deprecated `kSecAttrAccessibleAlways`.
+    @available(*, deprecated)
+    func testKeychainAccessibilityAlwaysMapsToAfterFirstUnlock() {
+        XCTAssertEqual(
+            KeychainAccessibility.always.secValue as String,
+            kSecAttrAccessibleAfterFirstUnlock as String
+        )
+    }
+
     /// Test KeychainAccessibility enum values.
+    @available(*, deprecated)
     func testKeychainAccessibilityValues() {
         // Just verify the enum cases exist and have different secValues
         let afterFirstUnlock = KeychainAccessibility.afterFirstUnlock

@@ -353,7 +353,7 @@ if IrohAuthor.exists(identifier: "default") {
 |------|-------------|
 | `.afterFirstUnlock` | Available after first unlock (default, recommended) |
 | `.whenUnlocked` | Only when device is unlocked |
-| `.always` | Always available (less secure) |
+| `.always` | Deprecated: same as `.afterFirstUnlock` (Apple deprecated `kSecAttrAccessibleAlways`) |
 
 ## CLI Demo
 
