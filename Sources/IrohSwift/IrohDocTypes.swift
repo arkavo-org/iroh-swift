@@ -56,16 +56,25 @@ public struct DocEntry: Sendable {
     }
 
     /// Create from FFI entry.
-    init(from ffiEntry: IrohDocEntry) {
+    ///
+    /// Returns `nil` if the content hash is null, or the key is null with a
+    /// non-zero length.
+    init?(from ffiEntry: IrohDocEntry) {
+        guard let hashPtr = ffiEntry.content_hash else { return nil }
+        let keyLen = Int(ffiEntry.key.len)
+        if let keyPtr = ffiEntry.key.data {
+            self.key = Data(bytes: keyPtr, count: keyLen)
+        } else if keyLen == 0 {
+            self.key = Data()
+        } else {
+            return nil
+        }
+
         // Convert author ID bytes to hex string
         let authorBytes = withUnsafeBytes(of: ffiEntry.author_id.bytes) { Data($0) }
         self.authorId = authorBytes.map { String(format: "%02x", $0) }.joined()
 
-        // Copy key bytes
-        self.key = Data(bytes: ffiEntry.key.data, count: Int(ffiEntry.key.len))
-
-        // Copy content hash string
-        self.contentHash = String(cString: ffiEntry.content_hash)
+        self.contentHash = String(cString: hashPtr)
 
         self.contentSize = ffiEntry.content_size
         self.timestamp = ffiEntry.timestamp
@@ -73,7 +82,7 @@ public struct DocEntry: Sendable {
 
     /// Convert an FFI entry and free it with `iroh_doc_entry_free`.
     ///
-    /// Returns `nil` for a null pointer.
+    /// Returns `nil` for a null pointer or a malformed entry (which is still freed).
     static func consume(_ entryPtr: UnsafePointer<IrohDocEntry>?) -> DocEntry? {
         guard let entryPtr else { return nil }
         let entry = DocEntry(from: entryPtr.pointee)
@@ -110,7 +119,8 @@ public enum DocEvent: Sendable {
     /// Returns `nil` for an event type this version does not know, or when a
     /// field the type requires is null.
     static func from(_ ffiEvent: IrohDocEvent) -> DocEvent? {
-        let entry = ffiEvent.entry.map { DocEntry(from: $0.pointee) }
+        // Decoded only by the insert cases, which carry an entry
+        var entry: DocEntry? { ffiEvent.entry.flatMap { DocEntry(from: $0.pointee) } }
         let peerId = ffiEvent.peer_id.map { String(cString: $0) }
 
         switch ffiEvent.event_type {
