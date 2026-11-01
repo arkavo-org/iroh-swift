@@ -54,7 +54,13 @@ extension IrohDoc {
                         .takeUnretainedValue()
 
                     let docEvent = DocEvent.from(event)
+                    let eventType = event.event_type.rawValue
                     iroh_doc_event_free(event)
+                    // A malformed or newer event type is dropped, not fatal
+                    guard let docEvent else {
+                        IrohLogger.node.warning("subscribe: dropped document event of type \(eventType)")
+                        return
+                    }
                     ctx.continuation.yield(docEvent)
                 },
                 on_complete: { userdata in

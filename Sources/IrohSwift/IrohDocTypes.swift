@@ -96,38 +96,38 @@ public enum DocEvent: Sendable {
     case syncFinished(peerId: String)
 
     /// Create from FFI event.
-    static func from(_ ffiEvent: IrohDocEvent) -> DocEvent {
+    ///
+    /// Returns `nil` for an event type this version does not know, or when a
+    /// field the type requires is null.
+    static func from(_ ffiEvent: IrohDocEvent) -> DocEvent? {
+        let entry = ffiEvent.entry.map { DocEntry(from: $0.pointee) }
+        let peerId = ffiEvent.peer_id.map { String(cString: $0) }
+
         switch ffiEvent.event_type {
         case InsertLocal:
-            let entry = DocEntry(from: ffiEvent.entry!.pointee)
-            return .insertLocal(entry)
+            return entry.map { .insertLocal($0) }
 
         case InsertRemote:
-            let entry = DocEntry(from: ffiEvent.entry!.pointee)
-            let peerId = String(cString: ffiEvent.peer_id!)
+            guard let entry, let peerId else { return nil }
             return .insertRemote(from: peerId, entry: entry)
 
         case ContentReady:
-            let hash = String(cString: ffiEvent.content_hash!)
-            return .contentReady(hash: hash)
+            return ffiEvent.content_hash.map { .contentReady(hash: String(cString: $0)) }
 
         case PendingContentReady:
             return .pendingContentReady
 
         case NeighborUp:
-            let peerId = String(cString: ffiEvent.peer_id!)
-            return .neighborUp(peerId: peerId)
+            return peerId.map { .neighborUp(peerId: $0) }
 
         case NeighborDown:
-            let peerId = String(cString: ffiEvent.peer_id!)
-            return .neighborDown(peerId: peerId)
+            return peerId.map { .neighborDown(peerId: $0) }
 
         case SyncFinished:
-            let peerId = String(cString: ffiEvent.peer_id!)
-            return .syncFinished(peerId: peerId)
+            return peerId.map { .syncFinished(peerId: $0) }
 
         default:
-            fatalError("Unknown document event type: \(ffiEvent.event_type)")
+            return nil
         }
     }
 }
