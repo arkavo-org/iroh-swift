@@ -448,16 +448,16 @@ pub struct IrohDocSubscribeCallback {
 pub extern "C" fn iroh_node_create(config: IrohNodeConfig, callback: IrohNodeCreateCallback) {
     // Parse the storage path
     let storage_path = if config.storage_path.is_null() {
-        let error = CString::new("storage_path cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("storage_path cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     } else {
         let path_str = unsafe { CStr::from_ptr(config.storage_path) };
         match path_str.to_str() {
             Ok(s) => PathBuf::from(s),
             Err(e) => {
-                let error = CString::new(format!("Invalid storage path: {}", e)).unwrap();
-                (callback.on_failure)(callback.userdata, error.into_raw());
+                let error = c_string(format!("Invalid storage path: {}", e));
+                (callback.on_failure)(callback.userdata, error);
                 return;
             }
         }
@@ -471,8 +471,8 @@ pub extern "C" fn iroh_node_create(config: IrohNodeConfig, callback: IrohNodeCre
         match url_str.to_str() {
             Ok(s) => Some(s.to_string()),
             Err(e) => {
-                let error = CString::new(format!("Invalid custom relay URL: {}", e)).unwrap();
-                (callback.on_failure)(callback.userdata, error.into_raw());
+                let error = c_string(format!("Invalid custom relay URL: {}", e));
+                (callback.on_failure)(callback.userdata, error);
                 return;
             }
         }
@@ -506,8 +506,8 @@ pub extern "C" fn iroh_node_create(config: IrohNodeConfig, callback: IrohNodeCre
             (callback.on_success)(callback.userdata, handle);
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -554,8 +554,8 @@ pub extern "C" fn iroh_put(
     callback: IrohCallback,
 ) {
     if handle.is_null() {
-        let error = CString::new("handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
@@ -573,12 +573,12 @@ pub extern "C" fn iroh_put(
     // Note: This blocks on the node's runtime, which is intentional
     match node.put(&data) {
         Ok(ticket) => {
-            let ticket_cstr = CString::new(ticket).unwrap();
-            (callback.on_success)(callback.userdata, ticket_cstr.into_raw());
+            let ticket_cstr = c_string(ticket);
+            (callback.on_success)(callback.userdata, ticket_cstr);
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -596,14 +596,14 @@ pub unsafe extern "C" fn iroh_get(
     callback: IrohGetCallback,
 ) {
     if handle.is_null() {
-        let error = CString::new("handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
     if ticket.is_null() {
-        let error = CString::new("ticket cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("ticket cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
@@ -611,8 +611,8 @@ pub unsafe extern "C" fn iroh_get(
     let ticket_str = match unsafe { CStr::from_ptr(ticket) }.to_str() {
         Ok(s) => s.to_string(),
         Err(e) => {
-            let error = CString::new(format!("Invalid ticket string: {}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("Invalid ticket string: {}", e));
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
@@ -633,8 +633,8 @@ pub unsafe extern "C" fn iroh_get(
             (callback.on_success)(callback.userdata, owned);
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -689,14 +689,14 @@ pub unsafe extern "C" fn iroh_get_with_progress(
     callback: IrohGetProgressCallback,
 ) {
     if handle.is_null() {
-        let error = CString::new("handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
     if ticket.is_null() {
-        let error = CString::new("ticket cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("ticket cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
@@ -704,8 +704,8 @@ pub unsafe extern "C" fn iroh_get_with_progress(
     let ticket_str = match unsafe { CStr::from_ptr(ticket) }.to_str() {
         Ok(s) => s.to_string(),
         Err(e) => {
-            let error = CString::new(format!("Invalid ticket string: {}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("Invalid ticket string: {}", e));
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
@@ -732,8 +732,8 @@ pub unsafe extern "C" fn iroh_get_with_progress(
             (callback.on_success)(callback.userdata, owned);
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -746,8 +746,8 @@ pub unsafe extern "C" fn iroh_get_with_progress(
 #[unsafe(no_mangle)]
 pub extern "C" fn iroh_node_info(handle: *const IrohNodeHandle, callback: IrohNodeInfoCallback) {
     if handle.is_null() {
-        let error = CString::new("handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
@@ -755,18 +755,13 @@ pub extern "C" fn iroh_node_info(handle: *const IrohNodeHandle, callback: IrohNo
 
     match node.info() {
         Ok(info) => {
-            let node_id = CString::new(info.node_id).unwrap().into_raw();
-            let relay_url = info
-                .relay_url
-                .map(|url| CString::new(url).unwrap().into_raw())
-                .unwrap_or(std::ptr::null_mut());
+            let node_id = c_string(info.node_id);
+            let relay_url = info.relay_url.map(c_string).unwrap_or(std::ptr::null_mut());
 
             let direct_addrs = if info.direct_addrs.is_empty() {
                 std::ptr::null_mut()
             } else {
-                CString::new(info.direct_addrs.join("\n"))
-                    .unwrap()
-                    .into_raw()
+                c_string(info.direct_addrs.join("\n"))
             };
 
             let ffi_info = IrohNodeInfo {
@@ -779,8 +774,8 @@ pub extern "C" fn iroh_node_info(handle: *const IrohNodeHandle, callback: IrohNo
             (callback.on_success)(callback.userdata, ffi_info);
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -808,10 +803,8 @@ pub unsafe extern "C" fn iroh_validate_ticket(
         match unsafe { CStr::from_ptr(ticket) }.to_str() {
             Ok(ticket_str) => match ticket_str.parse::<BlobTicket>() {
                 Ok(parsed) => {
-                    let hash = CString::new(parsed.hash().to_string()).unwrap().into_raw();
-                    let node_id = CString::new(parsed.addr().id.to_string())
-                        .unwrap()
-                        .into_raw();
+                    let hash = c_string(parsed.hash().to_string());
+                    let node_id = c_string(parsed.addr().id.to_string());
 
                     IrohTicketInfo {
                         is_valid: true,
@@ -870,8 +863,8 @@ pub extern "C" fn iroh_node_close(handle: *mut IrohNodeHandle, callback: IrohClo
         match node.shutdown() {
             Ok(()) => (on_complete)(userdata),
             Err(e) => {
-                let error = CString::new(format!("{:#}", e)).unwrap();
-                (on_failure)(userdata, error.into_raw());
+                let error = c_string(format!("{:#}", e));
+                (on_failure)(userdata, error);
             }
         }
     });
@@ -891,8 +884,8 @@ pub extern "C" fn iroh_put_with_options(
     callback: IrohCallback,
 ) {
     if handle.is_null() {
-        let error = CString::new("handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
@@ -908,12 +901,12 @@ pub extern "C" fn iroh_put_with_options(
 
     match node.put_with_timeout(&data, timeout_ms) {
         Ok(ticket) => {
-            let ticket_cstr = CString::new(ticket).unwrap();
-            (callback.on_success)(callback.userdata, ticket_cstr.into_raw());
+            let ticket_cstr = c_string(ticket);
+            (callback.on_success)(callback.userdata, ticket_cstr);
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -949,14 +942,14 @@ pub unsafe extern "C" fn iroh_push_to_node(
     callback: IrohCallback,
 ) {
     if handle.is_null() {
-        let error = CString::new("handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
     if remote_node_id_hex.is_null() {
-        let error = CString::new("remote_node_id_hex cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("remote_node_id_hex cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
@@ -964,8 +957,8 @@ pub unsafe extern "C" fn iroh_push_to_node(
     let node_id_str = match unsafe { CStr::from_ptr(remote_node_id_hex) }.to_str() {
         Ok(s) => s.to_string(),
         Err(e) => {
-            let error = CString::new(format!("Invalid remote_node_id_hex string: {}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("Invalid remote_node_id_hex string: {}", e));
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
@@ -977,8 +970,8 @@ pub unsafe extern "C" fn iroh_push_to_node(
         match unsafe { CStr::from_ptr(relay_url) }.to_str() {
             Ok(s) => Some(s.to_string()),
             Err(e) => {
-                let error = CString::new(format!("Invalid relay_url string: {}", e)).unwrap();
-                (callback.on_failure)(callback.userdata, error.into_raw());
+                let error = c_string(format!("Invalid relay_url string: {}", e));
+                (callback.on_failure)(callback.userdata, error);
                 return;
             }
         }
@@ -997,9 +990,8 @@ pub unsafe extern "C" fn iroh_push_to_node(
             match unsafe { CStr::from_ptr(ptr) }.to_str() {
                 Ok(s) => result.push(s.to_string()),
                 Err(e) => {
-                    let error =
-                        CString::new(format!("Invalid direct address string: {}", e)).unwrap();
-                    (callback.on_failure)(callback.userdata, error.into_raw());
+                    let error = c_string(format!("Invalid direct address string: {}", e));
+                    (callback.on_failure)(callback.userdata, error);
                     return;
                 }
             }
@@ -1018,12 +1010,12 @@ pub unsafe extern "C" fn iroh_push_to_node(
 
     match node.push_to_node(&node_id_str, relay_url_str.as_deref(), &data, &addrs) {
         Ok(hash_hex) => {
-            let result = CString::new(hash_hex).unwrap();
-            (callback.on_success)(callback.userdata, result.into_raw());
+            let result = c_string(hash_hex);
+            (callback.on_success)(callback.userdata, result);
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -1053,14 +1045,14 @@ pub unsafe extern "C" fn iroh_push_to_node_with_options(
     callback: IrohCallback,
 ) {
     if handle.is_null() {
-        let error = CString::new("handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
     if remote_node_id_hex.is_null() {
-        let error = CString::new("remote_node_id_hex cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("remote_node_id_hex cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
@@ -1068,8 +1060,8 @@ pub unsafe extern "C" fn iroh_push_to_node_with_options(
     let node_id_str = match unsafe { CStr::from_ptr(remote_node_id_hex) }.to_str() {
         Ok(s) => s.to_string(),
         Err(e) => {
-            let error = CString::new(format!("Invalid remote_node_id_hex string: {}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("Invalid remote_node_id_hex string: {}", e));
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
@@ -1081,8 +1073,8 @@ pub unsafe extern "C" fn iroh_push_to_node_with_options(
         match unsafe { CStr::from_ptr(relay_url) }.to_str() {
             Ok(s) => Some(s.to_string()),
             Err(e) => {
-                let error = CString::new(format!("Invalid relay_url string: {}", e)).unwrap();
-                (callback.on_failure)(callback.userdata, error.into_raw());
+                let error = c_string(format!("Invalid relay_url string: {}", e));
+                (callback.on_failure)(callback.userdata, error);
                 return;
             }
         }
@@ -1101,9 +1093,8 @@ pub unsafe extern "C" fn iroh_push_to_node_with_options(
             match unsafe { CStr::from_ptr(ptr) }.to_str() {
                 Ok(s) => result.push(s.to_string()),
                 Err(e) => {
-                    let error =
-                        CString::new(format!("Invalid direct address string: {}", e)).unwrap();
-                    (callback.on_failure)(callback.userdata, error.into_raw());
+                    let error = c_string(format!("Invalid direct address string: {}", e));
+                    (callback.on_failure)(callback.userdata, error);
                     return;
                 }
             }
@@ -1129,12 +1120,12 @@ pub unsafe extern "C" fn iroh_push_to_node_with_options(
         timeout_ms,
     ) {
         Ok(hash_hex) => {
-            let result = CString::new(hash_hex).unwrap();
-            (callback.on_success)(callback.userdata, result.into_raw());
+            let result = c_string(hash_hex);
+            (callback.on_success)(callback.userdata, result);
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -1153,22 +1144,22 @@ pub unsafe extern "C" fn iroh_get_with_options(
     callback: IrohGetCallback,
 ) {
     if handle.is_null() {
-        let error = CString::new("handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
     if ticket.is_null() {
-        let error = CString::new("ticket cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("ticket cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
     let ticket_str = match unsafe { CStr::from_ptr(ticket) }.to_str() {
         Ok(s) => s.to_string(),
         Err(e) => {
-            let error = CString::new(format!("Invalid ticket string: {}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("Invalid ticket string: {}", e));
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
@@ -1188,8 +1179,8 @@ pub unsafe extern "C" fn iroh_get_with_options(
             (callback.on_success)(callback.userdata, owned);
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -1255,16 +1246,16 @@ pub unsafe extern "C" fn iroh_author_from_hex(
     callback: IrohAuthorCreateCallback,
 ) {
     if secret_hex.is_null() {
-        let error = CString::new("secret_hex cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("secret_hex cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
     let hex_str = match unsafe { CStr::from_ptr(secret_hex) }.to_str() {
         Ok(s) => s,
         Err(e) => {
-            let error = CString::new(format!("Invalid UTF-8 in secret_hex: {}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("Invalid UTF-8 in secret_hex: {}", e));
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
@@ -1277,17 +1268,16 @@ pub unsafe extern "C" fn iroh_author_from_hex(
             arr
         }
         Ok(bytes) => {
-            let error = CString::new(format!(
+            let error = c_string(format!(
                 "Invalid secret length: expected 32 bytes, got {}",
                 bytes.len()
-            ))
-            .unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            ));
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
         Err(e) => {
-            let error = CString::new(format!("Invalid hex string: {}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("Invalid hex string: {}", e));
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
@@ -1314,7 +1304,7 @@ pub unsafe extern "C" fn iroh_author_from_hex(
 #[unsafe(no_mangle)]
 pub extern "C" fn iroh_author_secret_to_hex(secret: IrohAuthorSecret) -> *mut c_char {
     let hex_string = hex::encode(secret.bytes);
-    CString::new(hex_string).unwrap().into_raw()
+    c_string(hex_string)
 }
 
 /// Export an author ID as a hex string.
@@ -1324,7 +1314,7 @@ pub extern "C" fn iroh_author_secret_to_hex(secret: IrohAuthorSecret) -> *mut c_
 #[unsafe(no_mangle)]
 pub extern "C" fn iroh_author_id_to_hex(id: IrohAuthorId) -> *mut c_char {
     let hex_string = hex::encode(id.bytes);
-    CString::new(hex_string).unwrap().into_raw()
+    c_string(hex_string)
 }
 
 /// Import an author into the docs engine.
@@ -1342,8 +1332,8 @@ pub extern "C" fn iroh_author_import(
     callback: IrohCloseCallback,
 ) {
     if handle.is_null() {
-        let error = CString::new("handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
@@ -1352,8 +1342,8 @@ pub extern "C" fn iroh_author_import(
     let docs = match node.docs() {
         Some(d) => d,
         None => {
-            let error = CString::new("docs not enabled on this node").unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string("docs not enabled on this node");
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
@@ -1366,8 +1356,8 @@ pub extern "C" fn iroh_author_import(
             (callback.on_complete)(callback.userdata);
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -1384,8 +1374,8 @@ pub extern "C" fn iroh_author_import(
 #[unsafe(no_mangle)]
 pub extern "C" fn iroh_doc_create(handle: *const IrohNodeHandle, callback: IrohDocCreateCallback) {
     if handle.is_null() {
-        let error = CString::new("handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
@@ -1394,8 +1384,8 @@ pub extern "C" fn iroh_doc_create(handle: *const IrohNodeHandle, callback: IrohD
     let docs = match node.docs() {
         Some(d) => d,
         None => {
-            let error = CString::new("docs not enabled on this node").unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string("docs not enabled on this node");
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
@@ -1403,7 +1393,7 @@ pub extern "C" fn iroh_doc_create(handle: *const IrohNodeHandle, callback: IrohD
     match node.runtime().block_on(docs.api().create()) {
         Ok(doc) => {
             let namespace_id = doc.id().to_string();
-            let namespace_cstr = CString::new(namespace_id).unwrap().into_raw();
+            let namespace_cstr = c_string(namespace_id);
 
             // Wrap the doc for FFI
             let wrapper = Box::new(DocWrapper {
@@ -1415,8 +1405,8 @@ pub extern "C" fn iroh_doc_create(handle: *const IrohNodeHandle, callback: IrohD
             (callback.on_success)(callback.userdata, doc_handle, namespace_cstr);
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -1434,22 +1424,22 @@ pub unsafe extern "C" fn iroh_doc_join(
     callback: IrohDocCreateCallback,
 ) {
     if handle.is_null() {
-        let error = CString::new("handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
     if ticket.is_null() {
-        let error = CString::new("ticket cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("ticket cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
     let ticket_str = match unsafe { CStr::from_ptr(ticket) }.to_str() {
         Ok(s) => s,
         Err(e) => {
-            let error = CString::new(format!("Invalid ticket UTF-8: {}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("Invalid ticket UTF-8: {}", e));
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
@@ -1457,8 +1447,8 @@ pub unsafe extern "C" fn iroh_doc_join(
     let doc_ticket: DocTicket = match ticket_str.parse() {
         Ok(t) => t,
         Err(e) => {
-            let error = CString::new(format!("Invalid doc ticket: {}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("Invalid doc ticket: {}", e));
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
@@ -1468,8 +1458,8 @@ pub unsafe extern "C" fn iroh_doc_join(
     let docs = match node.docs() {
         Some(d) => d,
         None => {
-            let error = CString::new("docs not enabled on this node").unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string("docs not enabled on this node");
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
@@ -1477,7 +1467,7 @@ pub unsafe extern "C" fn iroh_doc_join(
     match node.runtime().block_on(docs.api().import(doc_ticket)) {
         Ok(doc) => {
             let namespace_id = doc.id().to_string();
-            let namespace_cstr = CString::new(namespace_id).unwrap().into_raw();
+            let namespace_cstr = c_string(namespace_id);
 
             let wrapper = Box::new(DocWrapper {
                 doc,
@@ -1488,8 +1478,8 @@ pub unsafe extern "C" fn iroh_doc_join(
             (callback.on_success)(callback.userdata, doc_handle, namespace_cstr);
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -1510,8 +1500,8 @@ pub extern "C" fn iroh_doc_set(
     callback: IrohDocSetCallback,
 ) {
     if doc_handle.is_null() {
-        let error = CString::new("doc_handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("doc_handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
@@ -1542,12 +1532,12 @@ pub extern "C" fn iroh_doc_set(
     {
         Ok(hash) => {
             let hash: iroh_blobs::Hash = hash; // type annotation
-            let hash_str = CString::new(hash.to_string()).unwrap().into_raw();
+            let hash_str = c_string(hash.to_string());
             (callback.on_success)(callback.userdata, hash_str);
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -1565,8 +1555,8 @@ pub extern "C" fn iroh_doc_get(
     callback: IrohDocGetCallback,
 ) {
     if doc_handle.is_null() {
-        let error = CString::new("doc_handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("doc_handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
@@ -1579,8 +1569,10 @@ pub extern "C" fn iroh_doc_get(
         unsafe { std::slice::from_raw_parts(key.data, key.len).to_vec() }
     };
 
-    // Query for the exact key
-    let query = iroh_docs::store::Query::key_exact(key_bytes);
+    // The latest entry for the key across all authors. A plain key_exact query
+    // sorts by author and skips empty entries first, so it would return an older
+    // author's value, even after a newer delete.
+    let query = iroh_docs::store::Query::single_latest_per_key().key_exact(key_bytes);
 
     match node.runtime().block_on(async {
         use futures_lite::StreamExt;
@@ -1600,8 +1592,8 @@ pub extern "C" fn iroh_doc_get(
             (callback.on_success)(callback.userdata, std::ptr::null());
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -1622,8 +1614,8 @@ pub extern "C" fn iroh_doc_get_many(
     callback: IrohDocGetManyCallback,
 ) {
     if doc_handle.is_null() {
-        let error = CString::new("doc_handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("doc_handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
@@ -1636,8 +1628,8 @@ pub extern "C" fn iroh_doc_get_many(
         unsafe { std::slice::from_raw_parts(prefix.data, prefix.len).to_vec() }
     };
 
-    // Query by prefix
-    let query = iroh_docs::store::Query::key_prefix(prefix_bytes);
+    // One entry per key, the latest across all authors (deleted keys are skipped)
+    let query = iroh_docs::store::Query::single_latest_per_key().key_prefix(prefix_bytes);
 
     match node.runtime().block_on(async {
         use futures_lite::StreamExt;
@@ -1663,8 +1655,8 @@ pub extern "C" fn iroh_doc_get_many(
             (callback.on_complete)(callback.userdata);
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -1683,8 +1675,8 @@ pub extern "C" fn iroh_doc_del(
     callback: IrohDocDelCallback,
 ) {
     if doc_handle.is_null() {
-        let error = CString::new("doc_handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("doc_handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
@@ -1708,8 +1700,8 @@ pub extern "C" fn iroh_doc_del(
             (callback.on_success)(callback.userdata, count as u64);
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -1729,31 +1721,31 @@ pub unsafe extern "C" fn iroh_doc_read_content(
     callback: IrohGetCallback,
 ) {
     if handle.is_null() {
-        let error = CString::new("handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
     if content_hash.is_null() {
-        let error = CString::new("content_hash cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("content_hash cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
     let hash_str = match unsafe { CStr::from_ptr(content_hash) }.to_str() {
         Ok(s) => s,
         Err(e) => {
-            let error = CString::new(format!("Invalid hash UTF-8: {}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("Invalid hash UTF-8: {}", e));
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
 
-    let hash: iroh_blobs::Hash = match hash_str.parse() {
+    let hash: iroh_blobs::Hash = match parse_hash_str(hash_str) {
         Ok(h) => h,
         Err(e) => {
-            let error = CString::new(format!("Invalid hash: {}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(e);
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
@@ -1772,8 +1764,8 @@ pub unsafe extern "C" fn iroh_doc_read_content(
             (callback.on_success)(callback.userdata, owned);
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -1790,8 +1782,8 @@ pub extern "C" fn iroh_doc_share(
     callback: IrohCallback,
 ) {
     if doc_handle.is_null() {
-        let error = CString::new("doc_handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("doc_handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
@@ -1809,12 +1801,12 @@ pub extern "C" fn iroh_doc_share(
             .share(share_mode, AddrInfoOptions::RelayAndAddresses),
     ) {
         Ok(ticket) => {
-            let ticket_str = CString::new(ticket.to_string()).unwrap().into_raw();
+            let ticket_str = c_string(ticket.to_string());
             (callback.on_success)(callback.userdata, ticket_str);
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -1886,9 +1878,7 @@ fn convert_entry_to_ffi(entry: &iroh_docs::Entry) -> IrohDocEntry {
     };
 
     // Get content hash as string
-    let hash_str = CString::new(entry.content_hash().to_string())
-        .unwrap()
-        .into_raw();
+    let hash_str = c_string(entry.content_hash().to_string());
 
     IrohDocEntry {
         author_id,
@@ -1919,8 +1909,8 @@ pub extern "C" fn iroh_doc_subscribe(
     callback: IrohDocSubscribeCallback,
 ) -> *mut IrohSubscriptionHandle {
     if doc_handle.is_null() {
-        let error = CString::new("doc_handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("doc_handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return std::ptr::null_mut();
     }
 
@@ -1954,8 +1944,8 @@ pub extern "C" fn iroh_doc_subscribe(
         let stream = match doc.subscribe().await {
             Ok(s) => s,
             Err(e) => {
-                let error = CString::new(format!("{:#}", e)).unwrap();
-                (on_failure)(ud!(userdata_addr), error.into_raw());
+                let error = c_string(format!("{:#}", e));
+                (on_failure)(ud!(userdata_addr), error);
                 return;
             }
         };
@@ -1976,8 +1966,8 @@ pub extern "C" fn iroh_doc_subscribe(
                             (on_event)(ud!(userdata_addr), ffi_event);
                         }
                         Some(Err(e)) => {
-                            let error = CString::new(format!("{:#}", e)).unwrap();
-                            (on_failure)(ud!(userdata_addr), error.into_raw());
+                            let error = c_string(format!("{:#}", e));
+                            (on_failure)(ud!(userdata_addr), error);
                             break;
                         }
                         None => {
@@ -2060,7 +2050,7 @@ fn convert_live_event_to_ffi(event: &iroh_docs::engine::LiveEvent) -> IrohDocEve
         LiveEvent::InsertRemote { from, entry, .. } => {
             let ffi_entry = convert_entry_to_ffi(entry);
             let entry_ptr = Box::into_raw(Box::new(ffi_entry));
-            let peer_id = CString::new(from.to_string()).unwrap().into_raw();
+            let peer_id = c_string(from.to_string());
             IrohDocEvent {
                 event_type: IrohDocEventType::InsertRemote,
                 entry: entry_ptr,
@@ -2069,7 +2059,7 @@ fn convert_live_event_to_ffi(event: &iroh_docs::engine::LiveEvent) -> IrohDocEve
             }
         }
         LiveEvent::ContentReady { hash } => {
-            let hash_str = CString::new(hash.to_string()).unwrap().into_raw();
+            let hash_str = c_string(hash.to_string());
             IrohDocEvent {
                 event_type: IrohDocEventType::ContentReady,
                 entry: std::ptr::null(),
@@ -2084,7 +2074,7 @@ fn convert_live_event_to_ffi(event: &iroh_docs::engine::LiveEvent) -> IrohDocEve
             content_hash: std::ptr::null(),
         },
         LiveEvent::NeighborUp(peer) => {
-            let peer_id = CString::new(peer.to_string()).unwrap().into_raw();
+            let peer_id = c_string(peer.to_string());
             IrohDocEvent {
                 event_type: IrohDocEventType::NeighborUp,
                 entry: std::ptr::null(),
@@ -2093,7 +2083,7 @@ fn convert_live_event_to_ffi(event: &iroh_docs::engine::LiveEvent) -> IrohDocEve
             }
         }
         LiveEvent::NeighborDown(peer) => {
-            let peer_id = CString::new(peer.to_string()).unwrap().into_raw();
+            let peer_id = c_string(peer.to_string());
             IrohDocEvent {
                 event_type: IrohDocEventType::NeighborDown,
                 entry: std::ptr::null(),
@@ -2102,9 +2092,7 @@ fn convert_live_event_to_ffi(event: &iroh_docs::engine::LiveEvent) -> IrohDocEve
             }
         }
         LiveEvent::SyncFinished(sync_event) => {
-            let peer_id = CString::new(sync_event.peer.to_string())
-                .unwrap()
-                .into_raw();
+            let peer_id = c_string(sync_event.peer.to_string());
             IrohDocEvent {
                 event_type: IrohDocEventType::SyncFinished,
                 entry: std::ptr::null(),
@@ -2138,28 +2126,28 @@ pub unsafe extern "C" fn iroh_blob_tag_set(
     callback: IrohCloseCallback,
 ) {
     if handle.is_null() {
-        let error = CString::new("handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
     if tag_name.is_null() {
-        let error = CString::new("tag_name cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("tag_name cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
     if hash_str.is_null() {
-        let error = CString::new("hash_str cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("hash_str cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
     let tag_name_str = match unsafe { CStr::from_ptr(tag_name) }.to_str() {
         Ok(s) => s.to_string(),
         Err(e) => {
-            let error = CString::new(format!("Invalid tag_name UTF-8: {}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("Invalid tag_name UTF-8: {}", e));
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
@@ -2167,17 +2155,17 @@ pub unsafe extern "C" fn iroh_blob_tag_set(
     let hash_string = match unsafe { CStr::from_ptr(hash_str) }.to_str() {
         Ok(s) => s.to_string(),
         Err(e) => {
-            let error = CString::new(format!("Invalid hash UTF-8: {}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("Invalid hash UTF-8: {}", e));
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
 
-    let hash: Hash = match hash_string.parse() {
+    let hash: Hash = match parse_hash_str(&hash_string) {
         Ok(h) => h,
         Err(e) => {
-            let error = CString::new(format!("Invalid hash: {}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(e);
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
@@ -2203,8 +2191,8 @@ pub unsafe extern "C" fn iroh_blob_tag_set(
             (callback.on_complete)(callback.userdata);
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -2226,31 +2214,31 @@ pub unsafe extern "C" fn iroh_blob_ticket_create(
     callback: IrohCallback,
 ) {
     if handle.is_null() {
-        let error = CString::new("handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
     if hash_str.is_null() {
-        let error = CString::new("hash_str cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("hash_str cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
     let hash_string = match unsafe { CStr::from_ptr(hash_str) }.to_str() {
         Ok(s) => s.to_string(),
         Err(e) => {
-            let error = CString::new(format!("Invalid hash UTF-8: {}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("Invalid hash UTF-8: {}", e));
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
 
-    let hash: Hash = match hash_string.parse() {
+    let hash: Hash = match parse_hash_str(&hash_string) {
         Ok(h) => h,
         Err(e) => {
-            let error = CString::new(format!("Invalid hash: {}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(e);
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
@@ -2265,7 +2253,7 @@ pub unsafe extern "C" fn iroh_blob_ticket_create(
     // Get the node's address and create a ticket
     let addr = node.endpoint().addr();
     let ticket = BlobTicket::new(addr, hash, blob_format);
-    let ticket_str = CString::new(ticket.to_string()).unwrap().into_raw();
+    let ticket_str = c_string(ticket.to_string());
 
     (callback.on_success)(callback.userdata, ticket_str);
 }
@@ -2283,22 +2271,22 @@ pub unsafe extern "C" fn iroh_blob_tag_delete(
     callback: IrohCloseCallback,
 ) {
     if handle.is_null() {
-        let error = CString::new("handle cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("handle cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
     if tag_name.is_null() {
-        let error = CString::new("tag_name cannot be null").unwrap();
-        (callback.on_failure)(callback.userdata, error.into_raw());
+        let error = c_string("tag_name cannot be null");
+        (callback.on_failure)(callback.userdata, error);
         return;
     }
 
     let tag_name_str = match unsafe { CStr::from_ptr(tag_name) }.to_str() {
         Ok(s) => s.to_string(),
         Err(e) => {
-            let error = CString::new(format!("Invalid tag_name UTF-8: {}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("Invalid tag_name UTF-8: {}", e));
+            (callback.on_failure)(callback.userdata, error);
             return;
         }
     };
@@ -2314,8 +2302,8 @@ pub unsafe extern "C" fn iroh_blob_tag_delete(
             (callback.on_complete)(callback.userdata);
         }
         Err(e) => {
-            let error = CString::new(format!("{:#}", e)).unwrap();
-            (callback.on_failure)(callback.userdata, error.into_raw());
+            let error = c_string(format!("{:#}", e));
+            (callback.on_failure)(callback.userdata, error);
         }
     }
 }
@@ -2897,6 +2885,23 @@ fn parse_blob_hash(s: &str) -> Result<Hash, String> {
     Ok(Hash::from_bytes(bytes))
 }
 
+/// Parse a blob hash given as 64 hex or 52 base32 characters.
+///
+/// iroh-blobs 0.103's `Hash::from_str` panics on base32 input that does not
+/// decode to exactly 32 bytes (fixed upstream in 0.104, n0-computer/iroh-blobs#282),
+/// and a panic in an `extern "C" fn` aborts the host app. Checking the length
+/// first keeps every other length away from it.
+fn parse_hash_str(s: &str) -> Result<Hash, String> {
+    match s.len() {
+        64 => parse_blob_hash(s),
+        52 => s.parse().map_err(|e| format!("Invalid hash: {}", e)),
+        n => Err(format!(
+            "Invalid hash: expected 64 hex or 52 base32 characters, got {}",
+            n
+        )),
+    }
+}
+
 unsafe fn required_str<'a>(ptr: *const c_char, name: &str) -> Result<&'a str, String> {
     if ptr.is_null() {
         return Err(format!("{} cannot be null", name));
@@ -2938,7 +2943,8 @@ unsafe fn borrowed_bytes<'a>(bytes: &IrohBytes) -> &'a [u8] {
 }
 
 /// A C string for Swift to free with `iroh_string_free` (interior NULs are dropped).
-fn c_string(s: String) -> *mut c_char {
+fn c_string(s: impl Into<String>) -> *mut c_char {
+    let s: String = s.into();
     let s = if s.contains('\0') {
         s.replace('\0', "")
     } else {
@@ -2950,6 +2956,14 @@ fn c_string(s: String) -> *mut c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_c_string_drops_interior_nul_instead_of_panicking() {
+        let ptr = c_string(format!("remote said: {}bad", '\0'));
+        let s = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap().to_owned();
+        unsafe { iroh_string_free(ptr) };
+        assert_eq!(s, "remote said: bad");
+    }
 
     #[test]
     fn test_caller_cancel_reaches_operation_synchronously() {
@@ -2970,6 +2984,57 @@ mod tests {
 
         // No caller token: never cancelled by the caller.
         assert!(!operation_token(std::ptr::null()).is_cancelled());
+    }
+
+    /// RFC 4648 base32 without padding, uppercase.
+    fn base32_nopad(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        let (mut out, mut buf, mut bits) = (String::new(), 0u32, 0u32);
+        for &b in bytes {
+            buf = (buf << 8) | u32::from(b);
+            bits += 8;
+            while bits >= 5 {
+                bits -= 5;
+                out.push(ALPHABET[((buf >> bits) & 31) as usize] as char);
+            }
+        }
+        if bits > 0 {
+            out.push(ALPHABET[((buf << (5 - bits)) & 31) as usize] as char);
+        }
+        out
+    }
+
+    #[test]
+    fn test_parse_hash_str_rejects_bad_input_without_panicking() {
+        for s in [
+            "",
+            "a",
+            "invalid",
+            &"a".repeat(51),
+            &"a".repeat(53),
+            &"!".repeat(52),
+        ] {
+            assert!(parse_hash_str(s).is_err(), "{s:?}");
+        }
+        assert!(parse_hash_str(&"z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn test_parse_hash_str_accepts_hex_and_base32() {
+        let hash = Hash::new(b"hello");
+        let base32 = base32_nopad(hash.as_bytes());
+        assert_eq!(base32.len(), 52);
+        assert_eq!(parse_hash_str(&hash.to_hex()).unwrap(), hash);
+        assert_eq!(parse_hash_str(&base32).unwrap(), hash);
+        assert_eq!(parse_hash_str(&base32.to_lowercase()).unwrap(), hash);
+    }
+
+    /// Canary: once iroh-blobs stops panicking here (0.104+), parse_hash_str's
+    /// length guard can be dropped in favour of `str::parse`.
+    #[test]
+    #[should_panic]
+    fn test_iroh_blobs_hash_from_str_still_panics_on_short_base32() {
+        let _ = "invalid".parse::<Hash>();
     }
 
     #[test]

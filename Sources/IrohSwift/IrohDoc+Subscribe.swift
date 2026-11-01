@@ -1,5 +1,6 @@
 import Foundation
 import IrohSwiftFFI
+import Synchronization
 
 extension IrohDoc {
     /// Subscribe to document events.
@@ -54,7 +55,13 @@ extension IrohDoc {
                         .takeUnretainedValue()
 
                     let docEvent = DocEvent.from(event)
+                    let eventType = event.event_type.rawValue
                     iroh_doc_event_free(event)
+                    // A malformed or newer event type is dropped, not fatal
+                    guard let docEvent else {
+                        IrohLogger.node.warning("subscribe: dropped document event of type \(eventType)")
+                        return
+                    }
                     ctx.continuation.yield(docEvent)
                 },
                 on_complete: { userdata in
@@ -75,8 +82,10 @@ extension IrohDoc {
                 }
             )
 
+            // Callbacks can end the stream on a Tokio thread before this returns;
+            // setHandle then cancels (and frees) the handle at once.
             let subHandle = iroh_doc_subscribe(handle.pointer, callback)
-            context.subscriptionHandle = SubscriptionHandleWrapper(pointer: subHandle)
+            context.setHandle(SubscriptionHandleWrapper(pointer: subHandle))
         }
     }
 }
@@ -84,18 +93,43 @@ extension IrohDoc {
 // MARK: - Subscription Context
 
 /// Internal context for managing a subscription.
-private final class SubscriptionContext: @unchecked Sendable {
+///
+/// The handle is set on the subscribing thread, while `cancel()` can run from
+/// `onTermination` on a Tokio thread, before or after that. The lock orders the
+/// two, and `iroh_subscription_cancel` (which frees the handle) runs exactly once.
+private final class SubscriptionContext: Sendable {
     let continuation: AsyncThrowingStream<DocEvent, Error>.Continuation
-    var subscriptionHandle: SubscriptionHandleWrapper?
+    private let state = Mutex(State())
+
+    private struct State {
+        var handle: SubscriptionHandleWrapper?
+        var cancelled = false
+    }
 
     init(continuation: AsyncThrowingStream<DocEvent, Error>.Continuation) {
         self.continuation = continuation
     }
 
-    func cancel() {
-        if let handle = subscriptionHandle {
+    /// Store the handle, or cancel it at once if the stream has already ended.
+    func setHandle(_ handle: SubscriptionHandleWrapper) {
+        let cancelNow = state.withLock { state in
+            if state.cancelled { return true }
+            state.handle = handle
+            return false
+        }
+        if cancelNow {
             iroh_subscription_cancel(handle.pointer)
-            subscriptionHandle = nil
+        }
+    }
+
+    func cancel() {
+        let handle = state.withLock { state in
+            state.cancelled = true
+            defer { state.handle = nil }
+            return state.handle
+        }
+        if let handle {
+            iroh_subscription_cancel(handle.pointer)
         }
     }
 }

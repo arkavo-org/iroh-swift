@@ -1,6 +1,6 @@
 [package]
 name = "iroh-swift-ffi"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
 description = "Minimal FFI bindings for Iroh blob operations"
@@ -13,7 +13,7 @@ name = "iroh_swift"
 # Same wire lines as the backend: https://github.com/arkavo-org/tdf-iroh-s3 (iroh 1.x, iroh-blobs 0.103).
 # Minimums: iroh-blobs 0.103.0 is yanked; 0.103.1 applies each EventMask field to its
 # own request type (iroh-blobs#270), so `push` is no longer governed by `get`.
-iroh = "1.3.0"
+iroh = "1.4.1"
 iroh-blobs = { version = "0.103.1", features = ["fs-store"] }
 # Docs support (optional, enabled via config)
 iroh-docs = "0.101"

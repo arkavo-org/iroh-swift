@@ -56,19 +56,38 @@ public struct DocEntry: Sendable {
     }
 
     /// Create from FFI entry.
-    init(from ffiEntry: IrohDocEntry) {
+    ///
+    /// Returns `nil` if the content hash is null, or the key is null with a
+    /// non-zero length.
+    init?(from ffiEntry: IrohDocEntry) {
+        guard let hashPtr = ffiEntry.content_hash else { return nil }
+        let keyLen = Int(ffiEntry.key.len)
+        if let keyPtr = ffiEntry.key.data {
+            self.key = Data(bytes: keyPtr, count: keyLen)
+        } else if keyLen == 0 {
+            self.key = Data()
+        } else {
+            return nil
+        }
+
         // Convert author ID bytes to hex string
         let authorBytes = withUnsafeBytes(of: ffiEntry.author_id.bytes) { Data($0) }
         self.authorId = authorBytes.map { String(format: "%02x", $0) }.joined()
 
-        // Copy key bytes
-        self.key = Data(bytes: ffiEntry.key.data, count: Int(ffiEntry.key.len))
-
-        // Copy content hash string
-        self.contentHash = String(cString: ffiEntry.content_hash)
+        self.contentHash = String(cString: hashPtr)
 
         self.contentSize = ffiEntry.content_size
         self.timestamp = ffiEntry.timestamp
+    }
+
+    /// Convert an FFI entry and free it with `iroh_doc_entry_free`.
+    ///
+    /// Returns `nil` for a null pointer or a malformed entry (which is still freed).
+    static func consume(_ entryPtr: UnsafePointer<IrohDocEntry>?) -> DocEntry? {
+        guard let entryPtr else { return nil }
+        let entry = DocEntry(from: entryPtr.pointee)
+        iroh_doc_entry_free(UnsafeMutablePointer(mutating: entryPtr))
+        return entry
     }
 }
 
@@ -96,38 +115,39 @@ public enum DocEvent: Sendable {
     case syncFinished(peerId: String)
 
     /// Create from FFI event.
-    static func from(_ ffiEvent: IrohDocEvent) -> DocEvent {
+    ///
+    /// Returns `nil` for an event type this version does not know, or when a
+    /// field the type requires is null.
+    static func from(_ ffiEvent: IrohDocEvent) -> DocEvent? {
+        // Decoded only by the insert cases, which carry an entry
+        var entry: DocEntry? { ffiEvent.entry.flatMap { DocEntry(from: $0.pointee) } }
+        let peerId = ffiEvent.peer_id.map { String(cString: $0) }
+
         switch ffiEvent.event_type {
         case InsertLocal:
-            let entry = DocEntry(from: ffiEvent.entry!.pointee)
-            return .insertLocal(entry)
+            return entry.map { .insertLocal($0) }
 
         case InsertRemote:
-            let entry = DocEntry(from: ffiEvent.entry!.pointee)
-            let peerId = String(cString: ffiEvent.peer_id!)
+            guard let entry, let peerId else { return nil }
             return .insertRemote(from: peerId, entry: entry)
 
         case ContentReady:
-            let hash = String(cString: ffiEvent.content_hash!)
-            return .contentReady(hash: hash)
+            return ffiEvent.content_hash.map { .contentReady(hash: String(cString: $0)) }
 
         case PendingContentReady:
             return .pendingContentReady
 
         case NeighborUp:
-            let peerId = String(cString: ffiEvent.peer_id!)
-            return .neighborUp(peerId: peerId)
+            return peerId.map { .neighborUp(peerId: $0) }
 
         case NeighborDown:
-            let peerId = String(cString: ffiEvent.peer_id!)
-            return .neighborDown(peerId: peerId)
+            return peerId.map { .neighborDown(peerId: $0) }
 
         case SyncFinished:
-            let peerId = String(cString: ffiEvent.peer_id!)
-            return .syncFinished(peerId: peerId)
+            return peerId.map { .syncFinished(peerId: $0) }
 
         default:
-            fatalError("Unknown document event type: \(ffiEvent.event_type)")
+            return nil
         }
     }
 }

@@ -76,6 +76,53 @@ final class IrohDocTests: XCTestCase {
         XCTAssertTrue(keys.contains("prefix/b"))
     }
 
+    /// getMany delivers every match, not only the newest 100.
+    func testDocGetManyReturnsMoreThan100Entries() async throws {
+        let doc = try await node.createDoc()
+        for i in 0..<150 {
+            _ = try await doc.set(author: author, key: "bulk/\(i)", value: Data("v\(i)".utf8))
+        }
+        var count = 0
+        for try await _ in try await doc.getMany(prefix: "bulk/") { count += 1 }
+        XCTAssertEqual(count, 150)
+    }
+
+    /// Two imported authors, ordered so the first sorts first by author ID.
+    /// A query sorted by author returns the first author's entry before the second's.
+    private func twoAuthorsInIdOrder() async throws -> (IrohAuthor, IrohAuthor) {
+        let other = try await IrohAuthor.create()
+        try await node.importAuthor(other)
+        return author.id < other.id ? (author, other) : (other, author)
+    }
+
+    /// When two authors write the same key, get and getMany return the newer write.
+    func testDocGetReturnsLatestWriteAcrossAuthors() async throws {
+        let doc = try await node.createDoc()
+        let (first, second) = try await twoAuthorsInIdOrder()
+        _ = try await doc.set(author: first, key: "k", value: Data("old".utf8))
+        _ = try await doc.set(author: second, key: "k", value: Data("new".utf8))
+
+        let entry = try await doc.get(key: "k")
+        let content = try await XCTUnwrap(entry).content(from: doc)
+        XCTAssertEqual(content, Data("new".utf8))
+
+        var entries: [DocEntry] = []
+        for try await e in try await doc.getMany(prefix: "k") { entries.append(e) }
+        XCTAssertEqual(entries.count, 1, "one entry per key, the latest")
+        XCTAssertEqual(entries.first?.authorId, second.id)
+    }
+
+    /// A delete by one author hides the key, though another author's older entry remains.
+    func testDocGetAfterDeleteByAnotherAuthorReturnsNil() async throws {
+        let doc = try await node.createDoc()
+        let (first, second) = try await twoAuthorsInIdOrder()
+        _ = try await doc.set(author: first, key: "k", value: Data("old".utf8))
+        _ = try await doc.delete(author: second, key: "k")
+
+        let entry = try await doc.get(key: "k")
+        XCTAssertNil(entry)
+    }
+
     /// Test deleting an entry.
     func testDocDelete() async throws {
         let doc = try await node.createDoc()
@@ -94,6 +141,51 @@ final class IrohDocTests: XCTestCase {
         // Verify it's gone
         entry = try await doc.get(key: key)
         XCTAssertNil(entry, "Entry should be nil after delete")
+    }
+
+    /// delete is a prefix delete: it also removes the author's longer keys.
+    func testDocDeleteRemovesKeysWithThePrefix() async throws {
+        let doc = try await node.createDoc()
+        for key in ["user", "user1", "user/settings", "other"] {
+            _ = try await doc.set(author: author, key: key, value: Data(key.utf8))
+        }
+
+        let count = try await doc.delete(author: author, key: "user")
+        XCTAssertEqual(count, 3)
+
+        var remaining: [String] = []
+        for try await entry in try await doc.getMany(prefix: "") {
+            remaining.append(try XCTUnwrap(entry.keyString))
+        }
+        XCTAssertEqual(remaining, ["other"])
+    }
+
+    /// subscribe delivers a local insert, and ending the stream cancels the subscription.
+    func testDocSubscribeDeliversLocalInsert() async throws {
+        let doc = try await node.createDoc()
+        let author = try XCTUnwrap(self.author)
+        let stream = try await doc.subscribe()
+
+        let key = try await withThrowingTaskGroup(of: String?.self) { group in
+            group.addTask {
+                for try await event in stream {
+                    if case .insertLocal(let entry) = event { return entry.keyString }
+                }
+                return nil
+            }
+            // The Rust subscription starts asynchronously: write until an event arrives.
+            group.addTask {
+                for i in 0..<50 {
+                    _ = try await doc.set(author: author, key: "sub/\(i)", value: Data("x".utf8))
+                    try await Task.sleep(for: .milliseconds(100))
+                }
+                return nil
+            }
+            let first = try await group.next() ?? nil
+            group.cancelAll()  // ends the stream, which cancels the subscription
+            return first
+        }
+        XCTAssertEqual(key?.hasPrefix("sub/"), true)
     }
 
     /// Test getting a share ticket.

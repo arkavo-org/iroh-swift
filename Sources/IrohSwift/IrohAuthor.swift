@@ -15,15 +15,10 @@ public enum KeychainAccessibility: Sendable {
     /// The data is only accessible when the device is unlocked.
     case whenUnlocked
 
-    /// Always available (less secure).
-    /// The data is always accessible, even when the device is locked.
-    case always
-
     var secValue: CFString {
         switch self {
         case .afterFirstUnlock: return kSecAttrAccessibleAfterFirstUnlock
         case .whenUnlocked: return kSecAttrAccessibleWhenUnlocked
-        case .always: return kSecAttrAccessibleAlways
         }
     }
 }
@@ -86,32 +81,19 @@ public struct IrohAuthor: Sendable, Hashable {
     ///   - accessibility: The Keychain accessibility level. Default is `.afterFirstUnlock`.
     /// - Returns: The author loaded from or saved to Keychain.
     /// - Throws: `IrohError.authorCreationFailed` if creation fails,
-    ///           `IrohError.keychainError` if Keychain operations fail.
+    ///           `IrohError.keychainError` if Keychain operations fail. A new
+    ///           author is created only when no item exists: if the stored item
+    ///           cannot be read (e.g. the device is locked) or is not a 32-byte
+    ///           secret, this throws and leaves the item in place.
     public static func getOrCreate(
         identifier: String = "default",
         accessibility: KeychainAccessibility = .afterFirstUnlock
     ) async throws -> IrohAuthor {
         // Try to load from Keychain first
-        if let secretData = try? loadFromKeychain(account: identifier) {
-            // Derive ID from secret
-            var ffiSecret = IrohAuthorSecret()
-            secretData.withUnsafeBytes { buffer in
-                withUnsafeMutableBytes(of: &ffiSecret.bytes) { destBuffer in
-                    destBuffer.copyMemory(from: UnsafeRawBufferPointer(buffer))
-                }
-            }
-
-            let ffiId = iroh_author_id_from_secret(ffiSecret)
-            let publicKey = Data(bytes: [ffiId.bytes.0, ffiId.bytes.1, ffiId.bytes.2, ffiId.bytes.3,
-                                         ffiId.bytes.4, ffiId.bytes.5, ffiId.bytes.6, ffiId.bytes.7,
-                                         ffiId.bytes.8, ffiId.bytes.9, ffiId.bytes.10, ffiId.bytes.11,
-                                         ffiId.bytes.12, ffiId.bytes.13, ffiId.bytes.14, ffiId.bytes.15,
-                                         ffiId.bytes.16, ffiId.bytes.17, ffiId.bytes.18, ffiId.bytes.19,
-                                         ffiId.bytes.20, ffiId.bytes.21, ffiId.bytes.22, ffiId.bytes.23,
-                                         ffiId.bytes.24, ffiId.bytes.25, ffiId.bytes.26, ffiId.bytes.27,
-                                         ffiId.bytes.28, ffiId.bytes.29, ffiId.bytes.30, ffiId.bytes.31],
-                                 count: 32)
-            return IrohAuthor(secret: secretData, publicKey: publicKey)
+        // Only "not found" creates an author; any other read failure (a locked
+        // device, a missing entitlement) throws instead of replacing the identity.
+        if let secretData = try loadFromKeychain(account: identifier) {
+            return try fromKeychainSecret(secretData)
         }
 
         // Create a new author
@@ -227,12 +209,6 @@ public struct IrohAuthor: Sendable, Hashable {
     ///
     /// - Returns: The 64-character hex-encoded secret key.
     public func exportSecretHex() -> String {
-        var ffiSecret = IrohAuthorSecret()
-        secret.withUnsafeBytes { buffer in
-            withUnsafeMutableBytes(of: &ffiSecret.bytes) { destBuffer in
-                destBuffer.copyMemory(from: UnsafeRawBufferPointer(buffer))
-            }
-        }
         let hexPtr = iroh_author_secret_to_hex(ffiSecret)!
         let hex = String(cString: hexPtr)
         iroh_string_free(hexPtr)
@@ -261,18 +237,37 @@ public struct IrohAuthor: Sendable, Hashable {
 
     /// Convert to FFI secret type for document operations.
     internal var ffiSecret: IrohAuthorSecret {
+        Self.ffiSecret(from: secret)
+    }
+
+    /// Copy a 32-byte secret into the FFI type. Callers check the length.
+    private static func ffiSecret(from secretData: Data) -> IrohAuthorSecret {
         var result = IrohAuthorSecret()
-        secret.withUnsafeBytes { buffer in
+        secretData.withUnsafeBytes { buffer in
             withUnsafeMutableBytes(of: &result.bytes) { destBuffer in
-                destBuffer.copyMemory(from: UnsafeRawBufferPointer(buffer))
+                destBuffer.copyMemory(from: buffer)
             }
         }
         return result
     }
 
+    /// Rebuild an author from a secret loaded from the Keychain.
+    ///
+    /// Throws `IrohError.keychainError` if the stored secret is not 32 bytes,
+    /// rather than replacing the stored identity with a new one.
+    static func fromKeychainSecret(_ secretData: Data) throws -> IrohAuthor {
+        guard secretData.count == 32 else {
+            throw IrohError.keychainError("Stored author secret is \(secretData.count) bytes, expected 32")
+        }
+        let ffiId = iroh_author_id_from_secret(ffiSecret(from: secretData))
+        let publicKey = withUnsafeBytes(of: ffiId.bytes) { Data($0) }
+        return IrohAuthor(secret: secretData, publicKey: publicKey)
+    }
+
     // MARK: - Private Keychain Helpers
 
-    private static func loadFromKeychain(account: String) throws -> Data {
+    /// Returns `nil` only if no item exists for `account`.
+    private static func loadFromKeychain(account: String) throws -> Data? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
@@ -283,11 +278,16 @@ public struct IrohAuthor: Sendable, Hashable {
 
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
+        return try keychainData(status: status, result: result)
+    }
 
+    /// Interpret a Keychain read: `nil` for `errSecItemNotFound`, the data on
+    /// success, and `IrohError.keychainError` for any other status.
+    static func keychainData(status: OSStatus, result: AnyObject?) throws -> Data? {
+        if status == errSecItemNotFound { return nil }
         guard status == errSecSuccess, let data = result as? Data else {
             throw IrohError.keychainError("Failed to load author: \(status)")
         }
-
         return data
     }
 

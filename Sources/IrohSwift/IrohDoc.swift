@@ -184,13 +184,8 @@ public actor IrohDoc {
                             .fromOpaque(userdata!)
                             .takeRetainedValue()
 
-                        if let entryPtr = entryPtr {
-                            let entry = DocEntry(from: entryPtr.pointee)
-                            iroh_doc_entry_free(UnsafeMutablePointer(mutating: entryPtr))
-                            box.continuation.resume(returning: entry)
-                        } else {
-                            box.continuation.resume(returning: nil)
-                        }
+                        // A null entry means the key was not found
+                        box.continuation.resume(returning: DocEntry.consume(entryPtr))
                     },
                     on_failure: { userdata, errorPtr in
                         let box = Unmanaged<DocEntryContinuationBox>
@@ -228,7 +223,9 @@ public actor IrohDoc {
     public func getMany(prefix: Data) async throws -> AsyncThrowingStream<DocEntry, Error> {
         try ensureNotClosed()
 
-        return AsyncThrowingStream(bufferingPolicy: .bufferingNewest(100)) { continuation in
+        // Unbounded: iroh_doc_get_many runs to completion inside this closure,
+        // before the caller reads anything, so a bounded buffer would drop entries.
+        return AsyncThrowingStream(bufferingPolicy: .unbounded) { continuation in
             let context = GetManyContext(continuation: continuation)
             let contextPtr = Unmanaged.passRetained(context).toOpaque()
 
@@ -244,8 +241,11 @@ public actor IrohDoc {
                         let ctx = Unmanaged<GetManyContext>
                             .fromOpaque(userdata!)
                             .takeUnretainedValue()  // Don't consume - more entries coming
-                        let entry = DocEntry(from: entryPtr!.pointee)
-                        iroh_doc_entry_free(UnsafeMutablePointer(mutating: entryPtr))
+                        // A null entry is dropped, not fatal
+                        guard let entry = DocEntry.consume(entryPtr) else {
+                            IrohLogger.node.warning("getMany: dropped null document entry")
+                            return
+                        }
                         ctx.continuation.yield(entry)
                     },
                     on_complete: { userdata in
@@ -269,11 +269,17 @@ public actor IrohDoc {
         }
     }
 
-    /// Delete an entry (creates a tombstone).
+    /// Delete every entry by `author` whose key starts with `key`.
+    ///
+    /// This is a prefix delete: `"user"` also removes `"user1"` and
+    /// `"user/settings"`, and an empty key removes everything `author` wrote.
+    /// It writes an empty entry (a tombstone) at `key`, which also hides older
+    /// entries by other authors for that exact key from `get` and `getMany`.
+    /// Other authors' entries under longer keys are not affected.
     ///
     /// - Parameters:
     ///   - author: The author signing the deletion.
-    ///   - key: The key as a string (UTF-8 encoded).
+    ///   - key: The key prefix as a string (UTF-8 encoded).
     /// - Returns: The number of entries deleted.
     /// - Throws: `IrohError.docClosed` if the document is closed,
     ///           `IrohError.docDeleteFailed` if the operation fails.
@@ -285,11 +291,13 @@ public actor IrohDoc {
         return try await delete(author: author, key: keyData)
     }
 
-    /// Delete an entry using raw key bytes.
+    /// Delete every entry by `author` whose key starts with the `key` bytes.
+    ///
+    /// A prefix delete; see the `String` overload for details.
     ///
     /// - Parameters:
     ///   - author: The author signing the deletion.
-    ///   - key: The key bytes.
+    ///   - key: The key prefix bytes.
     /// - Returns: The number of entries deleted.
     /// - Throws: `IrohError.docClosed` if the document is closed,
     ///           `IrohError.docDeleteFailed` if the operation fails.

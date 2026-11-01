@@ -60,17 +60,53 @@ final class IrohAuthorTests: XCTestCase {
         XCTAssertEqual(set.count, 1, "Set should contain only one author")
     }
 
-    /// Test KeychainAccessibility enum values.
-    func testKeychainAccessibilityValues() {
-        // Just verify the enum cases exist and have different secValues
-        let afterFirstUnlock = KeychainAccessibility.afterFirstUnlock
-        let whenUnlocked = KeychainAccessibility.whenUnlocked
-        let always = KeychainAccessibility.always
+    /// A Keychain secret that is not 32 bytes throws instead of trapping.
+    func testKeychainSecretOfWrongLengthThrows() {
+        for count in [0, 31, 33] {
+            XCTAssertThrowsError(try IrohAuthor.fromKeychainSecret(Data(repeating: 1, count: count))) { error in
+                guard case IrohError.keychainError = error else {
+                    return XCTFail("\(count) bytes: expected keychainError, got \(error)")
+                }
+            }
+        }
+    }
 
-        // Each should return a CFString
-        XCTAssertNotNil(afterFirstUnlock.secValue)
-        XCTAssertNotNil(whenUnlocked.secValue)
-        XCTAssertNotNil(always.secValue)
+    /// Only "not found" counts as no stored author. Any other failure throws, so
+    /// getOrCreate never replaces an identity it could not read (e.g. a locked device).
+    func testKeychainReadDistinguishesNotFoundFromFailure() throws {
+        XCTAssertNil(try IrohAuthor.keychainData(status: errSecItemNotFound, result: nil))
+
+        let stored = Data(repeating: 7, count: 32)
+        XCTAssertEqual(try IrohAuthor.keychainData(status: errSecSuccess, result: stored as NSData), stored)
+
+        for status in [errSecInteractionNotAllowed, errSecMissingEntitlement, errSecAuthFailed] {
+            XCTAssertThrowsError(try IrohAuthor.keychainData(status: status, result: nil)) { error in
+                guard case IrohError.keychainError = error else {
+                    return XCTFail("status \(status): expected keychainError, got \(error)")
+                }
+            }
+        }
+        XCTAssertThrowsError(try IrohAuthor.keychainData(status: errSecSuccess, result: nil))
+    }
+
+    /// A 32-byte Keychain secret rebuilds the same author.
+    func testKeychainSecretRebuildsAuthor() async throws {
+        let author = try await IrohAuthor.create()
+        let loaded = try IrohAuthor.fromKeychainSecret(author.secret)
+        XCTAssertEqual(loaded.id, author.id)
+        XCTAssertEqual(loaded.publicKey, author.publicKey)
+    }
+
+    /// Each accessibility level maps to its Keychain constant.
+    func testKeychainAccessibilityValues() {
+        XCTAssertEqual(
+            KeychainAccessibility.afterFirstUnlock.secValue as String,
+            kSecAttrAccessibleAfterFirstUnlock as String
+        )
+        XCTAssertEqual(
+            KeychainAccessibility.whenUnlocked.secValue as String,
+            kSecAttrAccessibleWhenUnlocked as String
+        )
     }
 
     // Note: Keychain tests (getOrCreate, save, load, delete) require actual Keychain access
