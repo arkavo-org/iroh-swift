@@ -70,6 +70,16 @@ public struct DocEntry: Sendable {
         self.contentSize = ffiEntry.content_size
         self.timestamp = ffiEntry.timestamp
     }
+
+    /// Convert an FFI entry and free it with `iroh_doc_entry_free`.
+    ///
+    /// Returns `nil` for a null pointer.
+    static func consume(_ entryPtr: UnsafePointer<IrohDocEntry>?) -> DocEntry? {
+        guard let entryPtr else { return nil }
+        let entry = DocEntry(from: entryPtr.pointee)
+        iroh_doc_entry_free(UnsafeMutablePointer(mutating: entryPtr))
+        return entry
+    }
 }
 
 /// Events from document subscriptions.

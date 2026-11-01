@@ -184,13 +184,8 @@ public actor IrohDoc {
                             .fromOpaque(userdata!)
                             .takeRetainedValue()
 
-                        if let entryPtr = entryPtr {
-                            let entry = DocEntry(from: entryPtr.pointee)
-                            iroh_doc_entry_free(UnsafeMutablePointer(mutating: entryPtr))
-                            box.continuation.resume(returning: entry)
-                        } else {
-                            box.continuation.resume(returning: nil)
-                        }
+                        // A null entry means the key was not found
+                        box.continuation.resume(returning: DocEntry.consume(entryPtr))
                     },
                     on_failure: { userdata, errorPtr in
                         let box = Unmanaged<DocEntryContinuationBox>
@@ -244,8 +239,11 @@ public actor IrohDoc {
                         let ctx = Unmanaged<GetManyContext>
                             .fromOpaque(userdata!)
                             .takeUnretainedValue()  // Don't consume - more entries coming
-                        let entry = DocEntry(from: entryPtr!.pointee)
-                        iroh_doc_entry_free(UnsafeMutablePointer(mutating: entryPtr))
+                        // A null entry is dropped, not fatal
+                        guard let entry = DocEntry.consume(entryPtr) else {
+                            IrohLogger.node.warning("getMany: dropped null document entry")
+                            return
+                        }
                         ctx.continuation.yield(entry)
                     },
                     on_complete: { userdata in
