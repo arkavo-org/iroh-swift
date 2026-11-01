@@ -81,14 +81,18 @@ public struct IrohAuthor: Sendable, Hashable {
     ///   - accessibility: The Keychain accessibility level. Default is `.afterFirstUnlock`.
     /// - Returns: The author loaded from or saved to Keychain.
     /// - Throws: `IrohError.authorCreationFailed` if creation fails,
-    ///           `IrohError.keychainError` if Keychain operations fail or the
-    ///           stored secret is not 32 bytes (it is left in place).
+    ///           `IrohError.keychainError` if Keychain operations fail. A new
+    ///           author is created only when no item exists: if the stored item
+    ///           cannot be read (e.g. the device is locked) or is not a 32-byte
+    ///           secret, this throws and leaves the item in place.
     public static func getOrCreate(
         identifier: String = "default",
         accessibility: KeychainAccessibility = .afterFirstUnlock
     ) async throws -> IrohAuthor {
         // Try to load from Keychain first
-        if let secretData = try? loadFromKeychain(account: identifier) {
+        // Only "not found" creates an author; any other read failure (a locked
+        // device, a missing entitlement) throws instead of replacing the identity.
+        if let secretData = try loadFromKeychain(account: identifier) {
             return try fromKeychainSecret(secretData)
         }
 
@@ -269,7 +273,8 @@ public struct IrohAuthor: Sendable, Hashable {
 
     // MARK: - Private Keychain Helpers
 
-    private static func loadFromKeychain(account: String) throws -> Data {
+    /// Returns `nil` only if no item exists for `account`.
+    private static func loadFromKeychain(account: String) throws -> Data? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
@@ -280,11 +285,16 @@ public struct IrohAuthor: Sendable, Hashable {
 
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
+        return try keychainData(status: status, result: result)
+    }
 
+    /// Interpret a Keychain read: `nil` for `errSecItemNotFound`, the data on
+    /// success, and `IrohError.keychainError` for any other status.
+    static func keychainData(status: OSStatus, result: AnyObject?) throws -> Data? {
+        if status == errSecItemNotFound { return nil }
         guard status == errSecSuccess, let data = result as? Data else {
             throw IrohError.keychainError("Failed to load author: \(status)")
         }
-
         return data
     }
 

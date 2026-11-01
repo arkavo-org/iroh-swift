@@ -71,6 +71,24 @@ final class IrohAuthorTests: XCTestCase {
         }
     }
 
+    /// Only "not found" counts as no stored author. Any other failure throws, so
+    /// getOrCreate never replaces an identity it could not read (e.g. a locked device).
+    func testKeychainReadDistinguishesNotFoundFromFailure() throws {
+        XCTAssertNil(try IrohAuthor.keychainData(status: errSecItemNotFound, result: nil))
+
+        let stored = Data(repeating: 7, count: 32)
+        XCTAssertEqual(try IrohAuthor.keychainData(status: errSecSuccess, result: stored as NSData), stored)
+
+        for status in [errSecInteractionNotAllowed, errSecMissingEntitlement, errSecAuthFailed] {
+            XCTAssertThrowsError(try IrohAuthor.keychainData(status: status, result: nil)) { error in
+                guard case IrohError.keychainError = error else {
+                    return XCTFail("status \(status): expected keychainError, got \(error)")
+                }
+            }
+        }
+        XCTAssertThrowsError(try IrohAuthor.keychainData(status: errSecSuccess, result: nil))
+    }
+
     /// A 32-byte Keychain secret rebuilds the same author.
     func testKeychainSecretRebuildsAuthor() async throws {
         let author = try await IrohAuthor.create()
