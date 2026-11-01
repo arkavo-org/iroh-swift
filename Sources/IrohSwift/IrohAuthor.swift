@@ -90,32 +90,15 @@ public struct IrohAuthor: Sendable, Hashable {
     ///   - accessibility: The Keychain accessibility level. Default is `.afterFirstUnlock`.
     /// - Returns: The author loaded from or saved to Keychain.
     /// - Throws: `IrohError.authorCreationFailed` if creation fails,
-    ///           `IrohError.keychainError` if Keychain operations fail.
+    ///           `IrohError.keychainError` if Keychain operations fail or the
+    ///           stored secret is not 32 bytes (it is left in place).
     public static func getOrCreate(
         identifier: String = "default",
         accessibility: KeychainAccessibility = .afterFirstUnlock
     ) async throws -> IrohAuthor {
         // Try to load from Keychain first
         if let secretData = try? loadFromKeychain(account: identifier) {
-            // Derive ID from secret
-            var ffiSecret = IrohAuthorSecret()
-            secretData.withUnsafeBytes { buffer in
-                withUnsafeMutableBytes(of: &ffiSecret.bytes) { destBuffer in
-                    destBuffer.copyMemory(from: UnsafeRawBufferPointer(buffer))
-                }
-            }
-
-            let ffiId = iroh_author_id_from_secret(ffiSecret)
-            let publicKey = Data(bytes: [ffiId.bytes.0, ffiId.bytes.1, ffiId.bytes.2, ffiId.bytes.3,
-                                         ffiId.bytes.4, ffiId.bytes.5, ffiId.bytes.6, ffiId.bytes.7,
-                                         ffiId.bytes.8, ffiId.bytes.9, ffiId.bytes.10, ffiId.bytes.11,
-                                         ffiId.bytes.12, ffiId.bytes.13, ffiId.bytes.14, ffiId.bytes.15,
-                                         ffiId.bytes.16, ffiId.bytes.17, ffiId.bytes.18, ffiId.bytes.19,
-                                         ffiId.bytes.20, ffiId.bytes.21, ffiId.bytes.22, ffiId.bytes.23,
-                                         ffiId.bytes.24, ffiId.bytes.25, ffiId.bytes.26, ffiId.bytes.27,
-                                         ffiId.bytes.28, ffiId.bytes.29, ffiId.bytes.30, ffiId.bytes.31],
-                                 count: 32)
-            return IrohAuthor(secret: secretData, publicKey: publicKey)
+            return try fromKeychainSecret(secretData)
         }
 
         // Create a new author
@@ -272,6 +255,25 @@ public struct IrohAuthor: Sendable, Hashable {
             }
         }
         return result
+    }
+
+    /// Rebuild an author from a secret loaded from the Keychain.
+    ///
+    /// Throws `IrohError.keychainError` if the stored secret is not 32 bytes,
+    /// rather than replacing the stored identity with a new one.
+    static func fromKeychainSecret(_ secretData: Data) throws -> IrohAuthor {
+        guard secretData.count == 32 else {
+            throw IrohError.keychainError("Stored author secret is \(secretData.count) bytes, expected 32")
+        }
+        var ffiSecret = IrohAuthorSecret()
+        secretData.withUnsafeBytes { buffer in
+            withUnsafeMutableBytes(of: &ffiSecret.bytes) { destBuffer in
+                destBuffer.copyMemory(from: buffer)
+            }
+        }
+        let ffiId = iroh_author_id_from_secret(ffiSecret)
+        let publicKey = withUnsafeBytes(of: ffiId.bytes) { Data($0) }
+        return IrohAuthor(secret: secretData, publicKey: publicKey)
     }
 
     // MARK: - Private Keychain Helpers

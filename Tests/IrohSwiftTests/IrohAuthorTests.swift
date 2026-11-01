@@ -60,6 +60,25 @@ final class IrohAuthorTests: XCTestCase {
         XCTAssertEqual(set.count, 1, "Set should contain only one author")
     }
 
+    /// A Keychain secret that is not 32 bytes throws instead of trapping.
+    func testKeychainSecretOfWrongLengthThrows() {
+        for count in [0, 31, 33] {
+            XCTAssertThrowsError(try IrohAuthor.fromKeychainSecret(Data(repeating: 1, count: count))) { error in
+                guard case IrohError.keychainError = error else {
+                    return XCTFail("\(count) bytes: expected keychainError, got \(error)")
+                }
+            }
+        }
+    }
+
+    /// A 32-byte Keychain secret rebuilds the same author.
+    func testKeychainSecretRebuildsAuthor() async throws {
+        let author = try await IrohAuthor.create()
+        let loaded = try IrohAuthor.fromKeychainSecret(author.secret)
+        XCTAssertEqual(loaded.id, author.id)
+        XCTAssertEqual(loaded.publicKey, author.publicKey)
+    }
+
     /// `.always` maps to Apple's replacement for the deprecated `kSecAttrAccessibleAlways`.
     @available(*, deprecated)
     func testKeychainAccessibilityAlwaysMapsToAfterFirstUnlock() {
