@@ -1,6 +1,6 @@
 [package]
 name = "iroh-swift-ffi"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
 description = "Minimal FFI bindings for Iroh blob operations"
@@ -10,14 +10,11 @@ crate-type = ["staticlib"]
 name = "iroh_swift"
 
 [dependencies]
-# Same wire lines as the backend: https://github.com/arkavo-org/tdf-iroh-s3 (iroh 1.x, iroh-blobs 0.103).
-# Minimums: iroh-blobs 0.103.0 is yanked; 0.103.1 applies each EventMask field to its
-# own request type (iroh-blobs#270), so `push` is no longer governed by `get`.
+# Same wire lines as the backend: https://github.com/arkavo-org/tdf-iroh-s3 (iroh 1.x, iroh-blobs 0.104).
+# iroh-blobs 0.104.1 removes the `.obao4` file of an inlined outboard once an import
+# completes (n0-computer/iroh-blobs#334); 0.104.0 leaked it.
 iroh = "1.4.1"
-iroh-blobs = { version = "0.103.1", features = ["fs-store"] }
-# Docs support (optional, enabled via config)
-iroh-docs = "0.101"
-iroh-gossip = "0.101"
+iroh-blobs = { version = "0.104.1", features = ["fs-store"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "fs", "io-util", "time", "macros"] }
 tokio-util = "0.7"
 anyhow = "1"
@@ -32,8 +29,8 @@ iroh-mainline-address-lookup = "0.6"
 # The DHT client the lookup runs on (bootstrap nodes, `Testnet` in tests).
 n0-mainline = "0.7"
 # Verified-streaming types for fetching a blob straight into a file
-# (`iroh_blobs::get::fsm` yields `bao_tree` content items). Same 0.16 line iroh-blobs uses.
-bao-tree = "0.16"
+# (`iroh_blobs::get::fsm` yields `bao_tree` content items). Same 0.17 line iroh-blobs uses.
+bao-tree = "0.17"
 
 [build-dependencies]
 cbindgen = "0.28"

@@ -2,7 +2,7 @@
 import PackageDescription
 import Foundation
 
-let version = "0.7.0"
+let version = "0.8.0"
 
 // Checksum is updated by release automation
 let checksum = "da5b8e52a15cddd172c68f7c38e36ec9312883ffd47edbe579c56fc7e3f40e1b"

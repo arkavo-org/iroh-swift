@@ -14,17 +14,12 @@ public struct IrohConfig: Sendable {
     /// Example: "https://relay.example.com"
     public var customRelayUrl: String?
 
-    /// Whether to enable the Docs engine for syncing documents.
-    /// Default: false
-    public var docsEnabled: Bool
-
     /// Whether this node serves blobs to other nodes (accepts the iroh-blobs protocol).
     ///
     /// When `false` the node is client-only: it can still `fetch(hash:fromNode:...)`,
     /// `get(ticket:)` and `pushToNode(...)`, but peers cannot download blobs from
     /// it — their blobs connections are refused at the handshake. Tickets created
-    /// by `put(_:)` on a client-only node are not fetchable by others. With
-    /// `docsEnabled`, peers cannot pull this node's document content either.
+    /// by `put(_:)` on a client-only node are not fetchable by others.
     /// Whether peers may push blobs to a serving node is `acceptsPushes`.
     /// Default: true
     public var servesBlobs: Bool
@@ -77,7 +72,6 @@ public struct IrohConfig: Sendable {
     ///                  Application Support/iroh (excluded from iCloud backup).
     ///   - relayEnabled: Whether to use relay servers. Default: true.
     ///   - customRelayUrl: Custom relay server URL. If nil, uses n0's public relays.
-    ///   - docsEnabled: Whether to enable the Docs engine. Default: false.
     ///   - servesBlobs: Whether to serve blobs to other nodes. `false` makes the
     ///                  node client-only (fetch and push still work). Default: true.
     ///   - acceptsPushes: Whether peers may push blobs into this node's store.
@@ -93,7 +87,6 @@ public struct IrohConfig: Sendable {
         storagePath: URL? = nil,
         relayEnabled: Bool = true,
         customRelayUrl: String? = nil,
-        docsEnabled: Bool = false,
         servesBlobs: Bool = true,
         acceptsPushes: Bool = false,
         dhtLookup: Bool = false,
@@ -102,7 +95,6 @@ public struct IrohConfig: Sendable {
         self.storagePath = storagePath ?? Self.defaultStoragePath()
         self.relayEnabled = relayEnabled
         self.customRelayUrl = customRelayUrl
-        self.docsEnabled = docsEnabled
         self.servesBlobs = servesBlobs
         self.acceptsPushes = acceptsPushes
         self.dhtLookup = dhtLookup

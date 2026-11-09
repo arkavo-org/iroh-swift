@@ -39,7 +39,7 @@ Three-layer design with FFI boundary:
 Swift Layer (IrohSwift)           Rust FFI Layer                Iroh Libraries
 ┌─────────────────────┐          ┌────────────────────┐        ┌────────────────────┐
 │ IrohNode (actor)    │──C ABI──▶│ ffi.rs (callbacks) │───────▶│ iroh 1.4.1         │
-│ IrohConfig          │          │ node.rs (IrohNode) │        │ iroh-blobs 0.103.1 │
+│ IrohConfig          │          │ node.rs (IrohNode) │        │ iroh-blobs 0.104.1 │
 │ IrohError           │          └────────────────────┘        │ tokio runtime      │
 └─────────────────────┘                                        └────────────────────┘
 ```
@@ -161,5 +161,8 @@ on the redb lock) and `close()` nodes explicitly.
 ## Constraints
 
 - No Ruby code (per user preference)
+- No iroh-docs / iroh-gossip: docs support was removed in 0.8.0 because iroh-docs lagged
+  iroh-blobs (0.101 pinned `^0.103`) and no app used it. Before adding a crate that shares
+  the blobs store, check that it accepts the iroh-blobs version in use.
 - Strict Swift 6.2 concurrency checking enabled
 - Dual licensed: MIT + Apache 2.0
