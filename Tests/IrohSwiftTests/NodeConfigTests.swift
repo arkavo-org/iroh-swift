@@ -8,7 +8,7 @@ struct NodeConfigTests {
     func servesBlobsDefault() {
         #expect(IrohConfig().servesBlobs)
         #expect(!IrohConfig(servesBlobs: false).servesBlobs)
-        #expect(IrohConfig(relayEnabled: false, docsEnabled: true).servesBlobs)
+        #expect(IrohConfig(relayEnabled: false).servesBlobs)
     }
 
     @Test("IrohConfig refuses pushes by default")

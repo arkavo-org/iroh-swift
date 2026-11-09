@@ -66,7 +66,6 @@ public actor IrohNode {
                     storage_path: pathPtr,
                     relay_enabled: config.relayEnabled,
                     custom_relay_url: relayUrlPtr,
-                    docs_enabled: config.docsEnabled,
                     serves_blobs: config.servesBlobs,
                     accepts_pushes: config.acceptsPushes,
                     dht_lookup: config.dhtLookup,

@@ -1,13 +1,11 @@
 # iroh-swift
 
-Swift bindings for [Iroh](https://iroh.computer) - peer-to-peer blob storage and document sync.
+Swift bindings for [Iroh](https://iroh.computer) - peer-to-peer blob storage and transfer.
 
 ## Features
 
 - **Blob Storage**: Store and retrieve content-addressed data
-- **Docs**: Sync key-value documents across peers
 - **Relay Support**: NAT traversal via n0 public relays
-- **Keychain Integration**: Secure author key storage on iOS/macOS
 
 ## Requirements
 
@@ -193,58 +191,6 @@ a small blob can still return its hash, while a larger one fails with
 `IrohError.pushFailed`. Confirm delivery out of band (for example by fetching
 the hash back) when it matters.
 
-### Docs (Synchronized Documents)
-
-```swift
-import IrohSwift
-
-// Create a node with docs enabled
-let config = IrohConfig(
-    storagePath: myStorageURL,
-    relayEnabled: true,
-    docsEnabled: true
-)
-let node = try await IrohNode(config: config)
-
-// Create or load an author (keys stored in Keychain)
-let author = try await IrohAuthor.getOrCreate(identifier: "my-app")
-try await node.importAuthor(author)
-
-// Create a document
-let doc = try await node.createDoc()
-
-// Write key-value pairs
-try await doc.set(author: author, key: "greeting", value: "Hello!".data(using: .utf8)!)
-
-// Read values
-if let entry = try await doc.get(key: "greeting") {
-    let content = try await entry.content(from: doc)
-    print(String(data: content, encoding: .utf8)!)
-}
-
-// Share the document
-let ticket = try await doc.shareTicket(mode: .write)
-```
-
-### Join a Document
-
-```swift
-// Join using a ticket from another peer
-let doc = try await node.joinDoc(ticket: shareTicket)
-
-// Subscribe to live updates
-for try await event in try await doc.subscribe() {
-    switch event {
-    case .insertRemote(let peer, let entry):
-        print("Received from \(peer): \(entry.key)")
-    case .syncFinished(let peer):
-        print("Sync complete with \(peer)")
-    default:
-        break
-    }
-}
-```
-
 ### Blob Pinning
 
 ```swift
@@ -257,30 +203,6 @@ let bootstrapTicket = try await node.createTicket(hash: ticketInfo.hash!)
 
 // Remove the pin when no longer needed
 try await node.untagBlob(name: "pins/my-content")
-```
-
-### Author Management
-
-```swift
-// Create a new author (not stored)
-let author = try await IrohAuthor.create()
-
-// Get or create with Keychain storage
-let author = try await IrohAuthor.getOrCreate(
-    identifier: "default",
-    accessibility: .afterFirstUnlock  // Keychain security level
-)
-
-// Import from backup
-let author = try await IrohAuthor.fromHex(secretHex, saveTo: "restored")
-
-// Export for backup (handle securely!)
-let secretHex = author.exportSecretHex()
-
-// Check/delete from Keychain
-if IrohAuthor.exists(identifier: "default") {
-    try IrohAuthor.delete(identifier: "default")
-}
 ```
 
 ## API Reference
@@ -297,36 +219,11 @@ if IrohAuthor.exists(identifier: "default") {
 | `pushToNode(nodeId:relayUrl:directAddrs:fileURL:)` | Push a file to a node without loading it into memory, return the blob hash |
 | `endpointID()` | This node's Ed25519 public key, 64 lowercase hex (same as `info().nodeId`) |
 | `sign(_:)` | 64-byte Ed25519 signature with the endpoint secret key |
-| `createDoc()` | Create a new document (requires `docsEnabled`) |
-| `joinDoc(ticket:)` | Join an existing document |
-| `importAuthor(_:)` | Register an author with the docs engine |
 | `tagBlob(hash:name:format:)` | Pin a blob to prevent GC |
 | `untagBlob(name:)` | Remove a pin |
 | `createTicket(hash:format:)` | Create a ticket for an existing blob |
 | `info()` | Get node ID, relay URL, direct addresses, connection status |
 | `close()` | Gracefully shut down the node |
-
-### IrohDoc
-
-| Method | Description |
-|--------|-------------|
-| `set(author:key:value:)` | Write a key-value pair |
-| `get(key:)` | Read a single entry |
-| `getMany(prefix:)` | Query entries by key prefix |
-| `delete(author:key:)` | Delete the author's entries whose key starts with `key` (a prefix delete) |
-| `shareTicket(mode:)` | Get a shareable ticket (.read or .write) |
-| `subscribe()` | Subscribe to live document events |
-
-### IrohAuthor
-
-| Method | Description |
-|--------|-------------|
-| `create()` | Create a new random author |
-| `getOrCreate(identifier:accessibility:)` | Load from or save to Keychain |
-| `fromHex(_:saveTo:accessibility:)` | Import from hex-encoded secret |
-| `exportSecretHex()` | Export secret key (handle securely!) |
-| `exists(identifier:)` | Check if author exists in Keychain |
-| `delete(identifier:)` | Remove author from Keychain |
 
 ### IrohConfig
 
@@ -334,7 +231,6 @@ if IrohAuthor.exists(identifier: "default") {
 |----------|------|---------|-------------|
 | `storagePath` | `URL` | Application Support/iroh | Blob storage directory |
 | `relayEnabled` | `Bool` | `true` | Use n0 public relay servers |
-| `docsEnabled` | `Bool` | `false` | Enable document sync |
 | `customRelayUrl` | `String?` | `nil` | Custom relay server URL |
 | `servesBlobs` | `Bool` | `true` | Serve blobs to peers; `false` makes a client-only node (fetch and push still work) |
 | `acceptsPushes` | `Bool` | `false` | Let peers push blobs into this node's store; requires `servesBlobs` |
@@ -347,28 +243,11 @@ if IrohAuthor.exists(identifier: "default") {
 |--------|-------------|
 | `hex(_:)` | BLAKE3 hash of `Data` as 64 lowercase hex (equals the raw blob hash) |
 
-### KeychainAccessibility
-
-| Case | Description |
-|------|-------------|
-| `.afterFirstUnlock` | Available after first unlock (default, recommended) |
-| `.whenUnlocked` | Only when device is unlocked |
-
-`.always` was removed: Apple deprecated `kSecAttrAccessibleAlways`. Use
-`.afterFirstUnlock`. Authors saved with `.always` still load, since lookups do not
-filter on accessibility.
-
 ## CLI Demo
 
 ```bash
 # Blob storage demo
 swift run iroh-cli blob
-
-# Create a document and share
-swift run iroh-cli docs
-
-# Join a document
-swift run iroh-cli docs-join <ticket>
 ```
 
 ## Building from Source
@@ -401,9 +280,8 @@ IROH_LOCAL_DEV=1 swift test
 Swift Layer (IrohSwift)           Rust FFI Layer              Iroh Libraries
 ┌─────────────────────┐          ┌──────────────────┐        ┌────────────────────┐
 │ IrohNode (actor)    │──C ABI──▶│ ffi.rs           │───────▶│ iroh 1.4.1         │
-│ IrohDoc (actor)     │          │ node.rs          │        │ iroh-blobs 0.103.1 │
-│ IrohAuthor          │          └──────────────────┘        │ iroh-docs 0.101    │
-└─────────────────────┘                                      └────────────────────┘
+│ IrohConfig          │          │ node.rs          │        │ iroh-blobs 0.104.1 │
+└─────────────────────┘          └──────────────────┘        └────────────────────┘
 ```
 
 - **Swift Actor**: Thread-safe with async/await
