@@ -288,6 +288,29 @@ Swift Layer (IrohSwift)           Rust FFI Layer              Iroh Libraries
 - **Rust FFI**: Callback-based async bridged via `CheckedContinuation`
 - **Storage**: Persistent `FsStore` (excluded from iCloud backup)
 
+## Breaking Changes in 0.8.0
+
+Docs support is removed. iroh-docs had no release on iroh-blobs 0.104, and no
+known app enabled it. Removed:
+
+- `IrohDoc`, `IrohAuthor`, `DocEntry`, `DocEvent`, `DocShareMode` and
+  `KeychainAccessibility`.
+- `IrohConfig.docsEnabled` (drop the `docsEnabled:` argument), and
+  `IrohNode.createDoc()`, `joinDoc(ticket:)` and `importAuthor(_:)`.
+- The `IrohError` cases `docsNotEnabled`, `docCreationFailed`, `docJoinFailed`,
+  `docClosed`, `docGetFailed`, `docSetFailed`, `docDeleteFailed`,
+  `docShareFailed`, `contentReadFailed`, `docSubscribeFailed`,
+  `authorCreationFailed`, `authorImportFailed` and `keychainError`.
+- C API: `IrohNodeConfig.docs_enabled` and every `iroh_author_*` and `iroh_doc_*`
+  export.
+
+A `docs` folder that a docs-enabled node left in its storage directory is no
+longer read, and authors saved in the Keychain stay there; delete them if you
+no longer need them.
+
+iroh-blobs moves to 0.104.1. The wire protocol is unchanged (ALPN
+`/iroh-bytes/4`), so 0.8.0 and 0.7.x nodes still exchange blobs.
+
 ## Breaking Changes in 0.7.0
 
 - `KeychainAccessibility.always` is removed (Apple deprecated
@@ -321,6 +344,7 @@ existing `ip:port` addresses behave as before.
 
 | iroh-swift | iroh | iroh-blobs | iroh-docs |
 |------------|------|------------|-----------|
+| 0.8.x | 1.4.1 (+ iroh-mainline-address-lookup 0.6) | 0.104.1 | - |
 | 0.7.x | 1.4.1 (+ iroh-mainline-address-lookup 0.6) | 0.103.1 | 0.101 |
 | 0.6.x | 1.3.0 (+ iroh-mainline-address-lookup 0.6) | 0.103.1 | 0.101 |
 | 0.5.x | 1.1.0 | 0.103 | 0.101 |
