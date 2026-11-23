@@ -1499,8 +1499,13 @@ pub unsafe extern "C" fn iroh_push_file_to_node(
         .await;
         match result {
             Ok((hash, conn)) => {
-                crate::node::await_push_grace(conn, Some(&token), Some(&shutdown)).await;
-                completion.succeed(hash.to_hex().to_string());
+                match crate::node::await_push_grace(conn, Some(&token), Some(&shutdown)).await {
+                    Ok(()) => completion.succeed(hash.to_hex().to_string()),
+                    Err(e) => {
+                        let (code, _) = operation_error_code(&e);
+                        completion.fail(code, e.to_string());
+                    }
+                }
             }
             Err(e) => {
                 let (code, _) = operation_error_code(&e);
@@ -1590,8 +1595,13 @@ pub unsafe extern "C" fn iroh_push_bytes_to_node(
         .await;
         match result {
             Ok((hash, conn)) => {
-                crate::node::await_push_grace(conn, Some(&token), Some(&shutdown)).await;
-                completion.succeed(hash.to_hex().to_string());
+                match crate::node::await_push_grace(conn, Some(&token), Some(&shutdown)).await {
+                    Ok(()) => completion.succeed(hash.to_hex().to_string()),
+                    Err(e) => {
+                        let (code, _) = operation_error_code(&e);
+                        completion.fail(code, e.to_string());
+                    }
+                }
             }
             Err(e) => {
                 let (code, _) = operation_error_code(&e);

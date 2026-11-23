@@ -22,14 +22,15 @@ extension IrohNode {
         _ data: Data,
         maxAttempts: Int = 3,
         initialDelay: Duration = .seconds(1),
-        maxDelay: Duration = .seconds(60)
+        maxDelay: Duration = .seconds(60),
+        options: OperationOptions = .default
     ) async throws -> String {
         try await Self.withRetry(
             maxAttempts: maxAttempts,
             initialDelay: initialDelay,
             maxDelay: maxDelay
         ) {
-            try await self.put(data)
+            try await self.put(data, options: options)
         }
     }
 
@@ -42,23 +43,25 @@ extension IrohNode {
     ///   - maxAttempts: Maximum number of attempts. Defaults to 3.
     ///   - initialDelay: Delay before first retry. Defaults to 1 second.
     ///   - maxDelay: Maximum backoff delay between retries. Defaults to 60 seconds.
+    ///   - options: Operation options including timeout and maximum blob size.
     /// - Returns: The downloaded data.
     /// - Throws: `IrohError.maxRetriesExceeded` if all attempts fail,
     ///   `IrohError.invalidConfiguration` if `maxAttempts` is less than 1,
-    ///   `IrohError.nodeClosed` (not retried) if the node is closed,
+    ///   `IrohError.nodeClosed` or `IrohError.sizeLimitExceeded` (not retried),
     ///   `CancellationError` if the task is cancelled.
     public func getWithRetry(
         ticket: String,
         maxAttempts: Int = 3,
         initialDelay: Duration = .seconds(1),
-        maxDelay: Duration = .seconds(60)
+        maxDelay: Duration = .seconds(60),
+        options: OperationOptions = .default
     ) async throws -> Data {
         try await Self.withRetry(
             maxAttempts: maxAttempts,
             initialDelay: initialDelay,
             maxDelay: maxDelay
         ) {
-            try await self.get(ticket: ticket)
+            try await self.get(ticket: ticket, options: options)
         }
     }
 
@@ -116,6 +119,7 @@ extension IrohNode {
     private static func isPermanent(_ error: Error) -> Bool {
         if error is CancellationError { return true }
         if case IrohError.nodeClosed = error { return true }
+        if case IrohError.sizeLimitExceeded = error { return true }
         return false
     }
 }

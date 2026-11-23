@@ -6,6 +6,7 @@ extension IrohNode {
     ///
     /// - Returns: Node information including ID, relay URL, and connection status.
     /// - Throws: `IrohError.nodeClosed` if the node is closed,
+    ///           `CancellationError` if the calling task was cancelled,
     ///           `IrohError.nodeCreationFailed` if the info cannot be retrieved.
     public func info() async throws -> NodeInfo {
         try ensureNotClosed()

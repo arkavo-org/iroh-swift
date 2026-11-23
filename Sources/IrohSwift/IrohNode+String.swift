@@ -24,13 +24,21 @@ extension IrohNode {
     /// - Parameters:
     ///   - ticket: The ticket string from a `put` operation.
     ///   - encoding: The string encoding to use. Defaults to UTF-8.
+    ///   - options: Operation options including timeout and maximum blob size.
     /// - Returns: The decoded string.
     /// - Throws: `IrohError.stringDecodingFailed` if decoding fails,
+    ///           `IrohError.sizeLimitExceeded` if the blob exceeds `options.maxSize`,
+    ///           `IrohError.timeout` if the operation times out,
+    ///           `CancellationError` if cancelled,
     ///           or `IrohError.getFailed` if retrieval fails.
-    public func getString(ticket: String, encoding: String.Encoding = .utf8) async throws -> String {
+    public func getString(
+        ticket: String,
+        encoding: String.Encoding = .utf8,
+        options: OperationOptions = .default
+    ) async throws -> String {
         try Task.checkCancellation()
 
-        let data = try await get(ticket: ticket)
+        let data = try await get(ticket: ticket, options: options)
 
         guard let string = String(data: data, encoding: encoding) else {
             throw IrohError.stringDecodingFailed(encoding)

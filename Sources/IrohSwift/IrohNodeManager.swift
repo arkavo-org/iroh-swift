@@ -46,8 +46,22 @@ public final class IrohNodeManager: Sendable {
     /// Whether a download is currently in progress.
     @MainActor
     public var isDownloading: Bool {
-        downloadProgress != nil
+        activeDownloadCount > 0 || downloadProgress != nil
     }
+
+    /// Process-wide pending shutdown tasks keyed by normalized `storagePath`.
+    /// Serializes store reopening even when a consumer discards an old
+    /// `IrohNodeManager` after calling `reset()` and creates a new instance
+    /// targeting the same `FsStore` directory.
+    @MainActor
+    private static var pendingCleanups: [String: (id: UInt64, task: Task<Void, Never>)] = [:]
+
+    @MainActor
+    private static var nextCleanupId: UInt64 = 0
+
+    @MainActor
+    @ObservationIgnored
+    private var activeDownloadCount: Int = 0
 
     @MainActor
     @ObservationIgnored
@@ -56,6 +70,10 @@ public final class IrohNodeManager: Sendable {
     @MainActor
     @ObservationIgnored
     private var initGeneration: UInt64 = 0
+
+    @MainActor
+    @ObservationIgnored
+    private var activeStoragePath: String?
 
     @MainActor
     @ObservationIgnored
@@ -71,7 +89,8 @@ public final class IrohNodeManager: Sendable {
     ///
     /// This method is safe to call multiple times; subsequent calls
     /// while initializing or after success are ignored. If `reset()` was
-    /// called recently, initialization waits for the prior node to finish
+    /// called recently (on this instance or a prior instance targeting the
+    /// same `storagePath`), initialization waits for the prior node to finish
     /// closing so `FsStore` does not hit a redb lock conflict.
     ///
     /// - Parameter config: Configuration options. Uses defaults if not specified.
@@ -83,10 +102,14 @@ public final class IrohNodeManager: Sendable {
         isInitializing = true
         error = nil
 
+        let normalizedPath = config.storagePath.standardizedFileURL.path
+        activeStoragePath = normalizedPath
         let generation = initGeneration
         let priorCleanup = cleanupTask
+        let sharedCleanup = Self.pendingCleanups[normalizedPath]?.task
         let task = Task<IrohNode, Error> {
             await priorCleanup?.value
+            await sharedCleanup?.value
             try Task.checkCancellation()
             return try await IrohNode(config: config)
         }
@@ -142,6 +165,7 @@ public final class IrohNodeManager: Sendable {
             throw IrohError.nodeCreationFailed("Node not initialized")
         }
 
+        activeDownloadCount += 1
         downloadGeneration &+= 1
         let generation = downloadGeneration
         downloadProgress = DownloadProgress(downloaded: 0, total: 0)
@@ -157,8 +181,13 @@ public final class IrohNodeManager: Sendable {
         defer {
             continuation.finish()
             progressTask.cancel()
+            activeDownloadCount = max(0, activeDownloadCount - 1)
             if downloadGeneration == generation {
                 downloadGeneration &+= 1
+                if activeDownloadCount == 0 {
+                    downloadProgress = nil
+                }
+            } else if activeDownloadCount == 0 {
                 downloadProgress = nil
             }
         }
@@ -171,27 +200,37 @@ public final class IrohNodeManager: Sendable {
     /// Reset the manager, cancelling any in-flight initialization and closing
     /// any existing node cleanly in the background.
     ///
-    /// A subsequent `initialize(config:)` automatically awaits the prior node's
-    /// shutdown before reopening the blob store. Use `resetAndWait()` if you want
-    /// to explicitly await shutdown completion before deleting storage directories.
+    /// A subsequent `initialize(config:)` — on this instance or a newly created
+    /// `IrohNodeManager` targeting the same `storagePath` — automatically awaits
+    /// the prior node's shutdown before reopening the blob store. Use
+    /// `resetAndWait()` if you want to explicitly await shutdown completion
+    /// before deleting storage directories.
     @MainActor
     public func reset() {
         initGeneration &+= 1
         downloadGeneration &+= 1
+        activeDownloadCount = 0
 
         let previousInit = initTask
         initTask = nil
         previousInit?.cancel()
 
         let previousNode = node
+        let pathToClean = activeStoragePath
+        activeStoragePath = nil
         node = nil
         error = nil
         isInitializing = false
         downloadProgress = nil
 
         let priorCleanup = cleanupTask
-        cleanupTask = Task {
+        let priorShared = pathToClean.flatMap { Self.pendingCleanups[$0]?.task }
+        Self.nextCleanupId &+= 1
+        let cleanupId = Self.nextCleanupId
+
+        let task = Task { @MainActor in
             await priorCleanup?.value
+            await priorShared?.value
             if let previousInit {
                 if let created = try? await previousInit.value {
                     try? await created.close()
@@ -200,6 +239,13 @@ public final class IrohNodeManager: Sendable {
             if let previousNode {
                 try? await previousNode.close()
             }
+            if let pathToClean, Self.pendingCleanups[pathToClean]?.id == cleanupId {
+                Self.pendingCleanups.removeValue(forKey: pathToClean)
+            }
+        }
+        cleanupTask = task
+        if let pathToClean {
+            Self.pendingCleanups[pathToClean] = (id: cleanupId, task: task)
         }
     }
 

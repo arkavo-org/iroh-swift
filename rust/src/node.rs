@@ -190,19 +190,22 @@ impl IrohNode {
                 return Err(OperationError::Cancelled);
             }
 
-            // Create or load the persistent store
-            let store = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(OperationError::Cancelled),
-                res = FsStore::load(&storage_path) => {
-                    res.context("Failed to load blob store")?
-                }
-            };
+            // Let `FsStore::load` finish rather than dropping it mid-flight inside
+            // `select!`: dropping an in-flight load only triggers background
+            // shutdown, which can leave redb's lock held after `Cancelled` returns.
+            let store = FsStore::load(&storage_path)
+                .await
+                .context("Failed to load blob store")?;
 
             // Helper to shut down `store` cleanly if initialization fails or is cancelled.
             async fn cleanup_store(store: FsStore) {
-                let _ = tokio::time::timeout(Duration::from_secs(2), store.shutdown()).await;
+                let _ = tokio::time::timeout(Duration::from_secs(5), store.shutdown()).await;
                 drop(store);
+            }
+
+            if cancel.is_cancelled() {
+                cleanup_store(store).await;
+                return Err(OperationError::Cancelled);
             }
 
             // Build endpoint with relay configuration and in-memory ticket lookup
@@ -717,12 +720,6 @@ pub async fn get_from_ticket(
 ) -> Result<Vec<u8>, OperationError> {
     let ticket: BlobTicket = ticket_str.parse().context("Failed to parse ticket")?;
 
-    // Preserve the ticket's direct IP and custom relay hints so `endpoint` can
-    // dial the peer directly even with public discovery/relays disabled.
-    if ticket.addr().id != endpoint.id() && !ticket.addr().is_empty() {
-        memory_lookup.add_endpoint_info(ticket.addr().clone());
-    }
-
     let work = async {
         // Fast path: already complete in local store. Check size before reading into RAM.
         if let Ok(BlobStatus::Complete { size }) = store.blobs().status(ticket.hash()).await {
@@ -745,6 +742,12 @@ pub async fn get_from_ticket(
             return Err(OperationError::NotFound);
         }
 
+        // Preserve the ticket's direct IP and custom relay hints so `endpoint` can
+        // dial the peer directly even with public discovery/relays disabled.
+        if !ticket.addr().is_empty() {
+            memory_lookup.add_endpoint_info(ticket.addr().clone());
+        }
+
         // Dial by endpoint ID; `memory_lookup` provides the ticket's direct IP
         // and custom relay hints alongside any other configured lookups.
         let conn = endpoint
@@ -762,10 +765,12 @@ pub async fn get_from_ticket(
             return Err(OperationError::Cancelled);
         }
 
-        // Cache verified blob (already bounded by `max_size`) in local store so
-        // callers can subsequently pin/tag it with `tagBlob`.
-        store
+        // Cache verified blob (already bounded by `max_size`) in local store using
+        // a temp tag (not a permanent auto-tag) so `tagBlob`/`untagBlob` controls pinning.
+        let _temp_tag = store
+            .blobs()
             .add_slice(&buf)
+            .temp_tag()
             .await
             .context("Failed to store downloaded blob")?;
 
@@ -915,11 +920,14 @@ async fn push_hash_transfer(
 ///
 /// Runs OUTSIDE the caller's timeout and cancellation error scopes so an
 /// already-succeeded push never fails with a false `TimedOut` or `Cancelled`.
+/// If node shutdown interrupts this wait before the peer closes or the grace
+/// period elapses, returns [`OperationError::NodeShutDown`] because closing the
+/// endpoint may interrupt delivery before the peer commits the blob.
 pub async fn await_push_grace(
     conn: Connection,
     cancel: Option<&CancellationToken>,
     shutdown: Option<&CancellationToken>,
-) {
+) -> Result<(), OperationError> {
     let grace = Duration::from_millis(500);
     let cancelled = async {
         match cancel {
@@ -935,9 +943,10 @@ pub async fn await_push_grace(
     };
 
     tokio::select! {
-        _ = conn.closed() => {}
-        _ = tokio::time::sleep(grace) => {}
-        _ = shutting_down => {}
+        biased;
+        _ = shutting_down => Err(OperationError::NodeShutDown),
+        _ = conn.closed() => Ok(()),
+        _ = tokio::time::sleep(grace) => Ok(()),
         _ = cancelled => {
             // Transfer already completed: return immediately to the caller
             // while holding the connection open briefly in the background.
@@ -947,6 +956,7 @@ pub async fn await_push_grace(
                     _ = tokio::time::sleep(grace) => {}
                 }
             });
+            Ok(())
         }
     }
 }
@@ -1300,7 +1310,7 @@ pub async fn push_path(
     remote: EndpointAddr,
 ) -> Result<Hash, OperationError> {
     let (hash, conn) = push_path_transfer(endpoint, store, path, remote).await?;
-    await_push_grace(conn, None, None).await;
+    await_push_grace(conn, None, None).await?;
     Ok(hash)
 }
 
@@ -1347,7 +1357,7 @@ pub async fn push_bytes(
 ) -> Result<Hash, OperationError> {
     let (hash, conn) =
         push_bytes_transfer(endpoint, store, resolver, target, data, timeout_ms).await?;
-    await_push_grace(conn, None, None).await;
+    await_push_grace(conn, None, None).await?;
     Ok(hash)
 }
 
@@ -1779,10 +1789,13 @@ mod tests {
 
         let small = b"refused push";
         let small_result = client.push_to_node(&server_id, None, small, &addrs);
-        assert_eq!(
-            small_result.expect("a small refused push reports success"),
-            blake3_hex(small)
-        );
+        match small_result {
+            Ok(hash) => assert_eq!(hash, blake3_hex(small)),
+            Err(error) => assert!(
+                format!("{error:#}").contains("stopped by peer"),
+                "unexpected error for small refused push: {error:#}"
+            ),
+        }
 
         let large = test_bytes(2 * 1024 * 1024 + 3);
         let source = out.path().join("large.bin");

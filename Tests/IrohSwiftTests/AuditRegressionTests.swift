@@ -121,10 +121,9 @@ struct AuditRegressionTests {
         defer { try? FileManager.default.removeItem(at: dir) }
 
         let task = Task {
-            try await Task.sleep(for: .milliseconds(50))
+            withUnsafeCurrentTask { $0?.cancel() }
             return try await IrohNode(config: IrohConfig(storagePath: dir, relayEnabled: false))
         }
-        task.cancel()
 
         await #expect(throws: CancellationError.self) {
             let node = try await task.value
@@ -318,7 +317,15 @@ struct AuditRegressionTests {
         #expect(manager.node != nil)
         #expect(manager.error == nil)
 
-        await manager.resetAndWait()
+        // Cross-instance reset/re-init (ArkavoKit pattern: discard old manager after reset(),
+        // immediately create a fresh IrohNodeManager on the exact same storagePath).
+        manager.reset()
+        let replacement = IrohNodeManager()
+        await replacement.initialize(config: config)
+        #expect(replacement.node != nil)
+        #expect(replacement.error == nil)
+
+        await replacement.resetAndWait()
         try await server.close()
     }
     #endif
