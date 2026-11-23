@@ -400,7 +400,104 @@ typedef struct IrohPushFileCallback {
 } IrohPushFileCallback;
 
 /**
- * Create a new Iroh node asynchronously.
+ * Callback for `iroh_node_create_async`.
+ */
+typedef struct IrohNodeCreateAsyncCallback {
+    /**
+     * Opaque pointer passed back to Swift.
+     */
+    void *userdata;
+    /**
+     * Called on success with the node handle.
+     */
+    void (*on_success)(void *userdata, struct IrohNodeHandle *handle);
+    /**
+     * Called on failure with structured error code and message (`iroh_string_free`).
+     */
+    void (*on_failure)(void *userdata, enum IrohOperationErrorCode code, const char *error);
+} IrohNodeCreateAsyncCallback;
+
+/**
+ * Callback for cancellable string-returning operations (`iroh_put_async`).
+ */
+typedef struct IrohOperationCallback {
+    /**
+     * Opaque pointer passed back to Swift.
+     */
+    void *userdata;
+    /**
+     * Called on success with a C string (`iroh_string_free`).
+     */
+    void (*on_success)(void *userdata, const char *result);
+    /**
+     * Called on failure with structured error code and message (`iroh_string_free`).
+     */
+    void (*on_failure)(void *userdata, enum IrohOperationErrorCode code, const char *error);
+} IrohOperationCallback;
+
+/**
+ * Callback for `iroh_get_async`.
+ */
+typedef struct IrohGetAsyncCallback {
+    /**
+     * Opaque pointer passed back to Swift.
+     */
+    void *userdata;
+    /**
+     * Optional progress callback `(downloaded, total)`. Null to skip progress.
+     */
+    void (*on_progress)(void *userdata, uint64_t downloaded, uint64_t total);
+    /**
+     * Called on success with owned bytes (`iroh_bytes_free`).
+     */
+    void (*on_success)(void *userdata, struct IrohOwnedBytes bytes);
+    /**
+     * Called on failure. `size` carries the announced size for `SizeLimitExceeded`, else 0.
+     */
+    void (*on_failure)(void *userdata,
+                       enum IrohOperationErrorCode code,
+                       uint64_t size,
+                       const char *error);
+} IrohGetAsyncCallback;
+
+/**
+ * Callback for cancellable void operations (`iroh_blob_tag_set_async`, `iroh_blob_tag_delete_async`).
+ */
+typedef struct IrohVoidOperationCallback {
+    /**
+     * Opaque pointer passed back to Swift.
+     */
+    void *userdata;
+    /**
+     * Called on success.
+     */
+    void (*on_complete)(void *userdata);
+    /**
+     * Called on failure with structured error code and message (`iroh_string_free`).
+     */
+    void (*on_failure)(void *userdata, enum IrohOperationErrorCode code, const char *error);
+} IrohVoidOperationCallback;
+
+/**
+ * Callback for `iroh_node_info_async`.
+ */
+typedef struct IrohNodeInfoAsyncCallback {
+    /**
+     * Opaque pointer passed back to Swift.
+     */
+    void *userdata;
+    /**
+     * Called on success with node info.
+     */
+    void (*on_success)(void *userdata, struct IrohNodeInfo info);
+    /**
+     * Called on failure with structured error code and message (`iroh_string_free`).
+     */
+    void (*on_failure)(void *userdata, enum IrohOperationErrorCode code, const char *error);
+} IrohNodeInfoAsyncCallback;
+
+/**
+ * Create a new Iroh node asynchronously on a background thread.
  *
  * # Safety
  * - `config.storage_path` must be a valid null-terminated UTF-8 string
@@ -412,8 +509,8 @@ void iroh_node_create(struct IrohNodeConfig config, struct IrohNodeCreateCallbac
 /**
  * Destroy an Iroh node and free its resources.
  *
- * Performs shutdown on a background thread to avoid blocking Swift's
- * cooperative thread pool (which can deadlock if called from deinit).
+ * Performs shutdown on a background thread (with inline fallback on thread
+ * exhaustion) to avoid blocking Swift's cooperative thread pool.
  *
  * # Safety
  * - `handle` must be a valid pointer returned by `iroh_node_create`
@@ -423,6 +520,8 @@ void iroh_node_destroy(struct IrohNodeHandle *handle);
 
 /**
  * Add bytes to the blob store and get a shareable ticket.
+ *
+ * Returns immediately; the work runs on the node's Tokio runtime.
  *
  * # Safety
  * - `handle` must be a valid node handle
@@ -435,6 +534,8 @@ void iroh_put(const struct IrohNodeHandle *handle,
 
 /**
  * Download bytes from a ticket.
+ *
+ * Returns immediately; the work runs on the node's Tokio runtime.
  *
  * # Safety
  * - `handle` must be a valid node handle
@@ -466,6 +567,8 @@ void iroh_bytes_free(struct IrohOwnedBytes bytes);
 /**
  * Download bytes from a ticket with progress reporting.
  *
+ * Returns immediately; the work runs on the node's Tokio runtime.
+ *
  * # Safety
  * - `handle` must be a valid node handle
  * - `ticket` must be a valid null-terminated UTF-8 string
@@ -477,6 +580,8 @@ void iroh_get_with_progress(const struct IrohNodeHandle *handle,
 
 /**
  * Get information about the node.
+ *
+ * Returns immediately; the work runs on the node's Tokio runtime.
  *
  * # Safety
  * - `handle` must be a valid node handle
@@ -510,6 +615,8 @@ void iroh_node_close(struct IrohNodeHandle *handle, struct IrohCloseCallback cal
 
 /**
  * Add bytes to the blob store with options (e.g., timeout).
+ *
+ * Returns immediately; the work runs on the node's Tokio runtime.
  *
  * # Safety
  * - `handle` must be a valid node handle
@@ -578,6 +685,8 @@ void iroh_push_to_node_with_options(const struct IrohNodeHandle *handle,
 /**
  * Download bytes from a ticket with options (e.g., timeout).
  *
+ * Returns immediately; the work runs on the node's Tokio runtime.
+ *
  * # Safety
  * - `handle` must be a valid node handle
  * - `ticket` must be a valid null-terminated UTF-8 string
@@ -592,7 +701,7 @@ void iroh_get_with_options(const struct IrohNodeHandle *handle,
  * Tag (pin) a blob to prevent garbage collection.
  *
  * Tagged blobs are protected from GC until the tag is removed.
- * Use this after downloading content you want to keep.
+ * Returns immediately; the work runs on the node's Tokio runtime.
  *
  * # Safety
  * - `handle` must be a valid node handle
@@ -624,6 +733,8 @@ void iroh_blob_ticket_create(const struct IrohNodeHandle *handle,
 
 /**
  * Remove a tag (unpin) from a blob, allowing garbage collection.
+ *
+ * Returns immediately; the work runs on the node's Tokio runtime.
  *
  * # Safety
  * - `handle` must be a valid node handle
@@ -791,5 +902,96 @@ void iroh_push_bytes_to_node(const struct IrohNodeHandle *handle,
                              uint64_t timeoutMs,
                              const struct IrohCancelToken *cancelToken,
                              struct IrohPushFileCallback callback);
+
+/**
+ * Create a new Iroh node asynchronously on a background thread with cancellation.
+ *
+ * # Safety
+ * - `config.storage_path` must be a valid null-terminated UTF-8 string
+ * - `config.custom_relay_url` must be null or a valid null-terminated UTF-8 string
+ * - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+ * - `callback` must have valid function pointers
+ */
+void iroh_node_create_async(struct IrohNodeConfig config,
+                            const struct IrohCancelToken *cancelToken,
+                            struct IrohNodeCreateAsyncCallback callback);
+
+/**
+ * Add bytes to the blob store asynchronously with optional timeout and cancellation.
+ *
+ * `timeout_ms` of 0 means no timeout.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle that outlives the operation's callback
+ * - `bytes.data` must point to `bytes.len` readable bytes (copied before return)
+ * - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+ * - `callback` must have valid function pointers
+ */
+void iroh_put_async(const struct IrohNodeHandle *handle,
+                    struct IrohBytes bytes,
+                    uint64_t timeoutMs,
+                    const struct IrohCancelToken *cancelToken,
+                    struct IrohOperationCallback callback);
+
+/**
+ * Download bytes from a ticket asynchronously with `max_size`, optional timeout,
+ * optional progress callback, and cancellation.
+ *
+ * `timeout_ms` of 0 means no timeout; `max_size` of `u64::MAX` means no size limit.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle that outlives the operation's callback
+ * - `ticket` must be a valid null-terminated UTF-8 string
+ * - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+ * - `callback` must have valid function pointers
+ */
+void iroh_get_async(const struct IrohNodeHandle *handle,
+                    const char *ticket,
+                    uint64_t timeoutMs,
+                    uint64_t maxSize,
+                    const struct IrohCancelToken *cancelToken,
+                    struct IrohGetAsyncCallback callback);
+
+/**
+ * Tag (pin) a blob asynchronously with cancellation.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle that outlives the operation's callback
+ * - `tag_name` and `hash_str` must be valid null-terminated UTF-8 strings
+ * - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+ * - `callback` must have valid function pointers
+ */
+void iroh_blob_tag_set_async(const struct IrohNodeHandle *handle,
+                             const char *tagName,
+                             const char *hashStr,
+                             enum IrohBlobFormat format,
+                             const struct IrohCancelToken *cancelToken,
+                             struct IrohVoidOperationCallback callback);
+
+/**
+ * Remove a tag (unpin) asynchronously with cancellation.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle that outlives the operation's callback
+ * - `tag_name` must be a valid null-terminated UTF-8 string
+ * - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+ * - `callback` must have valid function pointers
+ */
+void iroh_blob_tag_delete_async(const struct IrohNodeHandle *handle,
+                                const char *tagName,
+                                const struct IrohCancelToken *cancelToken,
+                                struct IrohVoidOperationCallback callback);
+
+/**
+ * Get information about the node asynchronously with cancellation.
+ *
+ * # Safety
+ * - `handle` must be a valid node handle that outlives the operation's callback
+ * - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+ * - `callback` must have valid function pointers
+ */
+void iroh_node_info_async(const struct IrohNodeHandle *handle,
+                          const struct IrohCancelToken *cancelToken,
+                          struct IrohNodeInfoAsyncCallback callback);
 
 #endif  /* IROH_SWIFT_H */

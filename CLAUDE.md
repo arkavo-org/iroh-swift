@@ -49,11 +49,14 @@ Swift Layer (IrohSwift)           Rust FFI Layer                Iroh Libraries
 - Rust functions use callbacks; Swift converts to async/await via `CheckedContinuation`
 - Each IrohNode owns its own Tokio runtime
 - Manual memory management at FFI boundary (`iroh_string_free()`, `iroh_bytes_free()`, `iroh_node_destroy()`)
-- Most FFI calls `block_on` the node runtime on the calling thread. Long transfers
-  (`iroh_fetch_from_node`, `iroh_push_file_to_node`) instead spawn on the runtime and
-  return at once; Swift passes an `IrohCancelToken` (`CancelTokenBox`) and cancels it
-  from `withTaskCancellationHandler`. The Rust side watches a `child_token()` of it, so
-  a cancel is seen synchronously. A completion guard always calls exactly one of
+- Async FFI calls (`iroh_node_create_async`, `iroh_put_async`, `iroh_get_async`,
+  `iroh_blob_tag_*_async`, `iroh_node_info_async`, `iroh_fetch_from_node`,
+  `iroh_push_file_to_node`, `iroh_push_bytes_to_node`) spawn on the node runtime (or a
+  background thread for create/close/destroy with inline fallback on thread exhaustion)
+  and return at once so Swift's cooperative pool and the `IrohNode` actor are never
+  blocked. Swift passes an `IrohCancelToken` (`CancelTokenBox`) and cancels it from
+  `withTaskCancellationHandler`. The Rust side watches a `child_token()` of it, so a
+  cancel is seen synchronously. A completion drop guard always calls exactly one of
   success/failure, reporting `NodeShutDown` if the node closes mid-operation.
 
 ## Blob transfer semantics

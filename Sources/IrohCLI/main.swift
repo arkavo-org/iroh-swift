@@ -26,24 +26,31 @@ struct IrohCLI {
         let config = IrohConfig(storagePath: tempDir, relayEnabled: true)
         let node = try await IrohNode(config: config)
 
-        print("Node started successfully!")
+        do {
+            print("Node started successfully!")
 
-        // Put test data
-        let testData = Data("Hello from iroh-swift CLI! Timestamp: \(Date())".utf8)
-        let ticket = try await node.put(testData)
+            // Put test data
+            let testData = Data("Hello from iroh-swift CLI! Timestamp: \(Date())".utf8)
+            let ticket = try await node.put(testData)
 
-        print("")
-        print("=== TICKET ===")
-        print(ticket)
-        print("==============")
-        print("")
-        print("Share this ticket with iroh.arkavo.net to download the data.")
-        print("Press Enter to exit...")
+            print("")
+            print("=== TICKET ===")
+            print(ticket)
+            print("==============")
+            print("")
+            print("Share this ticket with iroh.arkavo.net to download the data.")
+            print("Press Enter to exit...")
 
-        // Keep node alive so remote can fetch
-        _ = readLine()
+            // Keep node alive so remote can fetch
+            _ = readLine()
 
-        print("Shutting down...")
+            print("Shutting down...")
+            try await node.close()
+        } catch {
+            try? await node.close()
+            try? FileManager.default.removeItem(at: tempDir)
+            throw error
+        }
         try? FileManager.default.removeItem(at: tempDir)
     }
 

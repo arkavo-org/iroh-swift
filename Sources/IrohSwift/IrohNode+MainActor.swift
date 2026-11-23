@@ -4,71 +4,65 @@ import Foundation
 public typealias MainActorProgressHandler = @MainActor @Sendable (DownloadProgress) -> Void
 
 extension IrohNode {
-    /// Download bytes from a ticket with progress updates delivered on MainActor.
+    /// Download bytes from a ticket with progress updates delivered strictly in order on MainActor.
     ///
     /// This is a convenience method for SwiftUI and UIKit integration where
-    /// progress updates need to be handled on the main thread.
-    ///
-    /// Example:
-    /// ```swift
-    /// @State private var progress: Double = 0
-    ///
-    /// func download() async throws {
-    ///     let data = try await node.getForUI(ticket: ticket) { progress in
-    ///         self.progress = progress.fraction ?? 0
-    ///     }
-    /// }
-    /// ```
+    /// progress updates need to be handled on the main thread. All progress
+    /// callbacks complete before this method returns, and no late callbacks are
+    /// delivered after completion or error.
     ///
     /// - Parameters:
     ///   - ticket: The ticket string obtained from another node's `put` call.
     ///   - onProgress: Called on MainActor with progress updates during the download.
     /// - Returns: The downloaded data.
     /// - Throws: `IrohError.nodeClosed` if the node is closed,
-    ///           `IrohError.getFailed` if the download fails.
+    ///           `IrohError.getFailed` if the download fails,
+    ///           `CancellationError` if the task was cancelled.
     public func getForUI(
         ticket: String,
         onProgress: @escaping MainActorProgressHandler
     ) async throws -> Data {
-        try await get(ticket: ticket) { progress in
-            Task { @MainActor in
-                onProgress(progress)
-            }
-        }
+        try await getForUI(ticket: ticket, options: .default, onProgress: onProgress)
     }
 
-    /// Download bytes from a ticket with options and progress updates on MainActor.
+    /// Download bytes from a ticket with options and progress updates delivered
+    /// strictly in order on MainActor.
     ///
     /// - Parameters:
     ///   - ticket: The ticket string obtained from another node's `put` call.
-    ///   - options: Operation options including timeout.
+    ///   - options: Operation options including timeout and maximum blob size.
     ///   - onProgress: Called on MainActor with progress updates during the download.
     /// - Returns: The downloaded data.
     /// - Throws: `IrohError.nodeClosed` if the node is closed,
     ///           `IrohError.timeout` if the operation times out,
-    ///           `IrohError.getFailed` if the download fails.
+    ///           `IrohError.sizeLimitExceeded` if the blob exceeds `options.maxSize`,
+    ///           `IrohError.getFailed` if the download fails,
+    ///           `CancellationError` if the task was cancelled.
     public func getForUI(
         ticket: String,
         options: OperationOptions,
         onProgress: @escaping MainActorProgressHandler
     ) async throws -> Data {
-        // For timeout variant, we use the options-based get which doesn't have progress
-        // but wraps it with the MainActor callback pattern
-        try ensureNotClosed()
-        try Task.checkCancellation()
-
-        // Initial progress notification
-        Task { @MainActor in
-            onProgress(DownloadProgress(downloaded: 0, total: 0))
+        let (stream, continuation) = AsyncStream.makeStream(of: DownloadProgress.self)
+        let consumer = Task { @MainActor in
+            for await progress in stream {
+                if Task.isCancelled { break }
+                onProgress(progress)
+            }
         }
 
-        let data = try await get(ticket: ticket, options: options)
-
-        // Final progress notification
-        Task { @MainActor in
-            onProgress(DownloadProgress(downloaded: UInt64(data.count), total: UInt64(data.count)))
+        do {
+            let data = try await get(ticket: ticket, options: options) { progress in
+                continuation.yield(progress)
+            }
+            continuation.finish()
+            await consumer.value
+            return data
+        } catch {
+            continuation.finish()
+            consumer.cancel()
+            await consumer.value
+            throw error
         }
-
-        return data
     }
 }

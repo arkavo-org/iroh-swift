@@ -220,7 +220,7 @@ unsafe impl Send for IrohCloseCallback {}
 // Node Lifecycle
 // ============================================================================
 
-/// Create a new Iroh node asynchronously.
+/// Create a new Iroh node asynchronously on a background thread.
 ///
 /// # Safety
 /// - `config.storage_path` must be a valid null-terminated UTF-8 string
@@ -228,74 +228,43 @@ unsafe impl Send for IrohCloseCallback {}
 /// - `callback` must have valid function pointers
 #[unsafe(no_mangle)]
 pub extern "C" fn iroh_node_create(config: IrohNodeConfig, callback: IrohNodeCreateCallback) {
-    // Parse the storage path
-    let storage_path = if config.storage_path.is_null() {
-        let error = c_string("storage_path cannot be null");
-        (callback.on_failure)(callback.userdata, error);
-        return;
-    } else {
-        let path_str = unsafe { CStr::from_ptr(config.storage_path) };
-        match path_str.to_str() {
-            Ok(s) => PathBuf::from(s),
-            Err(e) => {
-                let error = c_string(format!("Invalid storage path: {}", e));
-                (callback.on_failure)(callback.userdata, error);
+    let completion = NodeCreateCompletion::new(callback);
+    let parsed = unsafe { parse_node_config(&config) };
+    let (storage_path, custom_relay_url, relay_enabled, serves_blobs, accepts_pushes, options) =
+        match parsed {
+            Ok(parts) => parts,
+            Err(message) => {
+                completion.fail(message);
                 return;
             }
-        }
-    };
+        };
 
-    // Parse optional custom relay URL
-    let custom_relay_url = if config.custom_relay_url.is_null() {
-        None
-    } else {
-        let url_str = unsafe { CStr::from_ptr(config.custom_relay_url) };
-        match url_str.to_str() {
-            Ok(s) => Some(s.to_string()),
-            Err(e) => {
-                let error = c_string(format!("Invalid custom relay URL: {}", e));
-                (callback.on_failure)(callback.userdata, error);
-                return;
+    spawn_thread_or_inline(
+        "iroh-node-create",
+        move || match IrohNode::new_with_options(
+            storage_path,
+            relay_enabled,
+            custom_relay_url,
+            serves_blobs,
+            accepts_pushes,
+            options,
+        ) {
+            Ok(node) => {
+                let boxed = Box::new(node);
+                let handle = Box::into_raw(boxed) as *mut IrohNodeHandle;
+                completion.succeed(handle);
             }
-        }
-    };
-
-    let relay_enabled = config.relay_enabled;
-    let serves_blobs = config.serves_blobs;
-    let accepts_pushes = config.accepts_pushes;
-    let options = crate::node::NodeOptions {
-        dht_lookup: config.dht_lookup,
-        dht_publish: config.dht_publish,
-        ..Default::default()
-    };
-
-    // Create the node synchronously
-    // Note: Swift should call this from a background thread/task
-    match IrohNode::new_with_options(
-        storage_path,
-        relay_enabled,
-        custom_relay_url,
-        serves_blobs,
-        accepts_pushes,
-        options,
-    ) {
-        Ok(node) => {
-            // Box the node and convert to raw pointer
-            let boxed = Box::new(node);
-            let handle = Box::into_raw(boxed) as *mut IrohNodeHandle;
-            (callback.on_success)(callback.userdata, handle);
-        }
-        Err(e) => {
-            let error = c_string(format!("{:#}", e));
-            (callback.on_failure)(callback.userdata, error);
-        }
-    }
+            Err(e) => {
+                completion.fail(format!("{:#}", e));
+            }
+        },
+    );
 }
 
 /// Destroy an Iroh node and free its resources.
 ///
-/// Performs shutdown on a background thread to avoid blocking Swift's
-/// cooperative thread pool (which can deadlock if called from deinit).
+/// Performs shutdown on a background thread (with inline fallback on thread
+/// exhaustion) to avoid blocking Swift's cooperative thread pool.
 ///
 /// # Safety
 /// - `handle` must be a valid pointer returned by `iroh_node_create`
@@ -308,10 +277,7 @@ pub extern "C" fn iroh_node_destroy(handle: *mut IrohNodeHandle) {
 
     unsafe {
         let node = Box::from_raw(handle as *mut IrohNode);
-        // Shutdown on a dedicated thread so we never block Swift's
-        // cooperative thread pool. The thread is detached — if the
-        // process is exiting, the OS cleans up.
-        std::thread::spawn(move || {
+        spawn_thread_or_inline("iroh-node-destroy", move || {
             let _ = node.shutdown();
         });
     }
@@ -323,6 +289,8 @@ pub extern "C" fn iroh_node_destroy(handle: *mut IrohNodeHandle) {
 
 /// Add bytes to the blob store and get a shareable ticket.
 ///
+/// Returns immediately; the work runs on the node's Tokio runtime.
+///
 /// # Safety
 /// - `handle` must be a valid node handle
 /// - `bytes.data` must point to valid memory for `bytes.len` bytes
@@ -333,37 +301,41 @@ pub extern "C" fn iroh_put(
     bytes: IrohBytes,
     callback: IrohCallback,
 ) {
+    let completion = StringCompletion::new(callback);
     if handle.is_null() {
-        let error = c_string("handle cannot be null");
-        (callback.on_failure)(callback.userdata, error);
+        completion.fail("handle cannot be null");
         return;
     }
 
     // Copy the bytes to own them (Swift memory may not be stable)
-    let data = if bytes.data.is_null() || bytes.len == 0 {
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts(bytes.data, bytes.len).to_vec() }
-    };
-
-    // Get reference to node (we don't own it)
+    let data = unsafe { borrowed_bytes(&bytes) }.to_vec();
     let node = unsafe { &*(handle as *const IrohNode) };
-
-    // Perform the put operation
-    // Note: This blocks on the node's runtime, which is intentional
-    match node.put(&data) {
-        Ok(ticket) => {
-            let ticket_cstr = c_string(ticket);
-            (callback.on_success)(callback.userdata, ticket_cstr);
-        }
-        Err(e) => {
-            let error = c_string(format!("{:#}", e));
-            (callback.on_failure)(callback.userdata, error);
-        }
+    if node.is_shutting_down() {
+        completion.fail("node shut down");
+        return;
     }
+
+    let endpoint = node.endpoint().clone();
+    let store = node.store().clone();
+    let shutdown = node.shutdown_token();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    node.runtime().spawn(async move {
+        let result = crate::node::run_cancellable(
+            crate::node::put_bytes(&endpoint, &store, &data, 0),
+            &cancel,
+            &shutdown,
+        )
+        .await;
+        match result {
+            Ok(ticket) => completion.succeed(ticket),
+            Err(e) => completion.fail(e.to_string()),
+        }
+    });
 }
 
 /// Download bytes from a ticket.
+///
+/// Returns immediately; the work runs on the node's Tokio runtime.
 ///
 /// # Safety
 /// - `handle` must be a valid node handle
@@ -375,48 +347,52 @@ pub unsafe extern "C" fn iroh_get(
     ticket: *const c_char,
     callback: IrohGetCallback,
 ) {
-    if handle.is_null() {
-        let error = c_string("handle cannot be null");
-        (callback.on_failure)(callback.userdata, error);
-        return;
-    }
-
-    if ticket.is_null() {
-        let error = c_string("ticket cannot be null");
-        (callback.on_failure)(callback.userdata, error);
-        return;
-    }
-
-    // Parse the ticket string
-    let ticket_str = match unsafe { CStr::from_ptr(ticket) }.to_str() {
-        Ok(s) => s.to_string(),
-        Err(e) => {
-            let error = c_string(format!("Invalid ticket string: {}", e));
-            (callback.on_failure)(callback.userdata, error);
+    let completion = BytesCompletion::new(callback);
+    let ticket_str = match (|| {
+        if handle.is_null() {
+            return Err("handle cannot be null".to_string());
+        }
+        Ok(unsafe { required_str(ticket, "ticket") }?.to_string())
+    })() {
+        Ok(s) => s,
+        Err(msg) => {
+            completion.fail(msg);
             return;
         }
     };
 
-    // Get reference to node
     let node = unsafe { &*(handle as *const IrohNode) };
-
-    // Perform the get operation
-    match node.get(&ticket_str) {
-        Ok(bytes) => {
-            let mut vec = bytes;
-            let owned = IrohOwnedBytes {
-                data: vec.as_mut_ptr(),
-                len: vec.len(),
-                capacity: vec.capacity(),
-            };
-            std::mem::forget(vec); // Prevent deallocation, Swift will free
-            (callback.on_success)(callback.userdata, owned);
-        }
-        Err(e) => {
-            let error = c_string(format!("{:#}", e));
-            (callback.on_failure)(callback.userdata, error);
-        }
+    if node.is_shutting_down() {
+        completion.fail("node shut down");
+        return;
     }
+
+    let endpoint = node.endpoint().clone();
+    let store = node.store().clone();
+    let memory_lookup = node.memory_lookup().clone();
+    let shutdown = node.shutdown_token();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    node.runtime().spawn(async move {
+        let result = crate::node::run_cancellable(
+            crate::node::get_from_ticket(
+                &endpoint,
+                &store,
+                &memory_lookup,
+                &ticket_str,
+                u64::MAX,
+                0,
+                &cancel,
+                |_, _| {},
+            ),
+            &cancel,
+            &shutdown,
+        )
+        .await;
+        match result {
+            Ok(bytes) => completion.succeed(bytes),
+            Err(e) => completion.fail(e.to_string()),
+        }
+    });
 }
 
 // ============================================================================
@@ -458,6 +434,8 @@ pub extern "C" fn iroh_bytes_free(bytes: IrohOwnedBytes) {
 
 /// Download bytes from a ticket with progress reporting.
 ///
+/// Returns immediately; the work runs on the node's Tokio runtime.
+///
 /// # Safety
 /// - `handle` must be a valid node handle
 /// - `ticket` must be a valid null-terminated UTF-8 string
@@ -468,96 +446,86 @@ pub unsafe extern "C" fn iroh_get_with_progress(
     ticket: *const c_char,
     callback: IrohGetProgressCallback,
 ) {
-    if handle.is_null() {
-        let error = c_string("handle cannot be null");
-        (callback.on_failure)(callback.userdata, error);
-        return;
-    }
-
-    if ticket.is_null() {
-        let error = c_string("ticket cannot be null");
-        (callback.on_failure)(callback.userdata, error);
-        return;
-    }
-
-    // Parse the ticket string
-    let ticket_str = match unsafe { CStr::from_ptr(ticket) }.to_str() {
-        Ok(s) => s.to_string(),
-        Err(e) => {
-            let error = c_string(format!("Invalid ticket string: {}", e));
-            (callback.on_failure)(callback.userdata, error);
+    let completion = BytesCompletion::with_progress(callback);
+    let ticket_str = match (|| {
+        if handle.is_null() {
+            return Err("handle cannot be null".to_string());
+        }
+        Ok(unsafe { required_str(ticket, "ticket") }?.to_string())
+    })() {
+        Ok(s) => s,
+        Err(msg) => {
+            completion.fail(msg);
             return;
         }
     };
 
     let node = unsafe { &*(handle as *const IrohNode) };
-    let userdata = callback.userdata;
-    let on_progress_fn = callback.on_progress;
-
-    // Progress callback closure
-    let progress_fn = move |downloaded: u64, total: u64| {
-        let progress = IrohDownloadProgress { downloaded, total };
-        (on_progress_fn)(userdata, progress);
-    };
-
-    match node.get_with_progress(&ticket_str, progress_fn) {
-        Ok(bytes) => {
-            let mut vec = bytes;
-            let owned = IrohOwnedBytes {
-                data: vec.as_mut_ptr(),
-                len: vec.len(),
-                capacity: vec.capacity(),
-            };
-            std::mem::forget(vec);
-            (callback.on_success)(callback.userdata, owned);
-        }
-        Err(e) => {
-            let error = c_string(format!("{:#}", e));
-            (callback.on_failure)(callback.userdata, error);
-        }
+    if node.is_shutting_down() {
+        completion.fail("node shut down");
+        return;
     }
+
+    let endpoint = node.endpoint().clone();
+    let store = node.store().clone();
+    let memory_lookup = node.memory_lookup().clone();
+    let shutdown = node.shutdown_token();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    node.runtime().spawn(async move {
+        let result = crate::node::run_cancellable(
+            crate::node::get_from_ticket(
+                &endpoint,
+                &store,
+                &memory_lookup,
+                &ticket_str,
+                u64::MAX,
+                0,
+                &cancel,
+                |downloaded, total| completion.progress(downloaded, total),
+            ),
+            &cancel,
+            &shutdown,
+        )
+        .await;
+        match result {
+            Ok(bytes) => completion.succeed(bytes),
+            Err(e) => completion.fail(e.to_string()),
+        }
+    });
 }
 
 /// Get information about the node.
+///
+/// Returns immediately; the work runs on the node's Tokio runtime.
 ///
 /// # Safety
 /// - `handle` must be a valid node handle
 /// - `callback` must have valid function pointers
 #[unsafe(no_mangle)]
 pub extern "C" fn iroh_node_info(handle: *const IrohNodeHandle, callback: IrohNodeInfoCallback) {
+    let completion = NodeInfoCompletion::new(callback);
     if handle.is_null() {
-        let error = c_string("handle cannot be null");
-        (callback.on_failure)(callback.userdata, error);
+        completion.fail("handle cannot be null");
         return;
     }
 
     let node = unsafe { &*(handle as *const IrohNode) };
-
-    match node.info() {
-        Ok(info) => {
-            let node_id = c_string(info.node_id);
-            let relay_url = info.relay_url.map(c_string).unwrap_or(std::ptr::null_mut());
-
-            let direct_addrs = if info.direct_addrs.is_empty() {
-                std::ptr::null_mut()
-            } else {
-                c_string(info.direct_addrs.join("\n"))
-            };
-
-            let ffi_info = IrohNodeInfo {
-                node_id,
-                relay_url,
-                is_connected: info.is_connected,
-                direct_addrs,
-                dht_active: info.dht_active,
-            };
-            (callback.on_success)(callback.userdata, ffi_info);
-        }
-        Err(e) => {
-            let error = c_string(format!("{:#}", e));
-            (callback.on_failure)(callback.userdata, error);
-        }
+    if node.is_shutting_down() {
+        completion.fail("node shut down");
+        return;
     }
+
+    let endpoint = node.endpoint().clone();
+    let dht_active = node.dht_active();
+    let shutdown = node.shutdown_token();
+    node.runtime().spawn(async move {
+        if shutdown.is_cancelled() {
+            completion.fail("node shut down");
+            return;
+        }
+        let info = crate::node::node_info_from_endpoint(&endpoint, dht_active);
+        completion.succeed(info);
+    });
 }
 
 /// Validate and parse a ticket string.
@@ -627,30 +595,24 @@ pub unsafe extern "C" fn iroh_validate_ticket(
 /// - `callback` must have valid function pointers
 #[unsafe(no_mangle)]
 pub extern "C" fn iroh_node_close(handle: *mut IrohNodeHandle, callback: IrohCloseCallback) {
+    let completion = VoidCompletion::new(callback);
     if handle.is_null() {
-        (callback.on_complete)(callback.userdata);
+        completion.succeed();
         return;
     }
 
-    // Run shutdown on a dedicated thread to avoid blocking Swift's
-    // cooperative thread pool, which can cause deadlocks.
+    // Run shutdown on a dedicated thread (with inline fallback on thread
+    // exhaustion) to avoid blocking Swift's cooperative thread pool.
     let node = unsafe { Box::from_raw(handle as *mut IrohNode) };
-    let on_complete = callback.on_complete;
-    let on_failure = callback.on_failure;
-    let userdata = callback.userdata as usize;
-    std::thread::spawn(move || {
-        let userdata = userdata as *mut c_void;
-        match node.shutdown() {
-            Ok(()) => (on_complete)(userdata),
-            Err(e) => {
-                let error = c_string(format!("{:#}", e));
-                (on_failure)(userdata, error);
-            }
-        }
+    spawn_thread_or_inline("iroh-node-close", move || match node.shutdown() {
+        Ok(()) => completion.succeed(),
+        Err(e) => completion.fail(format!("{:#}", e)),
     });
 }
 
 /// Add bytes to the blob store with options (e.g., timeout).
+///
+/// Returns immediately; the work runs on the node's Tokio runtime.
 ///
 /// # Safety
 /// - `handle` must be a valid node handle
@@ -663,32 +625,36 @@ pub extern "C" fn iroh_put_with_options(
     options: IrohOperationOptions,
     callback: IrohCallback,
 ) {
+    let completion = StringCompletion::new(callback);
     if handle.is_null() {
-        let error = c_string("handle cannot be null");
-        (callback.on_failure)(callback.userdata, error);
+        completion.fail("handle cannot be null");
         return;
     }
 
-    // Copy the bytes to own them (Swift memory may not be stable)
-    let data = if bytes.data.is_null() || bytes.len == 0 {
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts(bytes.data, bytes.len).to_vec() }
-    };
-
+    let data = unsafe { borrowed_bytes(&bytes) }.to_vec();
     let node = unsafe { &*(handle as *const IrohNode) };
-    let timeout_ms = options.timeout_ms;
-
-    match node.put_with_timeout(&data, timeout_ms) {
-        Ok(ticket) => {
-            let ticket_cstr = c_string(ticket);
-            (callback.on_success)(callback.userdata, ticket_cstr);
-        }
-        Err(e) => {
-            let error = c_string(format!("{:#}", e));
-            (callback.on_failure)(callback.userdata, error);
-        }
+    if node.is_shutting_down() {
+        completion.fail("node shut down");
+        return;
     }
+
+    let timeout_ms = options.timeout_ms;
+    let endpoint = node.endpoint().clone();
+    let store = node.store().clone();
+    let shutdown = node.shutdown_token();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    node.runtime().spawn(async move {
+        let result = crate::node::run_cancellable(
+            crate::node::put_bytes(&endpoint, &store, &data, timeout_ms),
+            &cancel,
+            &shutdown,
+        )
+        .await;
+        match result {
+            Ok(ticket) => completion.succeed(ticket),
+            Err(e) => completion.fail(e.to_string()),
+        }
+    });
 }
 
 /// Push bytes to a remote node identified by its node ID.
@@ -912,6 +878,8 @@ pub unsafe extern "C" fn iroh_push_to_node_with_options(
 
 /// Download bytes from a ticket with options (e.g., timeout).
 ///
+/// Returns immediately; the work runs on the node's Tokio runtime.
+///
 /// # Safety
 /// - `handle` must be a valid node handle
 /// - `ticket` must be a valid null-terminated UTF-8 string
@@ -923,46 +891,53 @@ pub unsafe extern "C" fn iroh_get_with_options(
     options: IrohOperationOptions,
     callback: IrohGetCallback,
 ) {
-    if handle.is_null() {
-        let error = c_string("handle cannot be null");
-        (callback.on_failure)(callback.userdata, error);
-        return;
-    }
-
-    if ticket.is_null() {
-        let error = c_string("ticket cannot be null");
-        (callback.on_failure)(callback.userdata, error);
-        return;
-    }
-
-    let ticket_str = match unsafe { CStr::from_ptr(ticket) }.to_str() {
-        Ok(s) => s.to_string(),
-        Err(e) => {
-            let error = c_string(format!("Invalid ticket string: {}", e));
-            (callback.on_failure)(callback.userdata, error);
+    let completion = BytesCompletion::new(callback);
+    let ticket_str = match (|| {
+        if handle.is_null() {
+            return Err("handle cannot be null".to_string());
+        }
+        Ok(unsafe { required_str(ticket, "ticket") }?.to_string())
+    })() {
+        Ok(s) => s,
+        Err(msg) => {
+            completion.fail(msg);
             return;
         }
     };
 
     let node = unsafe { &*(handle as *const IrohNode) };
-    let timeout_ms = options.timeout_ms;
-
-    match node.get_with_timeout(&ticket_str, timeout_ms) {
-        Ok(bytes) => {
-            let mut vec = bytes;
-            let owned = IrohOwnedBytes {
-                data: vec.as_mut_ptr(),
-                len: vec.len(),
-                capacity: vec.capacity(),
-            };
-            std::mem::forget(vec);
-            (callback.on_success)(callback.userdata, owned);
-        }
-        Err(e) => {
-            let error = c_string(format!("{:#}", e));
-            (callback.on_failure)(callback.userdata, error);
-        }
+    if node.is_shutting_down() {
+        completion.fail("node shut down");
+        return;
     }
+
+    let timeout_ms = options.timeout_ms;
+    let endpoint = node.endpoint().clone();
+    let store = node.store().clone();
+    let memory_lookup = node.memory_lookup().clone();
+    let shutdown = node.shutdown_token();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    node.runtime().spawn(async move {
+        let result = crate::node::run_cancellable(
+            crate::node::get_from_ticket(
+                &endpoint,
+                &store,
+                &memory_lookup,
+                &ticket_str,
+                u64::MAX,
+                timeout_ms,
+                &cancel,
+                |_, _| {},
+            ),
+            &cancel,
+            &shutdown,
+        )
+        .await;
+        match result {
+            Ok(bytes) => completion.succeed(bytes),
+            Err(e) => completion.fail(e.to_string()),
+        }
+    });
 }
 
 // ============================================================================
@@ -972,7 +947,7 @@ pub unsafe extern "C" fn iroh_get_with_options(
 /// Tag (pin) a blob to prevent garbage collection.
 ///
 /// Tagged blobs are protected from GC until the tag is removed.
-/// Use this after downloading content you want to keep.
+/// Returns immediately; the work runs on the node's Tokio runtime.
 ///
 /// # Safety
 /// - `handle` must be a valid node handle
@@ -987,47 +962,21 @@ pub unsafe extern "C" fn iroh_blob_tag_set(
     format: IrohBlobFormat,
     callback: IrohCloseCallback,
 ) {
-    if handle.is_null() {
-        let error = c_string("handle cannot be null");
-        (callback.on_failure)(callback.userdata, error);
-        return;
-    }
-
-    if tag_name.is_null() {
-        let error = c_string("tag_name cannot be null");
-        (callback.on_failure)(callback.userdata, error);
-        return;
-    }
-
-    if hash_str.is_null() {
-        let error = c_string("hash_str cannot be null");
-        (callback.on_failure)(callback.userdata, error);
-        return;
-    }
-
-    let tag_name_str = match unsafe { CStr::from_ptr(tag_name) }.to_str() {
-        Ok(s) => s.to_string(),
-        Err(e) => {
-            let error = c_string(format!("Invalid tag_name UTF-8: {}", e));
-            (callback.on_failure)(callback.userdata, error);
-            return;
+    let completion = VoidCompletion::new(callback);
+    let parsed = (|| {
+        if handle.is_null() {
+            return Err("handle cannot be null".to_string());
         }
-    };
+        let tag_name_str = unsafe { required_str(tag_name, "tag_name") }?.to_string();
+        let hash_string = unsafe { required_str(hash_str, "hash_str") }?;
+        let hash = parse_hash_str(hash_string)?;
+        Ok((tag_name_str, hash))
+    })();
 
-    let hash_string = match unsafe { CStr::from_ptr(hash_str) }.to_str() {
-        Ok(s) => s.to_string(),
-        Err(e) => {
-            let error = c_string(format!("Invalid hash UTF-8: {}", e));
-            (callback.on_failure)(callback.userdata, error);
-            return;
-        }
-    };
-
-    let hash: Hash = match parse_hash_str(&hash_string) {
-        Ok(h) => h,
-        Err(e) => {
-            let error = c_string(e);
-            (callback.on_failure)(callback.userdata, error);
+    let (tag_name_str, hash) = match parsed {
+        Ok(parts) => parts,
+        Err(msg) => {
+            completion.fail(msg);
             return;
         }
     };
@@ -1043,20 +992,32 @@ pub unsafe extern "C" fn iroh_blob_tag_set(
     };
 
     let node = unsafe { &*(handle as *const IrohNode) };
-
-    // Use the store's tags API (FsStore derefs to Store which has tags())
-    match node
-        .runtime()
-        .block_on(node.store().tags().set(tag_name_str, hash_and_format))
-    {
-        Ok(()) => {
-            (callback.on_complete)(callback.userdata);
-        }
-        Err(e) => {
-            let error = c_string(format!("{:#}", e));
-            (callback.on_failure)(callback.userdata, error);
-        }
+    if node.is_shutting_down() {
+        completion.fail("node shut down");
+        return;
     }
+
+    let store = node.store().clone();
+    let shutdown = node.shutdown_token();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    node.runtime().spawn(async move {
+        let result = crate::node::run_cancellable(
+            async {
+                store
+                    .tags()
+                    .set(tag_name_str, hash_and_format)
+                    .await
+                    .map_err(|e| crate::node::OperationError::Failed(anyhow::Error::new(e)))
+            },
+            &cancel,
+            &shutdown,
+        )
+        .await;
+        match result {
+            Ok(()) => completion.succeed(),
+            Err(e) => completion.fail(e.to_string()),
+        }
+    });
 }
 
 /// Create a shareable ticket for an existing local blob.
@@ -1122,6 +1083,8 @@ pub unsafe extern "C" fn iroh_blob_ticket_create(
 
 /// Remove a tag (unpin) from a blob, allowing garbage collection.
 ///
+/// Returns immediately; the work runs on the node's Tokio runtime.
+///
 /// # Safety
 /// - `handle` must be a valid node handle
 /// - `tag_name` must be a valid null-terminated UTF-8 string
@@ -1132,42 +1095,48 @@ pub unsafe extern "C" fn iroh_blob_tag_delete(
     tag_name: *const c_char,
     callback: IrohCloseCallback,
 ) {
-    if handle.is_null() {
-        let error = c_string("handle cannot be null");
-        (callback.on_failure)(callback.userdata, error);
-        return;
-    }
-
-    if tag_name.is_null() {
-        let error = c_string("tag_name cannot be null");
-        (callback.on_failure)(callback.userdata, error);
-        return;
-    }
-
-    let tag_name_str = match unsafe { CStr::from_ptr(tag_name) }.to_str() {
-        Ok(s) => s.to_string(),
-        Err(e) => {
-            let error = c_string(format!("Invalid tag_name UTF-8: {}", e));
-            (callback.on_failure)(callback.userdata, error);
+    let completion = VoidCompletion::new(callback);
+    let tag_name_str = match (|| {
+        if handle.is_null() {
+            return Err("handle cannot be null".to_string());
+        }
+        Ok(unsafe { required_str(tag_name, "tag_name") }?.to_string())
+    })() {
+        Ok(s) => s,
+        Err(msg) => {
+            completion.fail(msg);
             return;
         }
     };
 
     let node = unsafe { &*(handle as *const IrohNode) };
-
-    // Use the store's tags API to delete the tag
-    match node
-        .runtime()
-        .block_on(node.store().tags().delete(tag_name_str))
-    {
-        Ok(_count) => {
-            (callback.on_complete)(callback.userdata);
-        }
-        Err(e) => {
-            let error = c_string(format!("{:#}", e));
-            (callback.on_failure)(callback.userdata, error);
-        }
+    if node.is_shutting_down() {
+        completion.fail("node shut down");
+        return;
     }
+
+    let store = node.store().clone();
+    let shutdown = node.shutdown_token();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    node.runtime().spawn(async move {
+        let result = crate::node::run_cancellable(
+            async {
+                store
+                    .tags()
+                    .delete(tag_name_str)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| crate::node::OperationError::Failed(anyhow::Error::new(e)))
+            },
+            &cancel,
+            &shutdown,
+        )
+        .await;
+        match result {
+            Ok(()) => completion.succeed(),
+            Err(e) => completion.fail(e.to_string()),
+        }
+    });
 }
 
 // ============================================================================
@@ -1510,14 +1479,22 @@ pub unsafe extern "C" fn iroh_push_file_to_node(
         let result = crate::node::run_cancellable(
             async {
                 let remote = resolver.resolve_target(target).await?;
-                crate::node::push_path(&endpoint, &store, &path, remote).await
+                crate::node::push_path_transfer(&endpoint, &store, &path, remote).await
             },
             &token,
             &shutdown,
         )
         .await;
         match result {
-            Ok(hash) => completion.succeed(hash.to_hex().to_string()),
+            Ok((hash, conn)) => {
+                match crate::node::await_push_grace(conn, Some(&token), Some(&shutdown)).await {
+                    Ok(()) => completion.succeed(hash.to_hex().to_string()),
+                    Err(e) => {
+                        let (code, _) = operation_error_code(&e);
+                        completion.fail(code, e.to_string());
+                    }
+                }
+            }
             Err(e) => {
                 let (code, _) = operation_error_code(&e);
                 completion.fail(code, e.to_string());
@@ -1597,13 +1574,481 @@ pub unsafe extern "C" fn iroh_push_bytes_to_node(
     let resolver = node.host_resolver().clone();
     node.runtime().spawn(async move {
         let result = crate::node::run_cancellable(
-            crate::node::push_bytes(&endpoint, &store, &resolver, target, &data, timeout_ms),
+            crate::node::push_bytes_transfer(
+                &endpoint, &store, &resolver, target, &data, timeout_ms,
+            ),
             &token,
             &shutdown,
         )
         .await;
         match result {
-            Ok(hash) => completion.succeed(hash.to_hex().to_string()),
+            Ok((hash, conn)) => {
+                match crate::node::await_push_grace(conn, Some(&token), Some(&shutdown)).await {
+                    Ok(()) => completion.succeed(hash.to_hex().to_string()),
+                    Err(e) => {
+                        let (code, _) = operation_error_code(&e);
+                        completion.fail(code, e.to_string());
+                    }
+                }
+            }
+            Err(e) => {
+                let (code, _) = operation_error_code(&e);
+                completion.fail(code, e.to_string());
+            }
+        }
+    });
+}
+
+// ============================================================================
+// Structured-Error Cancellable Operations
+// ============================================================================
+
+/// Callback for `iroh_node_create_async`.
+#[repr(C)]
+pub struct IrohNodeCreateAsyncCallback {
+    /// Opaque pointer passed back to Swift.
+    pub userdata: *mut c_void,
+    /// Called on success with the node handle.
+    pub on_success: extern "C" fn(userdata: *mut c_void, handle: *mut IrohNodeHandle),
+    /// Called on failure with structured error code and message (`iroh_string_free`).
+    pub on_failure:
+        extern "C" fn(userdata: *mut c_void, code: IrohOperationErrorCode, error: *const c_char),
+}
+
+/// Callback for cancellable string-returning operations (`iroh_put_async`).
+#[repr(C)]
+pub struct IrohOperationCallback {
+    /// Opaque pointer passed back to Swift.
+    pub userdata: *mut c_void,
+    /// Called on success with a C string (`iroh_string_free`).
+    pub on_success: extern "C" fn(userdata: *mut c_void, result: *const c_char),
+    /// Called on failure with structured error code and message (`iroh_string_free`).
+    pub on_failure:
+        extern "C" fn(userdata: *mut c_void, code: IrohOperationErrorCode, error: *const c_char),
+}
+
+/// Callback for cancellable void operations (`iroh_blob_tag_set_async`, `iroh_blob_tag_delete_async`).
+#[repr(C)]
+pub struct IrohVoidOperationCallback {
+    /// Opaque pointer passed back to Swift.
+    pub userdata: *mut c_void,
+    /// Called on success.
+    pub on_complete: extern "C" fn(userdata: *mut c_void),
+    /// Called on failure with structured error code and message (`iroh_string_free`).
+    pub on_failure:
+        extern "C" fn(userdata: *mut c_void, code: IrohOperationErrorCode, error: *const c_char),
+}
+
+/// Callback for `iroh_get_async`.
+#[repr(C)]
+pub struct IrohGetAsyncCallback {
+    /// Opaque pointer passed back to Swift.
+    pub userdata: *mut c_void,
+    /// Optional progress callback `(downloaded, total)`. Null to skip progress.
+    pub on_progress: Option<extern "C" fn(userdata: *mut c_void, downloaded: u64, total: u64)>,
+    /// Called on success with owned bytes (`iroh_bytes_free`).
+    pub on_success: extern "C" fn(userdata: *mut c_void, bytes: IrohOwnedBytes),
+    /// Called on failure. `size` carries the announced size for `SizeLimitExceeded`, else 0.
+    pub on_failure: extern "C" fn(
+        userdata: *mut c_void,
+        code: IrohOperationErrorCode,
+        size: u64,
+        error: *const c_char,
+    ),
+}
+
+/// Callback for `iroh_node_info_async`.
+#[repr(C)]
+pub struct IrohNodeInfoAsyncCallback {
+    /// Opaque pointer passed back to Swift.
+    pub userdata: *mut c_void,
+    /// Called on success with node info.
+    pub on_success: extern "C" fn(userdata: *mut c_void, info: IrohNodeInfo),
+    /// Called on failure with structured error code and message (`iroh_string_free`).
+    pub on_failure:
+        extern "C" fn(userdata: *mut c_void, code: IrohOperationErrorCode, error: *const c_char),
+}
+
+/// Create a new Iroh node asynchronously on a background thread with cancellation.
+///
+/// # Safety
+/// - `config.storage_path` must be a valid null-terminated UTF-8 string
+/// - `config.custom_relay_url` must be null or a valid null-terminated UTF-8 string
+/// - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_node_create_async(
+    config: IrohNodeConfig,
+    cancel_token: *const IrohCancelToken,
+    callback: IrohNodeCreateAsyncCallback,
+) {
+    let completion = NodeCreateAsyncCompletion::new(callback);
+    let parsed = unsafe { parse_node_config(&config) };
+    let (storage_path, custom_relay_url, relay_enabled, serves_blobs, accepts_pushes, options) =
+        match parsed {
+            Ok(parts) => parts,
+            Err(message) => {
+                completion.fail(IrohOperationErrorCode::Failed, message);
+                return;
+            }
+        };
+
+    let token = operation_token(cancel_token);
+    if token.is_cancelled() {
+        completion.fail(IrohOperationErrorCode::Cancelled, "operation cancelled");
+        return;
+    }
+
+    spawn_thread_or_inline(
+        "iroh-node-create",
+        move || match IrohNode::new_with_options_cancellable(
+            storage_path,
+            relay_enabled,
+            custom_relay_url,
+            serves_blobs,
+            accepts_pushes,
+            options,
+            &token,
+        ) {
+            Ok(node) => {
+                let boxed = Box::new(node);
+                let handle = Box::into_raw(boxed) as *mut IrohNodeHandle;
+                completion.succeed(handle);
+            }
+            Err(e) => {
+                let (code, _) = operation_error_code(&e);
+                completion.fail(code, e.to_string());
+            }
+        },
+    );
+}
+
+/// Add bytes to the blob store asynchronously with optional timeout and cancellation.
+///
+/// `timeout_ms` of 0 means no timeout.
+///
+/// # Safety
+/// - `handle` must be a valid node handle that outlives the operation's callback
+/// - `bytes.data` must point to `bytes.len` readable bytes (copied before return)
+/// - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_put_async(
+    handle: *const IrohNodeHandle,
+    bytes: IrohBytes,
+    timeout_ms: u64,
+    cancel_token: *const IrohCancelToken,
+    callback: IrohOperationCallback,
+) {
+    let completion = OperationStringCompletion {
+        userdata: callback.userdata as usize,
+        on_success: callback.on_success,
+        on_failure: callback.on_failure,
+        done: false,
+    };
+
+    if handle.is_null() {
+        completion.fail(IrohOperationErrorCode::Failed, "handle cannot be null");
+        return;
+    }
+
+    let node = unsafe { &*(handle as *const IrohNode) };
+    if node.is_shutting_down() {
+        completion.fail(IrohOperationErrorCode::NodeShutDown, "node shut down");
+        return;
+    }
+
+    let data = unsafe { borrowed_bytes(&bytes) }.to_vec();
+    let token = operation_token(cancel_token);
+    let endpoint = node.endpoint().clone();
+    let store = node.store().clone();
+    let shutdown = node.shutdown_token();
+    node.runtime().spawn(async move {
+        let result = crate::node::run_cancellable(
+            crate::node::put_bytes(&endpoint, &store, &data, timeout_ms),
+            &token,
+            &shutdown,
+        )
+        .await;
+        match result {
+            Ok(ticket) => completion.succeed(ticket),
+            Err(e) => {
+                let (code, _) = operation_error_code(&e);
+                completion.fail(code, e.to_string());
+            }
+        }
+    });
+}
+
+/// Download bytes from a ticket asynchronously with `max_size`, optional timeout,
+/// optional progress callback, and cancellation.
+///
+/// `timeout_ms` of 0 means no timeout; `max_size` of `u64::MAX` means no size limit.
+///
+/// # Safety
+/// - `handle` must be a valid node handle that outlives the operation's callback
+/// - `ticket` must be a valid null-terminated UTF-8 string
+/// - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_get_async(
+    handle: *const IrohNodeHandle,
+    ticket: *const c_char,
+    timeout_ms: u64,
+    max_size: u64,
+    cancel_token: *const IrohCancelToken,
+    callback: IrohGetAsyncCallback,
+) {
+    let completion = GetAsyncCompletion {
+        userdata: callback.userdata as usize,
+        on_progress: callback.on_progress,
+        on_success: callback.on_success,
+        on_failure: callback.on_failure,
+        done: false,
+    };
+
+    let ticket_str = match (|| {
+        if handle.is_null() {
+            return Err("handle cannot be null".to_string());
+        }
+        Ok(unsafe { required_str(ticket, "ticket") }?.to_string())
+    })() {
+        Ok(s) => s,
+        Err(message) => {
+            completion.fail(IrohOperationErrorCode::Failed, 0, message);
+            return;
+        }
+    };
+
+    let node = unsafe { &*(handle as *const IrohNode) };
+    if node.is_shutting_down() {
+        completion.fail(IrohOperationErrorCode::NodeShutDown, 0, "node shut down");
+        return;
+    }
+
+    let token = operation_token(cancel_token);
+    let endpoint = node.endpoint().clone();
+    let store = node.store().clone();
+    let memory_lookup = node.memory_lookup().clone();
+    let shutdown = node.shutdown_token();
+    node.runtime().spawn(async move {
+        let result = crate::node::run_cancellable(
+            crate::node::get_from_ticket(
+                &endpoint,
+                &store,
+                &memory_lookup,
+                &ticket_str,
+                max_size,
+                timeout_ms,
+                &token,
+                |downloaded, total| completion.progress(downloaded, total),
+            ),
+            &token,
+            &shutdown,
+        )
+        .await;
+        match result {
+            Ok(bytes) => completion.succeed(bytes),
+            Err(e) => {
+                let (code, size) = operation_error_code(&e);
+                completion.fail(code, size, e.to_string());
+            }
+        }
+    });
+}
+
+/// Tag (pin) a blob asynchronously with cancellation.
+///
+/// # Safety
+/// - `handle` must be a valid node handle that outlives the operation's callback
+/// - `tag_name` and `hash_str` must be valid null-terminated UTF-8 strings
+/// - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_blob_tag_set_async(
+    handle: *const IrohNodeHandle,
+    tag_name: *const c_char,
+    hash_str: *const c_char,
+    format: IrohBlobFormat,
+    cancel_token: *const IrohCancelToken,
+    callback: IrohVoidOperationCallback,
+) {
+    let completion = VoidOperationCompletion {
+        userdata: callback.userdata as usize,
+        on_complete: callback.on_complete,
+        on_failure: callback.on_failure,
+        done: false,
+    };
+
+    let parsed = (|| {
+        if handle.is_null() {
+            return Err("handle cannot be null".to_string());
+        }
+        let tag_name_str = unsafe { required_str(tag_name, "tag_name") }?.to_string();
+        let hash_string = unsafe { required_str(hash_str, "hash_str") }?;
+        let hash = parse_hash_str(hash_string)?;
+        Ok((tag_name_str, hash))
+    })();
+
+    let (tag_name_str, hash) = match parsed {
+        Ok(parts) => parts,
+        Err(message) => {
+            completion.fail(IrohOperationErrorCode::Failed, message);
+            return;
+        }
+    };
+
+    let blob_format = match format {
+        IrohBlobFormat::Raw => BlobFormat::Raw,
+        IrohBlobFormat::HashSeq => BlobFormat::HashSeq,
+    };
+    let hash_and_format = HashAndFormat {
+        hash,
+        format: blob_format,
+    };
+
+    let node = unsafe { &*(handle as *const IrohNode) };
+    if node.is_shutting_down() {
+        completion.fail(IrohOperationErrorCode::NodeShutDown, "node shut down");
+        return;
+    }
+
+    let token = operation_token(cancel_token);
+    let store = node.store().clone();
+    let shutdown = node.shutdown_token();
+    node.runtime().spawn(async move {
+        let result = crate::node::run_cancellable(
+            async {
+                store
+                    .tags()
+                    .set(tag_name_str, hash_and_format)
+                    .await
+                    .map_err(|e| crate::node::OperationError::Failed(anyhow::Error::new(e)))
+            },
+            &token,
+            &shutdown,
+        )
+        .await;
+        match result {
+            Ok(()) => completion.succeed(),
+            Err(e) => {
+                let (code, _) = operation_error_code(&e);
+                completion.fail(code, e.to_string());
+            }
+        }
+    });
+}
+
+/// Remove a tag (unpin) asynchronously with cancellation.
+///
+/// # Safety
+/// - `handle` must be a valid node handle that outlives the operation's callback
+/// - `tag_name` must be a valid null-terminated UTF-8 string
+/// - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_blob_tag_delete_async(
+    handle: *const IrohNodeHandle,
+    tag_name: *const c_char,
+    cancel_token: *const IrohCancelToken,
+    callback: IrohVoidOperationCallback,
+) {
+    let completion = VoidOperationCompletion {
+        userdata: callback.userdata as usize,
+        on_complete: callback.on_complete,
+        on_failure: callback.on_failure,
+        done: false,
+    };
+
+    let tag_name_str = match (|| {
+        if handle.is_null() {
+            return Err("handle cannot be null".to_string());
+        }
+        Ok(unsafe { required_str(tag_name, "tag_name") }?.to_string())
+    })() {
+        Ok(s) => s,
+        Err(message) => {
+            completion.fail(IrohOperationErrorCode::Failed, message);
+            return;
+        }
+    };
+
+    let node = unsafe { &*(handle as *const IrohNode) };
+    if node.is_shutting_down() {
+        completion.fail(IrohOperationErrorCode::NodeShutDown, "node shut down");
+        return;
+    }
+
+    let token = operation_token(cancel_token);
+    let store = node.store().clone();
+    let shutdown = node.shutdown_token();
+    node.runtime().spawn(async move {
+        let result = crate::node::run_cancellable(
+            async {
+                store
+                    .tags()
+                    .delete(tag_name_str)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| crate::node::OperationError::Failed(anyhow::Error::new(e)))
+            },
+            &token,
+            &shutdown,
+        )
+        .await;
+        match result {
+            Ok(()) => completion.succeed(),
+            Err(e) => {
+                let (code, _) = operation_error_code(&e);
+                completion.fail(code, e.to_string());
+            }
+        }
+    });
+}
+
+/// Get information about the node asynchronously with cancellation.
+///
+/// # Safety
+/// - `handle` must be a valid node handle that outlives the operation's callback
+/// - `cancel_token` is nullable; if non-null must come from `iroh_cancel_token_new`
+/// - `callback` must have valid function pointers
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_node_info_async(
+    handle: *const IrohNodeHandle,
+    cancel_token: *const IrohCancelToken,
+    callback: IrohNodeInfoAsyncCallback,
+) {
+    let completion = NodeInfoAsyncCompletion {
+        userdata: callback.userdata as usize,
+        on_success: callback.on_success,
+        on_failure: callback.on_failure,
+        done: false,
+    };
+
+    if handle.is_null() {
+        completion.fail(IrohOperationErrorCode::Failed, "handle cannot be null");
+        return;
+    }
+
+    let node = unsafe { &*(handle as *const IrohNode) };
+    if node.is_shutting_down() {
+        completion.fail(IrohOperationErrorCode::NodeShutDown, "node shut down");
+        return;
+    }
+
+    let token = operation_token(cancel_token);
+    let endpoint = node.endpoint().clone();
+    let dht_active = node.dht_active();
+    let shutdown = node.shutdown_token();
+    node.runtime().spawn(async move {
+        let result = crate::node::run_cancellable(
+            async { Ok(crate::node::node_info_from_endpoint(&endpoint, dht_active)) },
+            &token,
+            &shutdown,
+        )
+        .await;
+        match result {
+            Ok(info) => completion.succeed(info),
             Err(e) => {
                 let (code, _) = operation_error_code(&e);
                 completion.fail(code, e.to_string());
@@ -1688,6 +2133,505 @@ impl PushFileCompletion {
 }
 
 impl Drop for PushFileCompletion {
+    fn drop(&mut self) {
+        if !self.done {
+            self.done = true;
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                IrohOperationErrorCode::NodeShutDown,
+                c_string("node shut down".to_string()),
+            );
+        }
+    }
+}
+
+/// Spawn `f` on a named OS thread; if thread creation fails (e.g. thread
+/// exhaustion), execute `f` inline instead of panicking across `extern "C"`.
+fn spawn_thread_or_inline<F>(name: &str, f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(f)));
+    let thread_slot = std::sync::Arc::clone(&slot);
+    let spawned = std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            if let Some(work) = thread_slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                work();
+            }
+        });
+    if spawned.is_err()
+        && let Some(work) = slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+    {
+        work();
+    }
+}
+
+type ParsedNodeConfig = (
+    PathBuf,
+    Option<String>,
+    bool,
+    bool,
+    bool,
+    crate::node::NodeOptions,
+);
+
+unsafe fn parse_node_config(config: &IrohNodeConfig) -> Result<ParsedNodeConfig, String> {
+    let storage_path = PathBuf::from(unsafe { required_str(config.storage_path, "storage_path") }?);
+    let custom_relay_url =
+        unsafe { optional_str(config.custom_relay_url, "custom_relay_url") }?.map(str::to_string);
+    let options = crate::node::NodeOptions {
+        dht_lookup: config.dht_lookup,
+        dht_publish: config.dht_publish,
+        ..Default::default()
+    };
+    Ok((
+        storage_path,
+        custom_relay_url,
+        config.relay_enabled,
+        config.serves_blobs,
+        config.accepts_pushes,
+        options,
+    ))
+}
+
+fn into_owned_bytes(mut vec: Vec<u8>) -> IrohOwnedBytes {
+    let owned = IrohOwnedBytes {
+        data: vec.as_mut_ptr(),
+        len: vec.len(),
+        capacity: vec.capacity(),
+    };
+    std::mem::forget(vec);
+    owned
+}
+
+fn ffi_node_info(info: crate::node::NodeInfo) -> IrohNodeInfo {
+    let node_id = c_string(info.node_id);
+    let relay_url = info.relay_url.map(c_string).unwrap_or(std::ptr::null_mut());
+    let direct_addrs = if info.direct_addrs.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        c_string(info.direct_addrs.join("\n"))
+    };
+    IrohNodeInfo {
+        node_id,
+        relay_url,
+        is_connected: info.is_connected,
+        direct_addrs,
+        dht_active: info.dht_active,
+    }
+}
+
+/// Drop-guard completion for `IrohNodeCreateCallback`.
+struct NodeCreateCompletion {
+    userdata: usize,
+    on_success: extern "C" fn(userdata: *mut c_void, handle: *mut IrohNodeHandle),
+    on_failure: extern "C" fn(userdata: *mut c_void, error: *const c_char),
+    done: bool,
+}
+
+impl NodeCreateCompletion {
+    fn new(callback: IrohNodeCreateCallback) -> Self {
+        Self {
+            userdata: callback.userdata as usize,
+            on_success: callback.on_success,
+            on_failure: callback.on_failure,
+            done: false,
+        }
+    }
+
+    fn succeed(mut self, handle: *mut IrohNodeHandle) {
+        self.done = true;
+        (self.on_success)(self.userdata as *mut c_void, handle);
+    }
+
+    fn fail(mut self, message: impl Into<String>) {
+        self.done = true;
+        (self.on_failure)(self.userdata as *mut c_void, c_string(message.into()));
+    }
+}
+
+impl Drop for NodeCreateCompletion {
+    fn drop(&mut self) {
+        if !self.done {
+            self.done = true;
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                c_string("node creation aborted".to_string()),
+            );
+        }
+    }
+}
+
+/// Drop-guard completion for `IrohNodeCreateAsyncCallback`.
+struct NodeCreateAsyncCompletion {
+    userdata: usize,
+    on_success: extern "C" fn(userdata: *mut c_void, handle: *mut IrohNodeHandle),
+    on_failure:
+        extern "C" fn(userdata: *mut c_void, code: IrohOperationErrorCode, error: *const c_char),
+    done: bool,
+}
+
+impl NodeCreateAsyncCompletion {
+    fn new(callback: IrohNodeCreateAsyncCallback) -> Self {
+        Self {
+            userdata: callback.userdata as usize,
+            on_success: callback.on_success,
+            on_failure: callback.on_failure,
+            done: false,
+        }
+    }
+
+    fn succeed(mut self, handle: *mut IrohNodeHandle) {
+        self.done = true;
+        (self.on_success)(self.userdata as *mut c_void, handle);
+    }
+
+    fn fail(mut self, code: IrohOperationErrorCode, message: impl Into<String>) {
+        self.done = true;
+        (self.on_failure)(self.userdata as *mut c_void, code, c_string(message.into()));
+    }
+}
+
+impl Drop for NodeCreateAsyncCompletion {
+    fn drop(&mut self) {
+        if !self.done {
+            self.done = true;
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                IrohOperationErrorCode::Failed,
+                c_string("node creation aborted".to_string()),
+            );
+        }
+    }
+}
+
+/// Drop-guard completion for legacy `IrohCallback`.
+struct StringCompletion {
+    userdata: usize,
+    on_success: extern "C" fn(userdata: *mut c_void, result: *const c_char),
+    on_failure: extern "C" fn(userdata: *mut c_void, error: *const c_char),
+    done: bool,
+}
+
+impl StringCompletion {
+    fn new(callback: IrohCallback) -> Self {
+        Self {
+            userdata: callback.userdata as usize,
+            on_success: callback.on_success,
+            on_failure: callback.on_failure,
+            done: false,
+        }
+    }
+
+    fn succeed(mut self, value: String) {
+        self.done = true;
+        (self.on_success)(self.userdata as *mut c_void, c_string(value));
+    }
+
+    fn fail(mut self, message: impl Into<String>) {
+        self.done = true;
+        (self.on_failure)(self.userdata as *mut c_void, c_string(message.into()));
+    }
+}
+
+impl Drop for StringCompletion {
+    fn drop(&mut self) {
+        if !self.done {
+            self.done = true;
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                c_string("node shut down".to_string()),
+            );
+        }
+    }
+}
+
+/// Drop-guard completion for legacy `IrohGetCallback` / `IrohGetProgressCallback`.
+struct BytesCompletion {
+    userdata: usize,
+    on_progress: Option<extern "C" fn(userdata: *mut c_void, progress: IrohDownloadProgress)>,
+    on_success: extern "C" fn(userdata: *mut c_void, bytes: IrohOwnedBytes),
+    on_failure: extern "C" fn(userdata: *mut c_void, error: *const c_char),
+    done: bool,
+}
+
+impl BytesCompletion {
+    fn new(callback: IrohGetCallback) -> Self {
+        Self {
+            userdata: callback.userdata as usize,
+            on_progress: None,
+            on_success: callback.on_success,
+            on_failure: callback.on_failure,
+            done: false,
+        }
+    }
+
+    fn with_progress(callback: IrohGetProgressCallback) -> Self {
+        Self {
+            userdata: callback.userdata as usize,
+            on_progress: Some(callback.on_progress),
+            on_success: callback.on_success,
+            on_failure: callback.on_failure,
+            done: false,
+        }
+    }
+
+    fn progress(&self, downloaded: u64, total: u64) {
+        if let Some(on_progress) = self.on_progress {
+            on_progress(
+                self.userdata as *mut c_void,
+                IrohDownloadProgress { downloaded, total },
+            );
+        }
+    }
+
+    fn succeed(mut self, bytes: Vec<u8>) {
+        self.done = true;
+        (self.on_success)(self.userdata as *mut c_void, into_owned_bytes(bytes));
+    }
+
+    fn fail(mut self, message: impl Into<String>) {
+        self.done = true;
+        (self.on_failure)(self.userdata as *mut c_void, c_string(message.into()));
+    }
+}
+
+impl Drop for BytesCompletion {
+    fn drop(&mut self) {
+        if !self.done {
+            self.done = true;
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                c_string("node shut down".to_string()),
+            );
+        }
+    }
+}
+
+/// Drop-guard completion for legacy `IrohCloseCallback` (used by `iroh_blob_tag_*`).
+struct VoidCompletion {
+    userdata: usize,
+    on_complete: extern "C" fn(userdata: *mut c_void),
+    on_failure: extern "C" fn(userdata: *mut c_void, error: *const c_char),
+    done: bool,
+}
+
+impl VoidCompletion {
+    fn new(callback: IrohCloseCallback) -> Self {
+        Self {
+            userdata: callback.userdata as usize,
+            on_complete: callback.on_complete,
+            on_failure: callback.on_failure,
+            done: false,
+        }
+    }
+
+    fn succeed(mut self) {
+        self.done = true;
+        (self.on_complete)(self.userdata as *mut c_void);
+    }
+
+    fn fail(mut self, message: impl Into<String>) {
+        self.done = true;
+        (self.on_failure)(self.userdata as *mut c_void, c_string(message.into()));
+    }
+}
+
+impl Drop for VoidCompletion {
+    fn drop(&mut self) {
+        if !self.done {
+            self.done = true;
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                c_string("node shut down".to_string()),
+            );
+        }
+    }
+}
+
+/// Drop-guard completion for legacy `IrohNodeInfoCallback`.
+struct NodeInfoCompletion {
+    userdata: usize,
+    on_success: extern "C" fn(userdata: *mut c_void, info: IrohNodeInfo),
+    on_failure: extern "C" fn(userdata: *mut c_void, error: *const c_char),
+    done: bool,
+}
+
+impl NodeInfoCompletion {
+    fn new(callback: IrohNodeInfoCallback) -> Self {
+        Self {
+            userdata: callback.userdata as usize,
+            on_success: callback.on_success,
+            on_failure: callback.on_failure,
+            done: false,
+        }
+    }
+
+    fn succeed(mut self, info: crate::node::NodeInfo) {
+        self.done = true;
+        (self.on_success)(self.userdata as *mut c_void, ffi_node_info(info));
+    }
+
+    fn fail(mut self, message: impl Into<String>) {
+        self.done = true;
+        (self.on_failure)(self.userdata as *mut c_void, c_string(message.into()));
+    }
+}
+
+impl Drop for NodeInfoCompletion {
+    fn drop(&mut self) {
+        if !self.done {
+            self.done = true;
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                c_string("node shut down".to_string()),
+            );
+        }
+    }
+}
+
+/// Drop-guard completion for `IrohOperationCallback`.
+struct OperationStringCompletion {
+    userdata: usize,
+    on_success: extern "C" fn(userdata: *mut c_void, result: *const c_char),
+    on_failure:
+        extern "C" fn(userdata: *mut c_void, code: IrohOperationErrorCode, error: *const c_char),
+    done: bool,
+}
+
+impl OperationStringCompletion {
+    fn succeed(mut self, value: String) {
+        self.done = true;
+        (self.on_success)(self.userdata as *mut c_void, c_string(value));
+    }
+
+    fn fail(mut self, code: IrohOperationErrorCode, message: impl Into<String>) {
+        self.done = true;
+        (self.on_failure)(self.userdata as *mut c_void, code, c_string(message.into()));
+    }
+}
+
+impl Drop for OperationStringCompletion {
+    fn drop(&mut self) {
+        if !self.done {
+            self.done = true;
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                IrohOperationErrorCode::NodeShutDown,
+                c_string("node shut down".to_string()),
+            );
+        }
+    }
+}
+
+/// Drop-guard completion for `IrohVoidOperationCallback`.
+struct VoidOperationCompletion {
+    userdata: usize,
+    on_complete: extern "C" fn(userdata: *mut c_void),
+    on_failure:
+        extern "C" fn(userdata: *mut c_void, code: IrohOperationErrorCode, error: *const c_char),
+    done: bool,
+}
+
+impl VoidOperationCompletion {
+    fn succeed(mut self) {
+        self.done = true;
+        (self.on_complete)(self.userdata as *mut c_void);
+    }
+
+    fn fail(mut self, code: IrohOperationErrorCode, message: impl Into<String>) {
+        self.done = true;
+        (self.on_failure)(self.userdata as *mut c_void, code, c_string(message.into()));
+    }
+}
+
+impl Drop for VoidOperationCompletion {
+    fn drop(&mut self) {
+        if !self.done {
+            self.done = true;
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                IrohOperationErrorCode::NodeShutDown,
+                c_string("node shut down".to_string()),
+            );
+        }
+    }
+}
+
+/// Drop-guard completion for `IrohGetAsyncCallback`.
+struct GetAsyncCompletion {
+    userdata: usize,
+    on_progress: Option<extern "C" fn(userdata: *mut c_void, downloaded: u64, total: u64)>,
+    on_success: extern "C" fn(userdata: *mut c_void, bytes: IrohOwnedBytes),
+    on_failure: extern "C" fn(
+        userdata: *mut c_void,
+        code: IrohOperationErrorCode,
+        size: u64,
+        error: *const c_char,
+    ),
+    done: bool,
+}
+
+impl GetAsyncCompletion {
+    fn progress(&self, downloaded: u64, total: u64) {
+        if let Some(on_progress) = self.on_progress {
+            on_progress(self.userdata as *mut c_void, downloaded, total);
+        }
+    }
+
+    fn succeed(mut self, bytes: Vec<u8>) {
+        self.done = true;
+        (self.on_success)(self.userdata as *mut c_void, into_owned_bytes(bytes));
+    }
+
+    fn fail(mut self, code: IrohOperationErrorCode, size: u64, message: impl Into<String>) {
+        self.done = true;
+        (self.on_failure)(
+            self.userdata as *mut c_void,
+            code,
+            size,
+            c_string(message.into()),
+        );
+    }
+}
+
+impl Drop for GetAsyncCompletion {
+    fn drop(&mut self) {
+        if !self.done {
+            self.done = true;
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                IrohOperationErrorCode::NodeShutDown,
+                0,
+                c_string("node shut down".to_string()),
+            );
+        }
+    }
+}
+
+/// Drop-guard completion for `IrohNodeInfoAsyncCallback`.
+struct NodeInfoAsyncCompletion {
+    userdata: usize,
+    on_success: extern "C" fn(userdata: *mut c_void, info: IrohNodeInfo),
+    on_failure:
+        extern "C" fn(userdata: *mut c_void, code: IrohOperationErrorCode, error: *const c_char),
+    done: bool,
+}
+
+impl NodeInfoAsyncCompletion {
+    fn succeed(mut self, info: crate::node::NodeInfo) {
+        self.done = true;
+        (self.on_success)(self.userdata as *mut c_void, ffi_node_info(info));
+    }
+
+    fn fail(mut self, code: IrohOperationErrorCode, message: impl Into<String>) {
+        self.done = true;
+        (self.on_failure)(self.userdata as *mut c_void, code, c_string(message.into()));
+    }
+}
+
+impl Drop for NodeInfoAsyncCompletion {
     fn drop(&mut self) {
         if !self.done {
             self.done = true;
@@ -1907,5 +2851,268 @@ mod tests {
         assert_eq!(parse_blob_hash(&hex.to_uppercase()).unwrap(), hash);
         assert!(parse_blob_hash(&hex[..63]).is_err());
         assert!(parse_blob_hash(&"z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn test_spawn_thread_or_inline_runs_work() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_thread_or_inline("iroh-test-worker", move || {
+            let _ = tx.send(42u32);
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn test_operation_error_code_distinguishes_timeout_from_transport_message() {
+        use crate::node::OperationError;
+
+        let transport_err = OperationError::Failed(anyhow::anyhow!("QUIC idle timed out"));
+        assert_eq!(
+            operation_error_code(&transport_err),
+            (IrohOperationErrorCode::Failed, 0)
+        );
+        assert_eq!(
+            operation_error_code(&OperationError::TimedOut),
+            (IrohOperationErrorCode::TimedOut, 0)
+        );
+        assert_eq!(
+            operation_error_code(&OperationError::SizeLimitExceeded(4096)),
+            (IrohOperationErrorCode::SizeLimitExceeded, 4096)
+        );
+        assert_eq!(
+            operation_error_code(&OperationError::Cancelled),
+            (IrohOperationErrorCode::Cancelled, 0)
+        );
+        assert_eq!(
+            operation_error_code(&OperationError::NodeShutDown),
+            (IrohOperationErrorCode::NodeShutDown, 0)
+        );
+    }
+
+    #[test]
+    fn test_ffi_async_operations_and_error_codes() {
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path_cstr = CString::new(dir.path().to_str().unwrap()).unwrap();
+        let config = IrohNodeConfig {
+            storage_path: path_cstr.as_ptr(),
+            relay_enabled: false,
+            custom_relay_url: std::ptr::null(),
+            serves_blobs: false,
+            accepts_pushes: false,
+            dht_lookup: false,
+            dht_publish: false,
+        };
+
+        // Pre-cancelled create returns Cancelled immediately.
+        let cancel_tx_box = Box::into_raw(Box::new(mpsc::channel::<IrohOperationErrorCode>().0));
+        let (cancel_tx, cancel_rx) = mpsc::channel::<IrohOperationErrorCode>();
+        unsafe {
+            *cancel_tx_box = cancel_tx;
+        }
+        extern "C" fn create_ok_unexpected(_: *mut c_void, _: *mut IrohNodeHandle) {
+            panic!("should not succeed when pre-cancelled");
+        }
+        extern "C" fn create_fail_record(
+            userdata: *mut c_void,
+            code: IrohOperationErrorCode,
+            err: *const c_char,
+        ) {
+            unsafe { iroh_string_free(err as *mut c_char) };
+            let tx =
+                unsafe { Box::from_raw(userdata as *mut mpsc::Sender<IrohOperationErrorCode>) };
+            let _ = tx.send(code);
+        }
+        let pre_cancel = iroh_cancel_token_new();
+        unsafe {
+            iroh_cancel_token_cancel(pre_cancel);
+            iroh_node_create_async(
+                config,
+                pre_cancel,
+                IrohNodeCreateAsyncCallback {
+                    userdata: cancel_tx_box as *mut c_void,
+                    on_success: create_ok_unexpected,
+                    on_failure: create_fail_record,
+                },
+            );
+            iroh_cancel_token_free(pre_cancel);
+        }
+        assert_eq!(
+            cancel_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            IrohOperationErrorCode::Cancelled
+        );
+
+        // Normal async create on background thread.
+        let (create_tx, create_rx) = mpsc::channel::<Result<usize, String>>();
+        extern "C" fn create_ok(userdata: *mut c_void, handle: *mut IrohNodeHandle) {
+            let tx = unsafe { Box::from_raw(userdata as *mut mpsc::Sender<Result<usize, String>>) };
+            let _ = tx.send(Ok(handle as usize));
+        }
+        extern "C" fn create_err(
+            userdata: *mut c_void,
+            _code: IrohOperationErrorCode,
+            err: *const c_char,
+        ) {
+            let msg = unsafe { CStr::from_ptr(err) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { iroh_string_free(err as *mut c_char) };
+            let tx = unsafe { Box::from_raw(userdata as *mut mpsc::Sender<Result<usize, String>>) };
+            let _ = tx.send(Err(msg));
+        }
+        let config2 = IrohNodeConfig {
+            storage_path: path_cstr.as_ptr(),
+            relay_enabled: false,
+            custom_relay_url: std::ptr::null(),
+            serves_blobs: false,
+            accepts_pushes: false,
+            dht_lookup: false,
+            dht_publish: false,
+        };
+        unsafe {
+            iroh_node_create_async(
+                config2,
+                std::ptr::null(),
+                IrohNodeCreateAsyncCallback {
+                    userdata: Box::into_raw(Box::new(create_tx)) as *mut c_void,
+                    on_success: create_ok,
+                    on_failure: create_err,
+                },
+            );
+        }
+        let handle = create_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap() as *mut IrohNodeHandle;
+
+        // Async put.
+        let payload = b"hello async ffi";
+        let (put_tx, put_rx) = mpsc::channel::<Result<String, IrohOperationErrorCode>>();
+        extern "C" fn put_ok(userdata: *mut c_void, ticket: *const c_char) {
+            let s = unsafe { CStr::from_ptr(ticket) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { iroh_string_free(ticket as *mut c_char) };
+            let tx = unsafe {
+                Box::from_raw(userdata as *mut mpsc::Sender<Result<String, IrohOperationErrorCode>>)
+            };
+            let _ = tx.send(Ok(s));
+        }
+        extern "C" fn put_err(
+            userdata: *mut c_void,
+            code: IrohOperationErrorCode,
+            err: *const c_char,
+        ) {
+            unsafe { iroh_string_free(err as *mut c_char) };
+            let tx = unsafe {
+                Box::from_raw(userdata as *mut mpsc::Sender<Result<String, IrohOperationErrorCode>>)
+            };
+            let _ = tx.send(Err(code));
+        }
+        unsafe {
+            iroh_put_async(
+                handle,
+                IrohBytes {
+                    data: payload.as_ptr(),
+                    len: payload.len(),
+                },
+                0,
+                std::ptr::null(),
+                IrohOperationCallback {
+                    userdata: Box::into_raw(Box::new(put_tx)) as *mut c_void,
+                    on_success: put_ok,
+                    on_failure: put_err,
+                },
+            );
+        }
+        let ticket = put_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let ticket_cstr = CString::new(ticket).unwrap();
+
+        // Async get with max_size smaller than payload -> SizeLimitExceeded.
+        let (get_tx, get_rx) = mpsc::channel::<Result<Vec<u8>, (IrohOperationErrorCode, u64)>>();
+        extern "C" fn get_ok(userdata: *mut c_void, bytes: IrohOwnedBytes) {
+            let slice = unsafe { std::slice::from_raw_parts(bytes.data, bytes.len) }.to_vec();
+            iroh_bytes_free(bytes);
+            let tx = unsafe {
+                Box::from_raw(
+                    userdata as *mut mpsc::Sender<Result<Vec<u8>, (IrohOperationErrorCode, u64)>>,
+                )
+            };
+            let _ = tx.send(Ok(slice));
+        }
+        extern "C" fn get_err(
+            userdata: *mut c_void,
+            code: IrohOperationErrorCode,
+            size: u64,
+            err: *const c_char,
+        ) {
+            unsafe { iroh_string_free(err as *mut c_char) };
+            let tx = unsafe {
+                Box::from_raw(
+                    userdata as *mut mpsc::Sender<Result<Vec<u8>, (IrohOperationErrorCode, u64)>>,
+                )
+            };
+            let _ = tx.send(Err((code, size)));
+        }
+        unsafe {
+            iroh_get_async(
+                handle,
+                ticket_cstr.as_ptr(),
+                0,
+                4,
+                std::ptr::null(),
+                IrohGetAsyncCallback {
+                    userdata: Box::into_raw(Box::new(get_tx)) as *mut c_void,
+                    on_progress: None,
+                    on_success: get_ok,
+                    on_failure: get_err,
+                },
+            );
+        }
+        assert_eq!(
+            get_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            Err((
+                IrohOperationErrorCode::SizeLimitExceeded,
+                payload.len() as u64
+            ))
+        );
+
+        // Close cleanly.
+        let (close_tx, close_rx) = mpsc::channel::<Result<(), String>>();
+        extern "C" fn close_ok(userdata: *mut c_void) {
+            let tx = unsafe { Box::from_raw(userdata as *mut mpsc::Sender<Result<(), String>>) };
+            let _ = tx.send(Ok(()));
+        }
+        extern "C" fn close_err(userdata: *mut c_void, err: *const c_char) {
+            let msg = unsafe { CStr::from_ptr(err) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { iroh_string_free(err as *mut c_char) };
+            let tx = unsafe { Box::from_raw(userdata as *mut mpsc::Sender<Result<(), String>>) };
+            let _ = tx.send(Err(msg));
+        }
+        iroh_node_close(
+            handle,
+            IrohCloseCallback {
+                userdata: Box::into_raw(Box::new(close_tx)) as *mut c_void,
+                on_complete: close_ok,
+                on_failure: close_err,
+            },
+        );
+        close_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
     }
 }

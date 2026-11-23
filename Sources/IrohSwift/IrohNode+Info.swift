@@ -6,62 +6,77 @@ extension IrohNode {
     ///
     /// - Returns: Node information including ID, relay URL, and connection status.
     /// - Throws: `IrohError.nodeClosed` if the node is closed,
+    ///           `CancellationError` if the calling task was cancelled,
     ///           `IrohError.nodeCreationFailed` if the info cannot be retrieved.
     public func info() async throws -> NodeInfo {
         try ensureNotClosed()
-        return try await withCheckedThrowingContinuation { continuation in
-            let box = Unmanaged.passRetained(
-                ContinuationBox<NodeInfo>(continuation)
-            ).toOpaque()
+        try Task.checkCancellation()
 
-            let callback = IrohNodeInfoCallback(
-                userdata: box,
-                on_success: { userdata, info in
-                    let box = Unmanaged<ContinuationBox<NodeInfo>>
-                        .fromOpaque(userdata!)
-                        .takeRetainedValue()
+        let token = CancelTokenBox()
+        let handle = self.handle
 
-                    let nodeId = String(cString: info.node_id)
-                    iroh_string_free(UnsafeMutablePointer(mutating: info.node_id))
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let box = Unmanaged.passRetained(
+                    ContinuationBox<NodeInfo>(continuation)
+                ).toOpaque()
 
-                    let relayUrl: String?
-                    if info.relay_url != nil {
-                        relayUrl = String(cString: info.relay_url)
-                        iroh_string_free(UnsafeMutablePointer(mutating: info.relay_url))
-                    } else {
-                        relayUrl = nil
+                let callback = IrohNodeInfoAsyncCallback(
+                    userdata: box,
+                    on_success: { userdata, info in
+                        let box = Unmanaged<ContinuationBox<NodeInfo>>
+                            .fromOpaque(userdata!)
+                            .takeRetainedValue()
+
+                        let nodeId = takeFFIString(info.node_id)
+
+                        let relayUrl: String?
+                        if info.relay_url != nil {
+                            relayUrl = takeFFIString(info.relay_url)
+                        } else {
+                            relayUrl = nil
+                        }
+
+                        let directAddrs: [String]
+                        if info.direct_addrs != nil {
+                            directAddrs = takeFFIString(info.direct_addrs)
+                                .split(separator: "\n")
+                                .map(String.init)
+                        } else {
+                            directAddrs = []
+                        }
+
+                        let nodeInfo = NodeInfo(
+                            nodeId: nodeId,
+                            relayUrl: relayUrl,
+                            isConnected: info.is_connected,
+                            directAddrs: directAddrs,
+                            dhtActive: info.dht_active
+                        )
+                        box.continuation.resume(returning: nodeInfo)
+                    },
+                    on_failure: { userdata, code, errorPtr in
+                        let box = Unmanaged<ContinuationBox<NodeInfo>>
+                            .fromOpaque(userdata!)
+                            .takeRetainedValue()
+                        let message = takeFFIString(errorPtr)
+                        let error: Error
+                        switch code {
+                        case IrohOperationErrorCode_Cancelled:
+                            error = CancellationError()
+                        case IrohOperationErrorCode_NodeShutDown:
+                            error = IrohError.nodeClosed
+                        default:
+                            error = IrohError.nodeCreationFailed(message)
+                        }
+                        box.continuation.resume(throwing: error)
                     }
+                )
 
-                    let directAddrs: [String]
-                    if info.direct_addrs != nil {
-                        directAddrs = String(cString: info.direct_addrs)
-                            .split(separator: "\n")
-                            .map(String.init)
-                        iroh_string_free(UnsafeMutablePointer(mutating: info.direct_addrs))
-                    } else {
-                        directAddrs = []
-                    }
-
-                    let nodeInfo = NodeInfo(
-                        nodeId: nodeId,
-                        relayUrl: relayUrl,
-                        isConnected: info.is_connected,
-                        directAddrs: directAddrs,
-                        dhtActive: info.dht_active
-                    )
-                    box.continuation.resume(returning: nodeInfo)
-                },
-                on_failure: { userdata, errorPtr in
-                    let box = Unmanaged<ContinuationBox<NodeInfo>>
-                        .fromOpaque(userdata!)
-                        .takeRetainedValue()
-                    let message = String(cString: errorPtr!)
-                    iroh_string_free(UnsafeMutablePointer(mutating: errorPtr))
-                    box.continuation.resume(throwing: IrohError.nodeCreationFailed(message))
-                }
-            )
-
-            iroh_node_info(handle.pointer, callback)
+                iroh_node_info_async(handle.pointer, token.pointer, callback)
+            }
+        } onCancel: {
+            token.cancel()
         }
     }
 }

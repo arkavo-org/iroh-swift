@@ -103,9 +103,14 @@ public struct IrohConfig: Sendable {
 
     /// Validate the configuration before node creation.
     ///
+    /// Pure option checks (`servesBlobs`/`acceptsPushes`, DHT flags, `storagePath.isFileURL`,
+    /// `customRelayUrl`) run before touching the filesystem so rejected configs leave no
+    /// disk side effects. Writability is verified with a unique probe filename so concurrent
+    /// `validate()` calls on the same directory do not race.
+    ///
     /// - Throws: `IrohError.invalidConfiguration` if validation fails.
     public func validate() throws {
-        // Checked first so a rejected config touches nothing on disk.
+        // Pure checks first so a rejected config touches nothing on disk.
         if acceptsPushes && !servesBlobs {
             throw IrohError.invalidConfiguration(
                 "acceptsPushes requires servesBlobs: a client-only node cannot receive pushes"
@@ -121,40 +126,57 @@ public struct IrohConfig: Sendable {
             )
         }
 
+        guard storagePath.isFileURL else {
+            throw IrohError.invalidConfiguration(
+                "Storage path must be a file URL: \(storagePath)"
+            )
+        }
+
+        // Validate custom relay URL format before touching disk.
+        if let relayUrl = customRelayUrl {
+            guard let url = URL(string: relayUrl),
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "https" || scheme == "http",
+                  let host = url.host,
+                  !host.isEmpty else {
+                throw IrohError.invalidConfiguration(
+                    "Invalid relay URL: must be a valid HTTP/HTTPS URL with a host"
+                )
+            }
+        }
+
         // Check storage path is writable
         let fm = FileManager.default
+        let path = storagePath.path
 
-        // Create directory if it doesn't exist
-        if !fm.fileExists(atPath: storagePath.path) {
+        var isDirectory: ObjCBool = false
+        if fm.fileExists(atPath: path, isDirectory: &isDirectory) {
+            guard isDirectory.boolValue else {
+                throw IrohError.invalidConfiguration(
+                    "Storage path exists and is not a directory: \(path)"
+                )
+            }
+        } else {
             do {
                 try fm.createDirectory(at: storagePath, withIntermediateDirectories: true)
             } catch {
                 throw IrohError.invalidConfiguration(
-                    "Cannot create storage directory: \(storagePath.path) - \(error.localizedDescription)"
+                    "Cannot create storage directory: \(path) - \(error.localizedDescription)"
                 )
             }
         }
 
-        // Test writability
-        let testFile = storagePath.appendingPathComponent(".iroh-write-test")
+        // Test writability with a unique probe file to avoid races between
+        // concurrent validate() calls on the same directory.
+        let testFile = storagePath.appendingPathComponent(".iroh-write-test-\(UUID().uuidString)")
         do {
-            try Data().write(to: testFile)
+            try Data().write(to: testFile, options: .withoutOverwriting)
             try fm.removeItem(at: testFile)
         } catch {
+            try? fm.removeItem(at: testFile)
             throw IrohError.invalidConfiguration(
-                "Storage path not writable: \(storagePath.path)"
+                "Storage path not writable: \(path)"
             )
-        }
-
-        // Validate custom relay URL format if provided
-        if let relayUrl = customRelayUrl {
-            guard let url = URL(string: relayUrl),
-                  let scheme = url.scheme?.lowercased(),
-                  scheme == "https" || scheme == "http" else {
-                throw IrohError.invalidConfiguration(
-                    "Invalid relay URL: must be a valid HTTP/HTTPS URL"
-                )
-            }
         }
     }
 
