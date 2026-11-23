@@ -358,12 +358,15 @@ pub enum DirectAddr {
 /// names must be given in punycode), at most 253 bytes, with no empty label.
 /// The port is 1..=65535.
 pub fn parse_direct_addr(entry: &str) -> Result<DirectAddr> {
-    if let Ok(socket) = entry.parse::<SocketAddr>() {
-        return Ok(DirectAddr::Socket(socket));
-    }
     let invalid = |why: &str| {
         anyhow::anyhow!("Invalid direct address {entry:?}: {why} (expected IP:port or host:port)")
     };
+    if let Ok(socket) = entry.parse::<SocketAddr>() {
+        if socket.port() == 0 {
+            return Err(invalid("port must be a number from 1 to 65535"));
+        }
+        return Ok(DirectAddr::Socket(socket));
+    }
     let (host, port) = entry
         .rsplit_once(':')
         .ok_or_else(|| invalid("missing port"))?;
@@ -709,5 +712,18 @@ mod tests {
         let t = target(&[]).unwrap();
         let addr = block_on(resolver.resolve_target(t)).unwrap();
         assert!(addr.is_empty());
+    }
+
+    #[test]
+    fn parse_direct_addr_rejects_port_zero_for_ip_literals() {
+        for bad in ["127.0.0.1:0", "0.0.0.0:0", "[::1]:0", "example.com:0"] {
+            let err = parse_direct_addr(bad).expect_err(&format!("{bad} must be rejected"));
+            assert!(
+                err.to_string().contains("1 to 65535"),
+                "unexpected error for {bad}: {err}"
+            );
+        }
+        assert!(parse_direct_addr("127.0.0.1:1").is_ok());
+        assert!(parse_direct_addr("[::1]:1").is_ok());
     }
 }

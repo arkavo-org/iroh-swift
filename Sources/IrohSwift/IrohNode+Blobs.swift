@@ -28,36 +28,57 @@ extension IrohNode {
         try ensureNotClosed()
         try Task.checkCancellation()
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let box = Unmanaged.passRetained(
-                BlobTagContinuationBox(continuation)
-            ).toOpaque()
+        let token = CancelTokenBox()
+        let handle = self.handle
+        let ffiFormat: IrohBlobFormat = format == .raw ? Raw : HashSeq
 
-            let callback = IrohCloseCallback(
-                userdata: box,
-                on_complete: { userdata in
-                    let box = Unmanaged<BlobTagContinuationBox>
-                        .fromOpaque(userdata!)
-                        .takeRetainedValue()
-                    box.continuation.resume()
-                },
-                on_failure: { userdata, errorPtr in
-                    let box = Unmanaged<BlobTagContinuationBox>
-                        .fromOpaque(userdata!)
-                        .takeRetainedValue()
-                    let message = String(cString: errorPtr!)
-                    iroh_string_free(UnsafeMutablePointer(mutating: errorPtr))
-                    box.continuation.resume(throwing: IrohError.blobTagFailed(message))
-                }
-            )
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let box = Unmanaged.passRetained(
+                    BlobTagContinuationBox(continuation)
+                ).toOpaque()
 
-            let ffiFormat: IrohBlobFormat = format == .raw ? Raw : HashSeq
+                let callback = IrohVoidOperationCallback(
+                    userdata: box,
+                    on_complete: { userdata in
+                        let box = Unmanaged<BlobTagContinuationBox>
+                            .fromOpaque(userdata!)
+                            .takeRetainedValue()
+                        box.continuation.resume()
+                    },
+                    on_failure: { userdata, code, errorPtr in
+                        let box = Unmanaged<BlobTagContinuationBox>
+                            .fromOpaque(userdata!)
+                            .takeRetainedValue()
+                        let message = takeFFIString(errorPtr)
+                        let error: Error
+                        switch code {
+                        case IrohOperationErrorCode_Cancelled:
+                            error = CancellationError()
+                        case IrohOperationErrorCode_NodeShutDown:
+                            error = IrohError.nodeClosed
+                        default:
+                            error = IrohError.blobTagFailed(message)
+                        }
+                        box.continuation.resume(throwing: error)
+                    }
+                )
 
-            name.withCString { namePtr in
-                hash.withCString { hashPtr in
-                    iroh_blob_tag_set(handle.pointer, namePtr, hashPtr, ffiFormat, callback)
+                name.withCString { namePtr in
+                    hash.withCString { hashPtr in
+                        iroh_blob_tag_set_async(
+                            handle.pointer,
+                            namePtr,
+                            hashPtr,
+                            ffiFormat,
+                            token.pointer,
+                            callback
+                        )
+                    }
                 }
             }
+        } onCancel: {
+            token.cancel()
         }
     }
 
@@ -78,32 +99,52 @@ extension IrohNode {
         try ensureNotClosed()
         try Task.checkCancellation()
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let box = Unmanaged.passRetained(
-                BlobTagContinuationBox(continuation)
-            ).toOpaque()
+        let token = CancelTokenBox()
+        let handle = self.handle
 
-            let callback = IrohCloseCallback(
-                userdata: box,
-                on_complete: { userdata in
-                    let box = Unmanaged<BlobTagContinuationBox>
-                        .fromOpaque(userdata!)
-                        .takeRetainedValue()
-                    box.continuation.resume()
-                },
-                on_failure: { userdata, errorPtr in
-                    let box = Unmanaged<BlobTagContinuationBox>
-                        .fromOpaque(userdata!)
-                        .takeRetainedValue()
-                    let message = String(cString: errorPtr!)
-                    iroh_string_free(UnsafeMutablePointer(mutating: errorPtr))
-                    box.continuation.resume(throwing: IrohError.blobUntagFailed(message))
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let box = Unmanaged.passRetained(
+                    BlobTagContinuationBox(continuation)
+                ).toOpaque()
+
+                let callback = IrohVoidOperationCallback(
+                    userdata: box,
+                    on_complete: { userdata in
+                        let box = Unmanaged<BlobTagContinuationBox>
+                            .fromOpaque(userdata!)
+                            .takeRetainedValue()
+                        box.continuation.resume()
+                    },
+                    on_failure: { userdata, code, errorPtr in
+                        let box = Unmanaged<BlobTagContinuationBox>
+                            .fromOpaque(userdata!)
+                            .takeRetainedValue()
+                        let message = takeFFIString(errorPtr)
+                        let error: Error
+                        switch code {
+                        case IrohOperationErrorCode_Cancelled:
+                            error = CancellationError()
+                        case IrohOperationErrorCode_NodeShutDown:
+                            error = IrohError.nodeClosed
+                        default:
+                            error = IrohError.blobUntagFailed(message)
+                        }
+                        box.continuation.resume(throwing: error)
+                    }
+                )
+
+                name.withCString { namePtr in
+                    iroh_blob_tag_delete_async(
+                        handle.pointer,
+                        namePtr,
+                        token.pointer,
+                        callback
+                    )
                 }
-            )
-
-            name.withCString { namePtr in
-                iroh_blob_tag_delete(handle.pointer, namePtr, callback)
             }
+        } onCancel: {
+            token.cancel()
         }
     }
 

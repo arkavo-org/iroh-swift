@@ -1,5 +1,4 @@
 import Foundation
-import IrohSwiftFFI
 
 /// Progress callback type for download operations.
 public typealias ProgressHandler = @Sendable (DownloadProgress) -> Void
@@ -12,69 +11,32 @@ extension IrohNode {
     ///   - onProgress: Called with progress updates during the download.
     /// - Returns: The downloaded data.
     /// - Throws: `IrohError.nodeClosed` if the node is closed,
-    ///           `IrohError.getFailed` if the download fails.
+    ///           `IrohError.getFailed` if the download fails,
+    ///           `CancellationError` if the task was cancelled.
     public func get(
         ticket: String,
         onProgress: @escaping ProgressHandler
     ) async throws -> Data {
-        try ensureNotClosed()
-        try Task.checkCancellation()
-        return try await withCheckedThrowingContinuation { continuation in
-            ticket.withCString { ticketPtr in
-                let context = ProgressContext(
-                    continuation: continuation,
-                    onProgress: onProgress
-                )
-                let box = Unmanaged.passRetained(context).toOpaque()
-
-                let callback = IrohGetProgressCallback(
-                    userdata: box,
-                    on_progress: { userdata, progress in
-                        let ctx = Unmanaged<ProgressContext>
-                            .fromOpaque(userdata!)
-                            .takeUnretainedValue()
-                        let swiftProgress = DownloadProgress(
-                            downloaded: progress.downloaded,
-                            total: progress.total
-                        )
-                        ctx.onProgress(swiftProgress)
-                    },
-                    on_success: { userdata, ownedBytes in
-                        let ctx = Unmanaged<ProgressContext>
-                            .fromOpaque(userdata!)
-                            .takeRetainedValue()
-                        let data = Data(bytes: ownedBytes.data, count: Int(ownedBytes.len))
-                        iroh_bytes_free(ownedBytes)
-                        ctx.continuation.resume(returning: data)
-                    },
-                    on_failure: { userdata, errorPtr in
-                        let ctx = Unmanaged<ProgressContext>
-                            .fromOpaque(userdata!)
-                            .takeRetainedValue()
-                        let message = String(cString: errorPtr!)
-                        iroh_string_free(UnsafeMutablePointer(mutating: errorPtr))
-                        ctx.continuation.resume(throwing: IrohError.getFailed(message))
-                    }
-                )
-
-                iroh_get_with_progress(handle.pointer, ticketPtr, callback)
-            }
-        }
+        try await getBytes(ticket: ticket, options: .default, onProgress: onProgress)
     }
-}
 
-// MARK: - Internal Helpers
-
-/// Context for progress callbacks, holding both the continuation and progress handler.
-private final class ProgressContext: @unchecked Sendable {
-    let continuation: CheckedContinuation<Data, Error>
-    let onProgress: ProgressHandler
-
-    init(
-        continuation: CheckedContinuation<Data, Error>,
+    /// Download bytes from a ticket with options (e.g., timeout, maxSize) and progress reporting.
+    ///
+    /// - Parameters:
+    ///   - ticket: The ticket string obtained from another node's `put` call.
+    ///   - options: Operation options including timeout and maximum blob size.
+    ///   - onProgress: Called with progress updates during the download.
+    /// - Returns: The downloaded data.
+    /// - Throws: `IrohError.nodeClosed` if the node is closed,
+    ///           `IrohError.timeout` if the operation times out,
+    ///           `IrohError.sizeLimitExceeded` if the blob exceeds `options.maxSize`,
+    ///           `IrohError.getFailed` if the download fails,
+    ///           `CancellationError` if the task was cancelled.
+    public func get(
+        ticket: String,
+        options: OperationOptions,
         onProgress: @escaping ProgressHandler
-    ) {
-        self.continuation = continuation
-        self.onProgress = onProgress
+    ) async throws -> Data {
+        try await getBytes(ticket: ticket, options: options, onProgress: onProgress)
     }
 }

@@ -56,3 +56,28 @@ func takeFFIString(_ pointer: UnsafePointer<CChar>?) -> String {
     iroh_string_free(UnsafeMutablePointer(mutating: pointer))
     return string
 }
+
+/// Sendable box for `IrohOwnedBytes` so a `Data.Deallocator.custom` closure can
+/// free the Rust allocation cleanly under Swift 6 strict concurrency.
+private struct OwnedBytesBox: @unchecked Sendable {
+    let bytes: IrohOwnedBytes
+}
+
+/// Wrap owned bytes returned by Rust in a `Data` without copying.
+///
+/// The underlying Rust `Vec<u8>` buffer is freed via `iroh_bytes_free` when
+/// the `Data` buffer is deallocated. Empty buffers are freed immediately.
+func takeFFIBytes(_ ownedBytes: IrohOwnedBytes) -> Data {
+    guard let ptr = ownedBytes.data, ownedBytes.len > 0 else {
+        iroh_bytes_free(ownedBytes)
+        return Data()
+    }
+    let box = OwnedBytesBox(bytes: ownedBytes)
+    return Data(
+        bytesNoCopy: ptr,
+        count: Int(ownedBytes.len),
+        deallocator: .custom { _, _ in
+            iroh_bytes_free(box.bytes)
+        }
+    )
+}

@@ -70,7 +70,12 @@ extension IrohNode {
         data: Data,
         options: OperationOptions
     ) async throws -> String {
-        try await pushBytes(
+        try ensureNotClosed()
+        try Task.checkCancellation()
+        if options.isImmediatelyExpired {
+            throw IrohError.timeout
+        }
+        return try await pushBytes(
             nodeId: nodeId,
             relayUrl: relayUrl,
             directAddrs: directAddrs,

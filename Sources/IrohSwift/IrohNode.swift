@@ -1,26 +1,56 @@
 import Foundation
 import IrohSwiftFFI
 
-/// Options for put/get operations.
+/// Options for put/get/push operations.
 public struct OperationOptions: Sendable {
     /// Timeout for the operation. Nil means no timeout.
     public var timeout: Duration?
 
-    /// Default options (no timeout).
+    /// Maximum blob size in bytes to accept on `get` operations.
+    /// Nil means no size limit.
+    public var maxSize: UInt64?
+
+    /// Default options (no timeout, no size limit).
     public static let `default` = OperationOptions()
 
     /// Create operation options.
     ///
-    /// - Parameter timeout: Timeout for the operation. Nil means no timeout.
-    public init(timeout: Duration? = nil) {
+    /// - Parameters:
+    ///   - timeout: Timeout for the operation. Nil means no timeout.
+    ///   - maxSize: Maximum blob size in bytes for `get` operations. Nil means no limit.
+    public init(timeout: Duration? = nil, maxSize: UInt64? = nil) {
         self.timeout = timeout
+        self.maxSize = maxSize
     }
 
-    /// Convert timeout to milliseconds for FFI.
+    /// Whether a configured timeout is zero or negative and has already expired.
+    var isImmediatelyExpired: Bool {
+        guard let timeout else { return false }
+        return timeout <= .zero
+    }
+
+    /// Maximum size passed to Rust (`UInt64.max` means no limit).
+    var effectiveMaxSize: UInt64 {
+        maxSize ?? UInt64.max
+    }
+
+    /// Convert timeout to milliseconds for FFI without trapping on negative or
+    /// very large durations.
+    ///
+    /// Returns `0` for `nil` (no timeout) or `<= .zero` (callers must check
+    /// `isImmediatelyExpired` first so `.zero` / negative durations fail immediately).
+    /// Positive sub-millisecond durations clamp to `1` ms so they never disable the
+    /// timeout, and very large durations saturate at `UInt64.max`.
     var timeoutMs: UInt64 {
-        guard let timeout = timeout else { return 0 }
+        guard let timeout, timeout > .zero else { return 0 }
         let components = timeout.components
-        return UInt64(components.seconds * 1000) + UInt64(components.attoseconds / 1_000_000_000_000_000)
+        let seconds = UInt64(components.seconds)
+        let subsecMs = UInt64(components.attoseconds / 1_000_000_000_000_000)
+        let (secMs, mulOverflow) = seconds.multipliedReportingOverflow(by: 1_000)
+        if mulOverflow { return UInt64.max }
+        let (totalMs, addOverflow) = secMs.addingReportingOverflow(subsecMs)
+        if addOverflow { return UInt64.max }
+        return max(1, totalMs)
     }
 }
 
@@ -46,67 +76,75 @@ public struct OperationOptions: Sendable {
 public actor IrohNode {
     let handle: NodeHandleWrapper
     private var isClosed = false
+    private var closeTask: Task<Void, Error>?
 
     /// Create a new Iroh node with the specified configuration.
     ///
     /// - Parameter config: Configuration options. Uses defaults if not specified.
-    /// - Throws: `IrohError.invalidConfiguration` if validation fails,
+    /// - Throws: `CancellationError` if the task is already or becomes cancelled,
+    ///           `IrohError.invalidConfiguration` if validation fails,
     ///           `IrohError.nodeCreationFailed` if the node cannot be created.
     public init(config: IrohConfig = IrohConfig()) async throws {
+        try Task.checkCancellation()
+
         // Validate configuration first
         try config.validate()
 
-        let wrapper: NodeHandleWrapper = try await withCheckedThrowingContinuation { continuation in
-            // Create the FFI config
-            let storagePath = config.storagePath.path
+        let token = CancelTokenBox()
+        let wrapper: NodeHandleWrapper = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                // Create the FFI config
+                let storagePath = config.storagePath.path
 
-            // Helper to create node with optional relay URL
-            func createNode(pathPtr: UnsafePointer<CChar>, relayUrlPtr: UnsafePointer<CChar>?) {
-                let ffiConfig = IrohNodeConfig(
-                    storage_path: pathPtr,
-                    relay_enabled: config.relayEnabled,
-                    custom_relay_url: relayUrlPtr,
-                    serves_blobs: config.servesBlobs,
-                    accepts_pushes: config.acceptsPushes,
-                    dht_lookup: config.dhtLookup,
-                    dht_publish: config.dhtPublish
-                )
+                // Helper to create node with optional relay URL
+                func createNode(pathPtr: UnsafePointer<CChar>, relayUrlPtr: UnsafePointer<CChar>?) {
+                    let ffiConfig = IrohNodeConfig(
+                        storage_path: pathPtr,
+                        relay_enabled: config.relayEnabled,
+                        custom_relay_url: relayUrlPtr,
+                        serves_blobs: config.servesBlobs,
+                        accepts_pushes: config.acceptsPushes,
+                        dht_lookup: config.dhtLookup,
+                        dht_publish: config.dhtPublish
+                    )
 
-                let box = Unmanaged.passRetained(
-                    ContinuationBox<NodeHandleWrapper>(continuation)
-                ).toOpaque()
+                    let box = Unmanaged.passRetained(
+                        ContinuationBox<NodeHandleWrapper>(continuation)
+                    ).toOpaque()
 
-                let callback = IrohNodeCreateCallback(
-                    userdata: box,
-                    on_success: { userdata, handlePtr in
-                        let box = Unmanaged<ContinuationBox<NodeHandleWrapper>>
-                            .fromOpaque(userdata!)
-                            .takeRetainedValue()
-                        let wrapper = NodeHandleWrapper(pointer: handlePtr!)
-                        box.continuation.resume(returning: wrapper)
-                    },
-                    on_failure: { userdata, errorPtr in
-                        let box = Unmanaged<ContinuationBox<NodeHandleWrapper>>
-                            .fromOpaque(userdata!)
-                            .takeRetainedValue()
-                        let message = String(cString: errorPtr!)
-                        iroh_string_free(UnsafeMutablePointer(mutating: errorPtr))
-                        box.continuation.resume(throwing: IrohError.nodeCreationFailed(message))
-                    }
-                )
+                    let callback = IrohNodeCreateAsyncCallback(
+                        userdata: box,
+                        on_success: { userdata, handlePtr in
+                            let box = Unmanaged<ContinuationBox<NodeHandleWrapper>>
+                                .fromOpaque(userdata!)
+                                .takeRetainedValue()
+                            let wrapper = NodeHandleWrapper(pointer: handlePtr!)
+                            box.continuation.resume(returning: wrapper)
+                        },
+                        on_failure: { userdata, code, errorPtr in
+                            let box = Unmanaged<ContinuationBox<NodeHandleWrapper>>
+                                .fromOpaque(userdata!)
+                                .takeRetainedValue()
+                            let message = takeFFIString(errorPtr)
+                            if code == IrohOperationErrorCode_Cancelled {
+                                box.continuation.resume(throwing: CancellationError())
+                            } else {
+                                box.continuation.resume(throwing: IrohError.nodeCreationFailed(message))
+                            }
+                        }
+                    )
 
-                iroh_node_create(ffiConfig, callback)
-            }
+                    iroh_node_create_async(ffiConfig, token.pointer, callback)
+                }
 
-            storagePath.withCString { pathPtr in
-                if let relayUrl = config.customRelayUrl {
-                    relayUrl.withCString { relayUrlPtr in
+                storagePath.withCString { pathPtr in
+                    withOptionalCString(config.customRelayUrl) { relayUrlPtr in
                         createNode(pathPtr: pathPtr, relayUrlPtr: relayUrlPtr)
                     }
-                } else {
-                    createNode(pathPtr: pathPtr, relayUrlPtr: nil)
                 }
             }
+        } onCancel: {
+            token.cancel()
         }
         self.handle = wrapper
     }
@@ -121,39 +159,45 @@ public actor IrohNode {
     /// Explicitly close the node and release resources.
     ///
     /// After calling close(), the node cannot be used for any operations.
-    /// This is preferred over letting deinit handle cleanup when you need
-    /// to await graceful shutdown completion.
+    /// Concurrent callers coalesce onto the same shutdown task so `close()` never
+    /// returns before shutdown has actually completed.
     ///
     /// - Throws: `IrohError.closeFailed` if shutdown fails.
     public func close() async throws {
-        guard !isClosed else { return }
-        isClosed = true
-
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let box = Unmanaged.passRetained(
-                VoidContinuationBox(continuation)
-            ).toOpaque()
-
-            let callback = IrohCloseCallback(
-                userdata: box,
-                on_complete: { userdata in
-                    let box = Unmanaged<VoidContinuationBox>
-                        .fromOpaque(userdata!)
-                        .takeRetainedValue()
-                    box.continuation.resume()
-                },
-                on_failure: { userdata, errorPtr in
-                    let box = Unmanaged<VoidContinuationBox>
-                        .fromOpaque(userdata!)
-                        .takeRetainedValue()
-                    let message = String(cString: errorPtr!)
-                    iroh_string_free(UnsafeMutablePointer(mutating: errorPtr))
-                    box.continuation.resume(throwing: IrohError.closeFailed(message))
-                }
-            )
-
-            iroh_node_close(handle.pointer, callback)
+        if let existing = closeTask {
+            return try await existing.value
         }
+
+        isClosed = true
+        let handle = self.handle
+        let task = Task<Void, Error> {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let box = Unmanaged.passRetained(
+                    VoidContinuationBox(continuation)
+                ).toOpaque()
+
+                let callback = IrohCloseCallback(
+                    userdata: box,
+                    on_complete: { userdata in
+                        let box = Unmanaged<VoidContinuationBox>
+                            .fromOpaque(userdata!)
+                            .takeRetainedValue()
+                        box.continuation.resume()
+                    },
+                    on_failure: { userdata, errorPtr in
+                        let box = Unmanaged<VoidContinuationBox>
+                            .fromOpaque(userdata!)
+                            .takeRetainedValue()
+                        let message = takeFFIString(errorPtr)
+                        box.continuation.resume(throwing: IrohError.closeFailed(message))
+                    }
+                )
+
+                iroh_node_close(handle.pointer, callback)
+            }
+        }
+        closeTask = task
+        try await task.value
     }
 
     /// Check if the node has been closed.
@@ -175,42 +219,7 @@ public actor IrohNode {
     ///           `IrohError.putFailed` if the operation fails,
     ///           `CancellationError` if the task was cancelled.
     public func put(_ data: Data) async throws -> String {
-        try ensureNotClosed()
-        try Task.checkCancellation()
-        return try await withCheckedThrowingContinuation { continuation in
-            data.withUnsafeBytes { buffer in
-                let bytes = IrohBytes(
-                    data: buffer.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                    len: UInt(buffer.count)
-                )
-
-                let box = Unmanaged.passRetained(
-                    ContinuationBox<String>(continuation)
-                ).toOpaque()
-
-                let callback = IrohCallback(
-                    userdata: box,
-                    on_success: { userdata, ticketPtr in
-                        let box = Unmanaged<ContinuationBox<String>>
-                            .fromOpaque(userdata!)
-                            .takeRetainedValue()
-                        let ticket = String(cString: ticketPtr!)
-                        iroh_string_free(UnsafeMutablePointer(mutating: ticketPtr))
-                        box.continuation.resume(returning: ticket)
-                    },
-                    on_failure: { userdata, errorPtr in
-                        let box = Unmanaged<ContinuationBox<String>>
-                            .fromOpaque(userdata!)
-                            .takeRetainedValue()
-                        let message = String(cString: errorPtr!)
-                        iroh_string_free(UnsafeMutablePointer(mutating: errorPtr))
-                        box.continuation.resume(throwing: IrohError.putFailed(message))
-                    }
-                )
-
-                iroh_put(handle.pointer, bytes, callback)
-            }
-        }
+        try await putBytes(data, options: .default)
     }
 
     /// Add bytes to the blob store with options (e.g., timeout).
@@ -221,50 +230,68 @@ public actor IrohNode {
     /// - Returns: A ticket string that can be used to retrieve the data.
     /// - Throws: `IrohError.nodeClosed` if the node is closed,
     ///           `IrohError.timeout` if the operation times out,
-    ///           `IrohError.putFailed` if the operation fails.
+    ///           `IrohError.putFailed` if the operation fails,
+    ///           `CancellationError` if the task was cancelled.
     public func put(_ data: Data, options: OperationOptions) async throws -> String {
+        try await putBytes(data, options: options)
+    }
+
+    private func putBytes(_ data: Data, options: OperationOptions) async throws -> String {
         try ensureNotClosed()
         try Task.checkCancellation()
-        return try await withCheckedThrowingContinuation { continuation in
-            data.withUnsafeBytes { buffer in
-                let bytes = IrohBytes(
-                    data: buffer.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                    len: UInt(buffer.count)
-                )
+        if options.isImmediatelyExpired {
+            throw IrohError.timeout
+        }
 
-                let ffiOptions = IrohOperationOptions(timeout_ms: options.timeoutMs)
+        let token = CancelTokenBox()
+        let handle = self.handle
+        let timeoutMs = options.timeoutMs
 
-                let box = Unmanaged.passRetained(
-                    ContinuationBox<String>(continuation)
-                ).toOpaque()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                data.withUnsafeBytes { buffer in
+                    let bytes = IrohBytes(
+                        data: buffer.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                        len: UInt(buffer.count)
+                    )
 
-                let callback = IrohCallback(
-                    userdata: box,
-                    on_success: { userdata, ticketPtr in
-                        let box = Unmanaged<ContinuationBox<String>>
-                            .fromOpaque(userdata!)
-                            .takeRetainedValue()
-                        let ticket = String(cString: ticketPtr!)
-                        iroh_string_free(UnsafeMutablePointer(mutating: ticketPtr))
-                        box.continuation.resume(returning: ticket)
-                    },
-                    on_failure: { userdata, errorPtr in
-                        let box = Unmanaged<ContinuationBox<String>>
-                            .fromOpaque(userdata!)
-                            .takeRetainedValue()
-                        let message = String(cString: errorPtr!)
-                        iroh_string_free(UnsafeMutablePointer(mutating: errorPtr))
-                        // Check if it's a timeout error
-                        if message.contains("timed out") {
-                            box.continuation.resume(throwing: IrohError.timeout)
-                        } else {
-                            box.continuation.resume(throwing: IrohError.putFailed(message))
+                    let box = Unmanaged.passRetained(
+                        ContinuationBox<String>(continuation)
+                    ).toOpaque()
+
+                    let callback = IrohOperationCallback(
+                        userdata: box,
+                        on_success: { userdata, ticketPtr in
+                            let box = Unmanaged<ContinuationBox<String>>
+                                .fromOpaque(userdata!)
+                                .takeRetainedValue()
+                            box.continuation.resume(returning: takeFFIString(ticketPtr))
+                        },
+                        on_failure: { userdata, code, errorPtr in
+                            let box = Unmanaged<ContinuationBox<String>>
+                                .fromOpaque(userdata!)
+                                .takeRetainedValue()
+                            let message = takeFFIString(errorPtr)
+                            let error: Error
+                            switch code {
+                            case IrohOperationErrorCode_Cancelled:
+                                error = CancellationError()
+                            case IrohOperationErrorCode_NodeShutDown:
+                                error = IrohError.nodeClosed
+                            case IrohOperationErrorCode_TimedOut:
+                                error = IrohError.timeout
+                            default:
+                                error = IrohError.putFailed(message)
+                            }
+                            box.continuation.resume(throwing: error)
                         }
-                    }
-                )
+                    )
 
-                iroh_put_with_options(handle.pointer, bytes, ffiOptions, callback)
+                    iroh_put_async(handle.pointer, bytes, timeoutMs, token.pointer, callback)
+                }
             }
+        } onCancel: {
+            token.cancel()
         }
     }
 
@@ -278,91 +305,125 @@ public actor IrohNode {
     ///           `IrohError.getFailed` if the download fails,
     ///           `CancellationError` if the task was cancelled.
     public func get(ticket: String) async throws -> Data {
-        try ensureNotClosed()
-        try Task.checkCancellation()
-        return try await withCheckedThrowingContinuation { continuation in
-            ticket.withCString { ticketPtr in
-                let box = Unmanaged.passRetained(
-                    ContinuationBox<Data>(continuation)
-                ).toOpaque()
-
-                let callback = IrohGetCallback(
-                    userdata: box,
-                    on_success: { userdata, ownedBytes in
-                        let box = Unmanaged<ContinuationBox<Data>>
-                            .fromOpaque(userdata!)
-                            .takeRetainedValue()
-                        let data = Data(bytes: ownedBytes.data, count: Int(ownedBytes.len))
-                        iroh_bytes_free(ownedBytes)
-                        box.continuation.resume(returning: data)
-                    },
-                    on_failure: { userdata, errorPtr in
-                        let box = Unmanaged<ContinuationBox<Data>>
-                            .fromOpaque(userdata!)
-                            .takeRetainedValue()
-                        let message = String(cString: errorPtr!)
-                        iroh_string_free(UnsafeMutablePointer(mutating: errorPtr))
-                        box.continuation.resume(throwing: IrohError.getFailed(message))
-                    }
-                )
-
-                iroh_get(handle.pointer, ticketPtr, callback)
-            }
-        }
+        try await getBytes(ticket: ticket, options: .default, onProgress: nil)
     }
 
-    /// Download bytes from a ticket with options (e.g., timeout).
+    /// Download bytes from a ticket with options (e.g., timeout, maxSize).
     ///
     /// - Parameters:
     ///   - ticket: The ticket string obtained from another node's `put` call.
-    ///   - options: Operation options including timeout.
+    ///   - options: Operation options including timeout and maximum blob size.
     /// - Returns: The downloaded data.
     /// - Throws: `IrohError.nodeClosed` if the node is closed,
     ///           `IrohError.timeout` if the operation times out,
-    ///           `IrohError.getFailed` if the download fails.
+    ///           `IrohError.sizeLimitExceeded` if the blob exceeds `options.maxSize`,
+    ///           `IrohError.getFailed` if the download fails,
+    ///           `CancellationError` if the task was cancelled.
     public func get(ticket: String, options: OperationOptions) async throws -> Data {
+        try await getBytes(ticket: ticket, options: options, onProgress: nil)
+    }
+
+    /// Shared non-blocking, cancellable implementation for all `get(ticket:...)` overloads.
+    func getBytes(
+        ticket: String,
+        options: OperationOptions,
+        onProgress: ProgressHandler?
+    ) async throws -> Data {
         try ensureNotClosed()
         try Task.checkCancellation()
-        return try await withCheckedThrowingContinuation { continuation in
-            ticket.withCString { ticketPtr in
-                let ffiOptions = IrohOperationOptions(timeout_ms: options.timeoutMs)
+        if options.isImmediatelyExpired {
+            throw IrohError.timeout
+        }
 
-                let box = Unmanaged.passRetained(
-                    ContinuationBox<Data>(continuation)
-                ).toOpaque()
+        let token = CancelTokenBox()
+        let handle = self.handle
+        let timeoutMs = options.timeoutMs
+        let maxSize = options.effectiveMaxSize
 
-                let callback = IrohGetCallback(
-                    userdata: box,
-                    on_success: { userdata, ownedBytes in
-                        let box = Unmanaged<ContinuationBox<Data>>
-                            .fromOpaque(userdata!)
-                            .takeRetainedValue()
-                        let data = Data(bytes: ownedBytes.data, count: Int(ownedBytes.len))
-                        iroh_bytes_free(ownedBytes)
-                        box.continuation.resume(returning: data)
-                    },
-                    on_failure: { userdata, errorPtr in
-                        let box = Unmanaged<ContinuationBox<Data>>
-                            .fromOpaque(userdata!)
-                            .takeRetainedValue()
-                        let message = String(cString: errorPtr!)
-                        iroh_string_free(UnsafeMutablePointer(mutating: errorPtr))
-                        // Check if it's a timeout error
-                        if message.contains("timed out") {
-                            box.continuation.resume(throwing: IrohError.timeout)
-                        } else {
-                            box.continuation.resume(throwing: IrohError.getFailed(message))
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                ticket.withCString { ticketPtr in
+                    let context = GetAsyncContext(
+                        continuation: continuation,
+                        onProgress: onProgress
+                    )
+                    let box = Unmanaged.passRetained(context).toOpaque()
+
+                    let progressCallback: (@convention(c) (UnsafeMutableRawPointer?, UInt64, UInt64) -> Void)?
+                    if onProgress != nil {
+                        progressCallback = { userdata, downloaded, total in
+                            let ctx = Unmanaged<GetAsyncContext>
+                                .fromOpaque(userdata!)
+                                .takeUnretainedValue()
+                            ctx.onProgress?(DownloadProgress(downloaded: downloaded, total: total))
                         }
+                    } else {
+                        progressCallback = nil
                     }
-                )
 
-                iroh_get_with_options(handle.pointer, ticketPtr, ffiOptions, callback)
+                    let callback = IrohGetAsyncCallback(
+                        userdata: box,
+                        on_progress: progressCallback,
+                        on_success: { userdata, ownedBytes in
+                            let ctx = Unmanaged<GetAsyncContext>
+                                .fromOpaque(userdata!)
+                                .takeRetainedValue()
+                            let data = takeFFIBytes(ownedBytes)
+                            ctx.continuation.resume(returning: data)
+                        },
+                        on_failure: { userdata, code, size, errorPtr in
+                            let ctx = Unmanaged<GetAsyncContext>
+                                .fromOpaque(userdata!)
+                                .takeRetainedValue()
+                            let message = takeFFIString(errorPtr)
+                            let error: Error
+                            switch code {
+                            case IrohOperationErrorCode_Cancelled:
+                                error = CancellationError()
+                            case IrohOperationErrorCode_NodeShutDown:
+                                error = IrohError.nodeClosed
+                            case IrohOperationErrorCode_TimedOut:
+                                error = IrohError.timeout
+                            case IrohOperationErrorCode_SizeLimitExceeded:
+                                error = IrohError.sizeLimitExceeded(size)
+                            default:
+                                error = IrohError.getFailed(message)
+                            }
+                            ctx.continuation.resume(throwing: error)
+                        }
+                    )
+
+                    iroh_get_async(
+                        handle.pointer,
+                        ticketPtr,
+                        timeoutMs,
+                        maxSize,
+                        token.pointer,
+                        callback
+                    )
+                }
             }
+        } onCancel: {
+            token.cancel()
         }
     }
 }
 
 // MARK: - Internal Helpers
+
+/// Context for async `get` callbacks with optional progress reporting.
+private final class GetAsyncContext: @unchecked Sendable {
+    let continuation: CheckedContinuation<Data, Error>
+    let onProgress: ProgressHandler?
+
+    init(
+        continuation: CheckedContinuation<Data, Error>,
+        onProgress: ProgressHandler?
+    ) {
+        self.continuation = continuation
+        self.onProgress = onProgress
+    }
+}
 
 /// Box for passing Swift continuations through FFI callbacks.
 final class ContinuationBox<T>: @unchecked Sendable {

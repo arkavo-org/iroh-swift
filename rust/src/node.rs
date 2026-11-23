@@ -8,11 +8,11 @@ use crate::resolve::{
 };
 use anyhow::{Context, Result};
 use bao_tree::io::BaoContentItem;
-use futures_lite::StreamExt;
 use iroh::address_lookup::AddrFilter;
+use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{Connection, ReadError, RelayMode, VarInt, presets};
 use iroh::{Endpoint, EndpointAddr, RelayMap, RelayUrl, protocol::Router};
-use iroh_blobs::api::downloader::DownloadProgressItem;
+use iroh_blobs::api::blobs::BlobStatus;
 use iroh_blobs::get::fsm::{
     AtBlobHeaderNextError, BlobContentNext, ConnectedNext, DecodeError, EndBlobNext,
 };
@@ -69,10 +69,16 @@ pub struct IrohNode {
     endpoint: Endpoint,
     store: FsStore,
     router: Router,
+    /// In-memory address lookup populated with `BlobTicket` direct IP and
+    /// custom relay hints so `get` reaches peers without public discovery.
+    memory_lookup: MemoryLookup,
+    /// Whether `BlobsProtocol` is registered on `router` (determines whether
+    /// `router.shutdown()` shuts down `store` or `IrohNode::shutdown()` must
+    /// shut down `store` directly).
+    serves_blobs: bool,
     /// Task draining the blobs provider's event channel (must be kept alive).
-    #[allow(dead_code)]
     event_handler: Option<tokio::task::JoinHandle<()>>,
-    /// Parent of every spawned, cancellable operation (fetch, file push).
+    /// Parent of every spawned, cancellable operation (fetch, push, put, get, etc.).
     /// Cancelled first on shutdown so in-flight operations report
     /// [`OperationError::NodeShutDown`] instead of an opaque connection error.
     operations: CancellationToken,
@@ -130,14 +136,45 @@ impl IrohNode {
         accepts_pushes: bool,
         options: NodeOptions,
     ) -> Result<Self> {
+        let cancel = CancellationToken::new();
+        Self::new_with_options_cancellable(
+            storage_path,
+            relay_enabled,
+            custom_relay_url,
+            serves_blobs,
+            accepts_pushes,
+            options,
+            &cancel,
+        )
+        .map_err(|e| match e {
+            OperationError::Failed(err) => err,
+            other => anyhow::anyhow!("{other}"),
+        })
+    }
+
+    /// Like [`IrohNode::new_with_options`], but stops promptly with
+    /// [`OperationError::Cancelled`] when `cancel` fires (including during
+    /// DHT bootstrap resolution and initial relay connection).
+    pub fn new_with_options_cancellable(
+        storage_path: PathBuf,
+        relay_enabled: bool,
+        custom_relay_url: Option<String>,
+        serves_blobs: bool,
+        accepts_pushes: bool,
+        options: NodeOptions,
+        cancel: &CancellationToken,
+    ) -> Result<Self, OperationError> {
+        if cancel.is_cancelled() {
+            return Err(OperationError::Cancelled);
+        }
         if accepts_pushes && !serves_blobs {
-            anyhow::bail!("accepts_pushes requires serves_blobs");
+            return Err(anyhow::anyhow!("accepts_pushes requires serves_blobs").into());
         }
         if options.dht_publish && !options.dht_lookup {
-            anyhow::bail!("dht_publish requires dht_lookup");
+            return Err(anyhow::anyhow!("dht_publish requires dht_lookup").into());
         }
         if options.dht_publish && !serves_blobs {
-            anyhow::bail!("dht_publish requires serves_blobs");
+            return Err(anyhow::anyhow!("dht_publish requires serves_blobs").into());
         }
         let host_resolver = HostResolver::new(HostResolverConfig {
             fall_through_to_lookup: false,
@@ -147,19 +184,41 @@ impl IrohNode {
         // Create dedicated runtime for this node
         let runtime = Runtime::new().context("Failed to create Tokio runtime")?;
 
-        let (endpoint, store, router, event_handler, dht_active) = runtime.block_on(async {
-            // Create or load the persistent store
-            let store = FsStore::load(&storage_path)
-                .await
-                .context("Failed to load blob store")?;
+        let memory_lookup = MemoryLookup::new();
+        let init_result = runtime.block_on(async {
+            if cancel.is_cancelled() {
+                return Err(OperationError::Cancelled);
+            }
 
-            // Build endpoint with relay configuration
-            let mut builder = Endpoint::builder(presets::N0);
+            // Create or load the persistent store
+            let store = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(OperationError::Cancelled),
+                res = FsStore::load(&storage_path) => {
+                    res.context("Failed to load blob store")?
+                }
+            };
+
+            // Helper to shut down `store` cleanly if initialization fails or is cancelled.
+            async fn cleanup_store(store: FsStore) {
+                let _ = tokio::time::timeout(Duration::from_secs(2), store.shutdown()).await;
+                drop(store);
+            }
+
+            // Build endpoint with relay configuration and in-memory ticket lookup
+            let mut builder =
+                Endpoint::builder(presets::N0).address_lookup(memory_lookup.clone());
             if !relay_enabled {
                 builder = builder.relay_mode(RelayMode::Disabled);
             } else if let Some(url) = custom_relay_url {
                 // Parse and use custom relay
-                let relay_url: RelayUrl = url.parse().context("Invalid relay URL")?;
+                let relay_url: RelayUrl = match url.parse().context("Invalid relay URL") {
+                    Ok(u) => u,
+                    Err(e) => {
+                        cleanup_store(store).await;
+                        return Err(e.into());
+                    }
+                };
                 let relay_map = RelayMap::from(relay_url);
                 builder = builder.relay_mode(RelayMode::Custom(relay_map));
             }
@@ -175,9 +234,16 @@ impl IrohNode {
                 let bootstrap = match &options.dht_bootstrap {
                     Some(bootstrap) => bootstrap.clone(),
                     None => {
-                        host_resolver
-                            .resolve_bootstrap(&DEFAULT_DHT_BOOTSTRAP, DHT_BOOTSTRAP_RESOLVE_BOUND)
-                            .await
+                        let resolved = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {
+                                cleanup_store(store).await;
+                                return Err(OperationError::Cancelled);
+                            }
+                            res = host_resolver
+                                .resolve_bootstrap(&DEFAULT_DHT_BOOTSTRAP, DHT_BOOTSTRAP_RESOLVE_BOUND) => res,
+                        };
+                        resolved
                     }
                 };
                 if bootstrap.is_empty() {
@@ -204,11 +270,38 @@ impl IrohNode {
                 }
             }
 
-            let endpoint = builder.bind().await.context("Failed to bind endpoint")?;
+            let endpoint = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    cleanup_store(store).await;
+                    return Err(OperationError::Cancelled);
+                }
+                res = builder.bind() => match res.context("Failed to bind endpoint") {
+                    Ok(ep) => ep,
+                    Err(e) => {
+                        cleanup_store(store).await;
+                        return Err(e.into());
+                    }
+                }
+            };
 
             // Wait for relay connection if enabled (with timeout to avoid hanging in CI)
             if relay_enabled {
-                let _ = tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await;
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        endpoint.close().await;
+                        cleanup_store(store).await;
+                        return Err(OperationError::Cancelled);
+                    }
+                    _ = tokio::time::timeout(Duration::from_secs(10), endpoint.online()) => {}
+                }
+            }
+
+            if cancel.is_cancelled() {
+                endpoint.close().await;
+                cleanup_store(store).await;
+                return Err(OperationError::Cancelled);
             }
 
             // Set up the blobs protocol handler, unless the node is client-only.
@@ -250,14 +343,24 @@ impl IrohNode {
 
             let router = router_builder.spawn();
 
-            Ok::<_, anyhow::Error>((endpoint, store, router, event_handler, dht_active))
-        })?;
+            Ok::<_, OperationError>((endpoint, store, router, event_handler, dht_active))
+        });
+
+        let (endpoint, store, router, event_handler, dht_active) = match init_result {
+            Ok(parts) => parts,
+            Err(err) => {
+                runtime.shutdown_timeout(Duration::from_secs(2));
+                return Err(err);
+            }
+        };
 
         Ok(Self {
             runtime,
             endpoint,
             store,
             router,
+            memory_lookup,
+            serves_blobs,
             event_handler,
             operations: CancellationToken::new(),
             // With the DHT active, unresolvable hostnames must not stop a dial by ID.
@@ -298,6 +401,16 @@ impl IrohNode {
         &self.host_resolver
     }
 
+    /// In-memory address lookup populated with `BlobTicket` hints (cheap to clone).
+    pub fn memory_lookup(&self) -> &MemoryLookup {
+        &self.memory_lookup
+    }
+
+    /// Whether the Mainline DHT address lookup is running on this node.
+    pub fn dht_active(&self) -> bool {
+        self.dht_active
+    }
+
     /// This endpoint's id: the Ed25519 public key as 64 lowercase hex characters.
     ///
     /// Same string as [`NodeInfo::node_id`] and as `EndpointId`'s `Display`,
@@ -318,105 +431,40 @@ impl IrohNode {
     /// Add bytes to the blob store and return a shareable ticket.
     ///
     /// The ticket can be used by other nodes to download the blob.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn put(&self, data: &[u8]) -> Result<String> {
-        self.runtime.block_on(async {
-            // Add the bytes to the store
-            let tag = self
-                .store
-                .add_slice(data)
-                .await
-                .context("Failed to add bytes to store")?;
-
-            // Get our network address for the ticket
-            let addr = self.endpoint.addr();
-
-            // Create a ticket that others can use to download
-            let ticket = BlobTicket::new(addr, tag.hash, tag.format);
-
-            Ok(ticket.to_string())
-        })
+        self.put_with_timeout(data, 0)
     }
 
     /// Download bytes from a ticket.
     ///
     /// This fetches the blob from the remote peer specified in the ticket.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn get(&self, ticket_str: &str) -> Result<Vec<u8>> {
-        self.runtime.block_on(async {
-            // Parse the ticket
-            let ticket: BlobTicket = ticket_str.parse().context("Failed to parse ticket")?;
-
-            // Create a downloader for fetching from remote peers
-            let downloader = self.store.downloader(&self.endpoint);
-
-            // Download the blob (if not already present locally)
-            // ContentDiscovery is implemented for sequences of NodeId
-            downloader
-                .download(ticket.hash(), [ticket.addr().id])
-                .await
-                .context("Failed to download blob")?;
-
-            // Read the bytes from local store
-            let bytes = self
-                .store
-                .get_bytes(ticket.hash())
-                .await
-                .context("Failed to read bytes from store")?;
-
-            Ok(bytes.to_vec())
-        })
+        self.get_with_timeout(ticket_str, 0)
     }
 
     /// Download bytes from a ticket with progress reporting.
     ///
     /// The progress callback is called with (downloaded, total) byte counts.
-    /// Note: total may be 0 if the size is unknown.
-    pub fn get_with_progress<F>(&self, ticket_str: &str, mut on_progress: F) -> Result<Vec<u8>>
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn get_with_progress<F>(&self, ticket_str: &str, on_progress: F) -> Result<Vec<u8>>
     where
         F: FnMut(u64, u64),
     {
-        self.runtime.block_on(async {
-            // Parse the ticket
-            let ticket: BlobTicket = ticket_str.parse().context("Failed to parse ticket")?;
-
-            // Create a downloader for fetching from remote peers
-            let downloader = self.store.downloader(&self.endpoint);
-
-            // Download the blob with progress tracking
-            let download = downloader.download(ticket.hash(), [ticket.addr().id]);
-            let mut stream = download
-                .stream()
-                .await
-                .context("Failed to start download")?;
-
-            // Process progress events
-            while let Some(item) = stream.next().await {
-                match item {
-                    DownloadProgressItem::Progress(bytes) => {
-                        // Total is not directly available from progress events
-                        on_progress(bytes, 0);
-                    }
-                    DownloadProgressItem::PartComplete { .. } => {
-                        // Part of the download completed
-                    }
-                    DownloadProgressItem::Error(e) => {
-                        return Err(anyhow::anyhow!("Download error: {:?}", e));
-                    }
-                    DownloadProgressItem::DownloadError => {
-                        return Err(anyhow::anyhow!("Download failed"));
-                    }
-                    _ => {}
-                }
-            }
-
-            // Read the bytes from local store
-            let bytes = self
-                .store
-                .get_bytes(ticket.hash())
-                .await
-                .context("Failed to read bytes from store")?;
-
-            Ok(bytes.to_vec())
-        })
+        let cancel = CancellationToken::new();
+        self.runtime
+            .block_on(get_from_ticket(
+                &self.endpoint,
+                &self.store,
+                &self.memory_lookup,
+                ticket_str,
+                u64::MAX,
+                0,
+                &cancel,
+                on_progress,
+            ))
+            .map_err(operation_error_to_anyhow)
     }
 
     /// Add bytes to the blob store with an optional timeout.
@@ -424,28 +472,11 @@ impl IrohNode {
     /// # Arguments
     /// * `data` - The bytes to store
     /// * `timeout_ms` - Timeout in milliseconds (0 = no timeout)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn put_with_timeout(&self, data: &[u8], timeout_ms: u64) -> Result<String> {
-        self.runtime.block_on(async {
-            let fut = async {
-                let tag = self
-                    .store
-                    .add_slice(data)
-                    .await
-                    .context("Failed to add bytes to store")?;
-
-                let addr = self.endpoint.addr();
-                let ticket = BlobTicket::new(addr, tag.hash, tag.format);
-                Ok::<_, anyhow::Error>(ticket.to_string())
-            };
-
-            if timeout_ms == 0 {
-                fut.await
-            } else {
-                tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
-                    .await
-                    .context("Operation timed out")?
-            }
-        })
+        self.runtime
+            .block_on(put_bytes(&self.endpoint, &self.store, data, timeout_ms))
+            .map_err(operation_error_to_anyhow)
     }
 
     /// Download bytes from a ticket with an optional timeout.
@@ -453,40 +484,27 @@ impl IrohNode {
     /// # Arguments
     /// * `ticket_str` - The ticket string
     /// * `timeout_ms` - Timeout in milliseconds (0 = no timeout)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn get_with_timeout(&self, ticket_str: &str, timeout_ms: u64) -> Result<Vec<u8>> {
-        self.runtime.block_on(async {
-            let fut = async {
-                let ticket: BlobTicket = ticket_str.parse().context("Failed to parse ticket")?;
-                let downloader = self.store.downloader(&self.endpoint);
-
-                downloader
-                    .download(ticket.hash(), [ticket.addr().id])
-                    .await
-                    .context("Failed to download blob")?;
-
-                let bytes = self
-                    .store
-                    .get_bytes(ticket.hash())
-                    .await
-                    .context("Failed to read bytes from store")?;
-
-                Ok::<_, anyhow::Error>(bytes.to_vec())
-            };
-
-            if timeout_ms == 0 {
-                fut.await
-            } else {
-                tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
-                    .await
-                    .context("Operation timed out")?
-            }
-        })
+        let cancel = CancellationToken::new();
+        self.runtime
+            .block_on(get_from_ticket(
+                &self.endpoint,
+                &self.store,
+                &self.memory_lookup,
+                ticket_str,
+                u64::MAX,
+                timeout_ms,
+                &cancel,
+                |_, _| {},
+            ))
+            .map_err(operation_error_to_anyhow)
     }
 
     /// Push data to a remote node.
     ///
-    /// Adds the data to the local store, connects to the remote node,
-    /// and pushes the blob. Returns the blob hash as a hex string.
+    /// Resolves the target first, adds the data to the local store, connects to
+    /// the remote node, and pushes the blob. Returns the blob hash as a hex string.
     ///
     /// # Arguments
     /// * `remote_node_id_hex` - The remote node's ID as a hex string
@@ -501,21 +519,7 @@ impl IrohNode {
         data: &[u8],
         direct_addrs: &[String],
     ) -> Result<String> {
-        // Argument errors first, before anything is stored.
-        let target = RemoteTarget::parse(remote_node_id_hex, relay_url, direct_addrs)?;
-        self.runtime.block_on(async {
-            // Add bytes to local store first
-            let tag = self
-                .store
-                .add_slice(data)
-                .await
-                .context("Failed to add bytes to store")?;
-
-            let endpoint_addr = self.host_resolver.resolve_target(target).await?;
-            push_hash(&self.endpoint, &self.store, tag.hash, endpoint_addr).await?;
-
-            Ok(hex::encode(tag.hash.as_bytes()))
-        })
+        self.push_to_node_with_timeout(remote_node_id_hex, relay_url, data, direct_addrs, 0)
     }
 
     /// Push data to a remote node with an optional timeout.
@@ -536,62 +540,31 @@ impl IrohNode {
         timeout_ms: u64,
     ) -> Result<String> {
         let target = RemoteTarget::parse(remote_node_id_hex, relay_url, direct_addrs)?;
-        self.runtime.block_on(async {
-            let fut = async {
-                let tag = self
-                    .store
-                    .add_slice(data)
-                    .await
-                    .context("Failed to add bytes to store")?;
-
-                let endpoint_addr = self.host_resolver.resolve_target(target).await?;
-                push_hash(&self.endpoint, &self.store, tag.hash, endpoint_addr).await?;
-
-                Ok::<_, anyhow::Error>(hex::encode(tag.hash.as_bytes()))
-            };
-
-            if timeout_ms == 0 {
-                fut.await
-            } else {
-                tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
-                    .await
-                    .context("Operation timed out")?
-            }
-        })
+        self.runtime
+            .block_on(push_bytes(
+                &self.endpoint,
+                &self.store,
+                &self.host_resolver,
+                target,
+                data,
+                timeout_ms,
+            ))
+            .map(|hash| hex::encode(hash.as_bytes()))
+            .map_err(operation_error_to_anyhow)
     }
 
     /// Get information about this node.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn info(&self) -> Result<NodeInfo> {
-        self.runtime.block_on(async {
-            // Get node ID from endpoint
-            let node_id = self.endpoint.id().to_string();
-
-            // Get address info which includes relay
-            let addr = self.endpoint.addr();
-            // Get the first relay URL if any
-            let relay_url = addr.relay_urls().next().map(|url| url.to_string());
-
-            // A node is considered connected if it has a relay URL or IP addresses
-            let is_connected = relay_url.is_some() || addr.ip_addrs().next().is_some();
-
-            let direct_addrs = addr.ip_addrs().map(|a| a.to_string()).collect();
-
-            Ok(NodeInfo {
-                node_id,
-                relay_url,
-                is_connected,
-                direct_addrs,
-                dht_active: self.dht_active,
-            })
-        })
+        Ok(node_info_from_endpoint(&self.endpoint, self.dht_active))
     }
 
     /// Gracefully shut down the node.
     ///
-    /// This ensures all pending writes are flushed to disk.
-    /// Uses a timeout to prevent hanging if the router cannot shut down cleanly.
-    /// The Tokio runtime is also shut down with a timeout to avoid blocking on
-    /// background tasks (e.g., event handlers) that may never complete.
+    /// This ensures all pending writes are flushed to disk, including for
+    /// client-only nodes where `BlobsProtocol` is not registered on the router.
+    /// Uses timeouts to prevent hanging while surfacing shutdown errors/timeouts
+    /// instead of silently discarding them.
     pub fn shutdown(self) -> Result<()> {
         // Destructure to control drop order: drop all node resources first,
         // then shut down the runtime last. This prevents Drop impls on
@@ -601,44 +574,320 @@ impl IrohNode {
             router,
             endpoint,
             store,
+            memory_lookup,
+            serves_blobs,
             event_handler,
             operations,
             host_resolver,
             dht_active: _,
         } = self;
         drop(host_resolver);
+        drop(memory_lookup);
 
-        // Stop in-flight fetches and file pushes first, before the endpoint goes
+        // Stop in-flight spawned operations first, before the endpoint goes
         // away: each reports NodeShutDown (a fetch also removes its temp file).
         operations.cancel();
 
+        // Actively abort the provider event drain task rather than detaching it.
+        if let Some(handle) = event_handler {
+            handle.abort();
+        }
+
         let result = runtime.block_on(async {
-            match tokio::time::timeout(Duration::from_secs(5), router.shutdown()).await {
-                Ok(result) => result.context("Failed to shutdown router"),
-                Err(_) => Ok(()),
+            let mut first_err: Option<anyhow::Error> = None;
+
+            let router_ok = match tokio::time::timeout(Duration::from_secs(5), router.shutdown())
+                .await
+            {
+                Ok(Ok(())) => true,
+                Ok(Err(e)) => {
+                    first_err = Some(anyhow::Error::new(e).context("Failed to shutdown router"));
+                    false
+                }
+                Err(_) => {
+                    first_err = Some(anyhow::anyhow!("Timed out shutting down router"));
+                    false
+                }
+            };
+
+            // When `serves_blobs == false`, BlobsProtocol is not registered on
+            // the router so `router.shutdown()` never flushes/closes `store`.
+            // Also attempt store shutdown if router shutdown failed/timed out.
+            if !serves_blobs || !router_ok {
+                match tokio::time::timeout(Duration::from_secs(5), store.shutdown()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        if first_err.is_none() {
+                            first_err = Some(
+                                anyhow::Error::new(e).context("Failed to shutdown blob store"),
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        if first_err.is_none() {
+                            first_err = Some(anyhow::anyhow!("Timed out shutting down blob store"));
+                        }
+                    }
+                }
+            }
+
+            match first_err {
+                Some(e) => Err(e),
+                None => Ok(()),
             }
         });
 
         // Drop all node resources before shutting down the runtime.
-        drop(event_handler);
         drop(store);
         drop(endpoint);
 
         // Explicitly shut down the runtime with a timeout so that
-        // background tasks (event handler, etc.) don't block process exit.
+        // background tasks don't block process exit.
         runtime.shutdown_timeout(Duration::from_secs(2));
 
         result
     }
 }
 
-/// Push a blob that is already in `store` to a remote node.
-async fn push_hash(
+fn operation_error_to_anyhow(e: OperationError) -> anyhow::Error {
+    match e {
+        OperationError::Failed(err) => err,
+        other => anyhow::anyhow!("{other}"),
+    }
+}
+
+/// Snapshot of [`NodeInfo`] from an endpoint without blocking on a runtime.
+pub fn node_info_from_endpoint(endpoint: &Endpoint, dht_active: bool) -> NodeInfo {
+    let node_id = endpoint.id().to_string();
+    let addr = endpoint.addr();
+    let relay_url = addr.relay_urls().next().map(|url| url.to_string());
+    let is_connected = relay_url.is_some() || addr.ip_addrs().next().is_some();
+    let direct_addrs = addr.ip_addrs().map(|a| a.to_string()).collect();
+
+    NodeInfo {
+        node_id,
+        relay_url,
+        is_connected,
+        direct_addrs,
+        dht_active,
+    }
+}
+
+/// Add bytes to `store` and return a shareable `BlobTicket` string.
+/// `timeout_ms == 0` means no timeout.
+pub async fn put_bytes(
+    endpoint: &Endpoint,
+    store: &FsStore,
+    data: &[u8],
+    timeout_ms: u64,
+) -> Result<String, OperationError> {
+    let work = async {
+        let tag = store
+            .add_slice(data)
+            .await
+            .context("Failed to add bytes to store")?;
+        let addr = endpoint.addr();
+        let ticket = BlobTicket::new(addr, tag.hash, tag.format);
+        Ok::<_, OperationError>(ticket.to_string())
+    };
+    if timeout_ms == 0 {
+        work.await
+    } else {
+        tokio::time::timeout(Duration::from_millis(timeout_ms), work)
+            .await
+            .map_err(|_| OperationError::TimedOut)?
+    }
+}
+
+/// Download bytes from a `BlobTicket`, populating `memory_lookup` with the
+/// ticket's direct IP and custom relay hints and enforcing `max_size` before
+/// reading any body or allocating disk space.
+///
+/// `timeout_ms == 0` means no timeout; `max_size == u64::MAX` means no limit.
+#[allow(clippy::too_many_arguments)]
+pub async fn get_from_ticket(
+    endpoint: &Endpoint,
+    store: &FsStore,
+    memory_lookup: &MemoryLookup,
+    ticket_str: &str,
+    max_size: u64,
+    timeout_ms: u64,
+    cancel: &CancellationToken,
+    mut on_progress: impl FnMut(u64, u64),
+) -> Result<Vec<u8>, OperationError> {
+    let ticket: BlobTicket = ticket_str.parse().context("Failed to parse ticket")?;
+
+    // Preserve the ticket's direct IP and custom relay hints so `endpoint` can
+    // dial the peer directly even with public discovery/relays disabled.
+    if ticket.addr().id != endpoint.id() && !ticket.addr().is_empty() {
+        memory_lookup.add_endpoint_info(ticket.addr().clone());
+    }
+
+    let work = async {
+        // Fast path: already complete in local store. Check size before reading into RAM.
+        if let Ok(BlobStatus::Complete { size }) = store.blobs().status(ticket.hash()).await {
+            if size > max_size {
+                return Err(OperationError::SizeLimitExceeded(size));
+            }
+            let bytes = store
+                .get_bytes(ticket.hash())
+                .await
+                .context("Failed to read bytes from store")?;
+            let actual = bytes.len() as u64;
+            if actual > max_size {
+                return Err(OperationError::SizeLimitExceeded(actual));
+            }
+            on_progress(actual, actual);
+            return Ok(Vec::from(bytes));
+        }
+
+        if ticket.addr().id == endpoint.id() {
+            return Err(OperationError::NotFound);
+        }
+
+        // Dial by endpoint ID; `memory_lookup` provides the ticket's direct IP
+        // and custom relay hints alongside any other configured lookups.
+        let conn = endpoint
+            .connect(ticket.addr().id, BLOBS_ALPN)
+            .await
+            .context("Failed to connect to remote node")?;
+
+        let result =
+            get_bytes_on_connection(&conn, ticket.hash(), max_size, cancel, &mut on_progress).await;
+
+        conn.close(VarInt::from_u32(0), b"done");
+        let buf = result?;
+
+        if cancel.is_cancelled() {
+            return Err(OperationError::Cancelled);
+        }
+
+        // Cache verified blob (already bounded by `max_size`) in local store so
+        // callers can subsequently pin/tag it with `tagBlob`.
+        store
+            .add_slice(&buf)
+            .await
+            .context("Failed to store downloaded blob")?;
+
+        Ok(buf)
+    };
+
+    if timeout_ms == 0 {
+        work.await
+    } else {
+        tokio::time::timeout(Duration::from_millis(timeout_ms), work)
+            .await
+            .map_err(|_| OperationError::TimedOut)?
+    }
+}
+
+async fn get_bytes_on_connection(
+    conn: &Connection,
+    hash: Hash,
+    max_size: u64,
+    cancel: &CancellationToken,
+    on_progress: &mut impl FnMut(u64, u64),
+) -> Result<Vec<u8>, OperationError> {
+    use iroh_blobs::get::fsm;
+
+    let connected = fsm::start(conn.clone(), GetRequest::blob(hash), Default::default())
+        .next()
+        .await
+        .context("Failed to open stream to remote node")?;
+    let ConnectedNext::StartRoot(root) = connected
+        .next()
+        .await
+        .context("Failed to send request to remote node")?
+    else {
+        return Err(anyhow::anyhow!("Unexpected response shape for a single-blob request").into());
+    };
+
+    // Enforce max_size from the size header before allocating body RAM or disk.
+    let (mut content, size) = root.next().next().await.map_err(header_error)?;
+    if size > max_size {
+        return Err(OperationError::SizeLimitExceeded(size));
+    }
+    let expected_len =
+        usize::try_from(size).map_err(|_| OperationError::SizeLimitExceeded(size))?;
+
+    // Cap initial reservation so a peer announcing a large size within `max_size`
+    // and disconnecting immediately cannot force an upfront allocation.
+    let mut buf = Vec::with_capacity(expected_len.min(64 * 1024));
+
+    on_progress(0, size);
+    let mut downloaded: u64 = 0;
+    let mut reported: u64 = 0;
+
+    let end = loop {
+        match content.next().await {
+            BlobContentNext::More((next, item)) => {
+                content = next;
+                match item.map_err(decode_error)? {
+                    BaoContentItem::Parent(_) => {}
+                    BaoContentItem::Leaf(leaf) => {
+                        let len = leaf.data.len() as u64;
+                        let leaf_end = leaf.offset.saturating_add(len);
+                        if leaf_end > size {
+                            return Err(anyhow::anyhow!(
+                                "Remote sent data past the announced size ({leaf_end} > {size})"
+                            )
+                            .into());
+                        }
+                        downloaded += len;
+                        if downloaded > max_size {
+                            return Err(OperationError::SizeLimitExceeded(downloaded));
+                        }
+                        if leaf.offset == buf.len() as u64 {
+                            buf.extend_from_slice(&leaf.data);
+                        } else {
+                            let start = usize::try_from(leaf.offset)
+                                .map_err(|_| OperationError::SizeLimitExceeded(leaf_end))?;
+                            let end = usize::try_from(leaf_end)
+                                .map_err(|_| OperationError::SizeLimitExceeded(leaf_end))?;
+                            if buf.len() < end {
+                                buf.resize(end, 0);
+                            }
+                            buf[start..end].copy_from_slice(&leaf.data);
+                        }
+
+                        if downloaded == size || downloaded - reported >= FETCH_PROGRESS_STEP {
+                            on_progress(downloaded, size);
+                            reported = downloaded;
+                        }
+                        if cancel.is_cancelled() {
+                            return Err(OperationError::Cancelled);
+                        }
+                    }
+                }
+            }
+            BlobContentNext::Done(end) => break end,
+        }
+    };
+
+    if downloaded != size || buf.len() != expected_len {
+        return Err(anyhow::anyhow!("Remote finished after {downloaded} of {size} bytes").into());
+    }
+
+    if let EndBlobNext::Closing(closing) = end.next() {
+        let _ = closing.next().await;
+    }
+
+    if reported != size {
+        on_progress(size, size);
+    }
+
+    Ok(buf)
+}
+
+/// Push a blob that is already in `store` to a remote node, returning the live
+/// `Connection` guard so the caller can keep it open briefly outside any
+/// timeout/cancellation scope (via [`await_push_grace`]).
+async fn push_hash_transfer(
     endpoint: &Endpoint,
     store: &FsStore,
     hash: Hash,
     endpoint_addr: EndpointAddr,
-) -> Result<()> {
+) -> Result<Connection> {
     // Connect to remote node
     let conn = endpoint
         .connect(endpoint_addr, BLOBS_ALPN)
@@ -648,7 +897,7 @@ async fn push_hash(
     // Keep a connection handle alive — execute_push takes ownership but
     // Connection is Clone (ref-counted). The server needs time to
     // accept_bi and process the push stream after execute_push returns.
-    let _conn_guard = conn.clone();
+    let conn_guard = conn.clone();
 
     // Push the blob
     let request = PushRequest::from(GetRequest::blob(hash));
@@ -658,12 +907,48 @@ async fn push_hash(
         .await
         .context("Failed to push blob to remote node")?;
 
-    // Give the server time to process the push before dropping the connection.
-    // Without this, small blobs may transfer in a single QUIC packet and the
-    // server's accept_bi may not be scheduled before the connection closes.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    Ok(conn_guard)
+}
 
-    Ok(())
+/// Keep a pushed connection alive briefly so the server can finish `accept_bi`
+/// and commit small blobs before the connection drops.
+///
+/// Runs OUTSIDE the caller's timeout and cancellation error scopes so an
+/// already-succeeded push never fails with a false `TimedOut` or `Cancelled`.
+pub async fn await_push_grace(
+    conn: Connection,
+    cancel: Option<&CancellationToken>,
+    shutdown: Option<&CancellationToken>,
+) {
+    let grace = Duration::from_millis(500);
+    let cancelled = async {
+        match cancel {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    let shutting_down = async {
+        match shutdown {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+
+    tokio::select! {
+        _ = conn.closed() => {}
+        _ = tokio::time::sleep(grace) => {}
+        _ = shutting_down => {}
+        _ = cancelled => {
+            // Transfer already completed: return immediately to the caller
+            // while holding the connection open briefly in the background.
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = conn.closed() => {}
+                    _ = tokio::time::sleep(grace) => {}
+                }
+            });
+        }
+    }
 }
 
 /// Why a spawned operation (fetch, file push) did not complete.
@@ -986,13 +1271,14 @@ async fn fetch_on_connection(
 }
 
 /// Import the file at `path` into the store (streamed, copied into the store)
-/// and push it to a remote node. Returns the blob hash.
-pub async fn push_path(
+/// and push it to a remote node, returning `(hash, conn)` so the caller can run
+/// [`await_push_grace`] outside its cancellation scope.
+pub async fn push_path_transfer(
     endpoint: &Endpoint,
     store: &FsStore,
     path: &Path,
     remote: EndpointAddr,
-) -> Result<Hash, OperationError> {
+) -> Result<(Hash, Connection), OperationError> {
     if !path.is_absolute() {
         return Err(anyhow::anyhow!("File path must be absolute: {}", path.display()).into());
     }
@@ -1000,29 +1286,43 @@ pub async fn push_path(
         .add_path(path)
         .await
         .with_context(|| format!("Failed to import {} into the store", path.display()))?;
-    push_hash(endpoint, store, tag.hash, remote).await?;
-    Ok(tag.hash)
+    let conn = push_hash_transfer(endpoint, store, tag.hash, remote).await?;
+    Ok((tag.hash, conn))
 }
 
-/// Add `data` to the store and push it to a remote node, resolving the target's
-/// hostnames first (so a cancel during DNS also stops the push). `timeout_ms` of 0
-/// means no timeout; it covers DNS, import and transfer. Returns the blob hash.
-pub async fn push_bytes(
+/// Import the file at `path` into the store (streamed, copied into the store)
+/// and push it to a remote node. Returns the blob hash.
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn push_path(
+    endpoint: &Endpoint,
+    store: &FsStore,
+    path: &Path,
+    remote: EndpointAddr,
+) -> Result<Hash, OperationError> {
+    let (hash, conn) = push_path_transfer(endpoint, store, path, remote).await?;
+    await_push_grace(conn, None, None).await;
+    Ok(hash)
+}
+
+/// Resolve `target`, add `data` to `store`, and push it to the remote node,
+/// returning `(hash, conn)` so [`await_push_grace`] runs outside `timeout_ms`
+/// and caller cancellation.
+pub async fn push_bytes_transfer(
     endpoint: &Endpoint,
     store: &FsStore,
     resolver: &HostResolver,
     target: RemoteTarget,
     data: &[u8],
     timeout_ms: u64,
-) -> Result<Hash, OperationError> {
+) -> Result<(Hash, Connection), OperationError> {
     let work = async {
         let remote = resolver.resolve_target(target).await?;
         let tag = store
             .add_slice(data)
             .await
             .context("Failed to add bytes to store")?;
-        push_hash(endpoint, store, tag.hash, remote).await?;
-        Ok::<_, OperationError>(tag.hash)
+        let conn = push_hash_transfer(endpoint, store, tag.hash, remote).await?;
+        Ok::<_, OperationError>((tag.hash, conn))
     };
     if timeout_ms == 0 {
         work.await
@@ -1031,6 +1331,24 @@ pub async fn push_bytes(
             .await
             .map_err(|_| OperationError::TimedOut)?
     }
+}
+
+/// Add `data` to the store and push it to a remote node, resolving the target's
+/// hostnames first (so a cancel during DNS also stops the push). `timeout_ms` of 0
+/// means no timeout; it covers DNS, import and transfer (not the post-transfer
+/// connection grace wait). Returns the blob hash.
+pub async fn push_bytes(
+    endpoint: &Endpoint,
+    store: &FsStore,
+    resolver: &HostResolver,
+    target: RemoteTarget,
+    data: &[u8],
+    timeout_ms: u64,
+) -> Result<Hash, OperationError> {
+    let (hash, conn) =
+        push_bytes_transfer(endpoint, store, resolver, target, data, timeout_ms).await?;
+    await_push_grace(conn, None, None).await;
+    Ok(hash)
 }
 
 /// BLAKE3 hash of `data` as 64 lowercase hex characters.
@@ -1925,8 +2243,14 @@ mod tests {
                 .unwrap()
         );
 
-        // A blackholed address (TEST-NET-1) runs into the time limit.
-        let result = run(target("192.0.2.1:9"), b"x", 400, &CancellationToken::new());
+        // A blackholed address (TEST-NET-1) for an unreachable peer runs into the time limit.
+        // Use a fresh peer ID so iroh does not reuse the cached localhost path from above.
+        let blackhole_id = iroh::SecretKey::from_bytes(&[123u8; 32])
+            .public()
+            .to_string();
+        let blackhole_target =
+            RemoteTarget::parse(&blackhole_id, None, &["192.0.2.1:9".to_string()]).unwrap();
+        let result = run(blackhole_target, b"x", 400, &CancellationToken::new());
         assert!(
             matches!(result, Err(OperationError::TimedOut)),
             "{result:?}"
@@ -2160,5 +2484,222 @@ mod tests {
 
         node_a.shutdown().unwrap();
         node_b.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_client_only_node_shutdown_flushes_store_and_reopens() {
+        let dir = tempdir().unwrap();
+        let data = b"persisted by client-only node";
+
+        let node1 = local_node(&dir, false);
+        let ticket = node1.put(data).unwrap();
+        let parsed: BlobTicket = ticket.parse().unwrap();
+        node1.shutdown().unwrap();
+
+        // Reopen the exact same FsStore directory and verify the blob survived.
+        let node2 = local_node(&dir, false);
+        let has = node2
+            .runtime()
+            .block_on(node2.store().has(parsed.hash()))
+            .unwrap();
+        assert!(has, "client-only FsStore must flush writes on shutdown");
+        let bytes = node2
+            .runtime()
+            .block_on(node2.store().get_bytes(parsed.hash()))
+            .unwrap();
+        assert_eq!(bytes.as_ref(), data);
+        node2.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_get_ticket_uses_direct_ip_and_relay_hints_via_memory_lookup() {
+        let dir_server = tempdir().unwrap();
+        let dir_client = tempdir().unwrap();
+
+        // Both nodes have relays disabled: get MUST use the ticket's direct IP
+        // hints populated into MemoryLookup.
+        let server = local_node(&dir_server, true);
+        let client = local_node(&dir_client, false);
+
+        let payload = test_bytes(300 * 1024);
+        let ticket = server.put(&payload).unwrap();
+
+        let mut progress = Vec::new();
+        let got = client
+            .get_with_progress(&ticket, |d, t| progress.push((d, t)))
+            .unwrap();
+        assert_eq!(got, payload);
+        assert!(
+            progress.last().copied() == Some((payload.len() as u64, payload.len() as u64)),
+            "expected final progress with known total, got {progress:?}"
+        );
+
+        // Also test direct `get` on a fresh client node.
+        let dir_client2 = tempdir().unwrap();
+        let client2 = local_node(&dir_client2, false);
+        assert_eq!(client2.get(&ticket).unwrap(), payload);
+
+        // Verify a ticket carrying a custom relay URL populates MemoryLookup.
+        let custom_relay: RelayUrl = "https://relay.example.invalid".parse().unwrap();
+        let remote_key = iroh::SecretKey::from_bytes(&[42u8; 32]);
+        let relay_addr =
+            EndpointAddr::from(remote_key.public()).with_relay_url(custom_relay.clone());
+        let relay_ticket =
+            BlobTicket::new(relay_addr, Hash::new(b"x"), iroh_blobs::BlobFormat::Raw);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let _ = client2.runtime().block_on(get_from_ticket(
+            client2.endpoint(),
+            client2.store(),
+            client2.memory_lookup(),
+            &relay_ticket.to_string(),
+            u64::MAX,
+            100,
+            &cancel,
+            |_, _| {},
+        ));
+        let stored = client2
+            .memory_lookup()
+            .get_endpoint_info(remote_key.public())
+            .expect("ticket relay hint should be stored in MemoryLookup");
+        assert!(
+            stored.relay_urls().any(|u| *u == custom_relay),
+            "expected custom relay URL in MemoryLookup"
+        );
+
+        client2.shutdown().unwrap();
+        client.shutdown().unwrap();
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_get_from_ticket_enforces_max_size_before_download() {
+        let dir_server = tempdir().unwrap();
+        let dir_client = tempdir().unwrap();
+
+        let server = local_node(&dir_server, true);
+        let client = local_node(&dir_client, false);
+
+        let payload = test_bytes(16 * 1024);
+        let ticket = server.put(&payload).unwrap();
+        let parsed: BlobTicket = ticket.parse().unwrap();
+        let cancel = CancellationToken::new();
+
+        let err = client
+            .runtime()
+            .block_on(get_from_ticket(
+                client.endpoint(),
+                client.store(),
+                client.memory_lookup(),
+                &ticket,
+                1024,
+                0,
+                &cancel,
+                |_, _| {},
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(err, OperationError::SizeLimitExceeded(n) if n == payload.len() as u64),
+            "expected SizeLimitExceeded({}), got {err:?}",
+            payload.len()
+        );
+        // Oversized blob must not have been written to the client's FsStore.
+        let has = client
+            .runtime()
+            .block_on(client.store().has(parsed.hash()))
+            .unwrap();
+        assert!(!has, "oversized blob must not be written to local FsStore");
+
+        // Local-hit maxSize enforcement on the server itself.
+        let err = server
+            .runtime()
+            .block_on(get_from_ticket(
+                server.endpoint(),
+                server.store(),
+                server.memory_lookup(),
+                &ticket,
+                100,
+                0,
+                &cancel,
+                |_, _| {},
+            ))
+            .unwrap_err();
+        assert!(matches!(err, OperationError::SizeLimitExceeded(n) if n == payload.len() as u64));
+
+        client.shutdown().unwrap();
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_push_short_timeout_excludes_post_transfer_grace_sleep() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+
+        let node_a = local_node(&dir_a, false);
+        let node_b = push_receiver(&dir_b);
+        let direct = direct_addrs(&node_b);
+        let data = b"fast localhost push";
+
+        // 250 ms timeout is shorter than the 500 ms post-transfer grace wait;
+        // push must still succeed because the grace period runs outside timeout.
+        let hash_hex = node_a
+            .push_to_node_with_timeout(&node_b.endpoint_id(), None, data, &direct, 250)
+            .expect("push should not time out during post-transfer grace period");
+        assert_eq!(hash_hex, blake3_hex(data));
+
+        let hash: Hash = hash_hex.parse().unwrap();
+        assert!(node_b.runtime().block_on(node_b.store().has(hash)).unwrap());
+
+        node_a.shutdown().unwrap();
+        node_b.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_legacy_push_to_node_resolves_before_storing_blob() {
+        let dir = tempdir().unwrap();
+        let node = node_with_dead_doh(&dir, false);
+        let data = b"must not be stored when target fails to resolve";
+        let expected_hash = Hash::new(data);
+        let remote_id = iroh::SecretKey::from_bytes(&[99u8; 32])
+            .public()
+            .to_string();
+
+        let err = node.push_to_node(
+            &remote_id,
+            None,
+            data,
+            &["unresolvable.invalid:11204".into()],
+        );
+        assert!(err.is_err());
+
+        let has = node
+            .runtime()
+            .block_on(node.store().has(expected_hash))
+            .unwrap();
+        assert!(
+            !has,
+            "legacy push_to_node must not persist blob before target hostname resolves"
+        );
+        node.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_node_create_cancellable_honours_pre_cancelled_token() {
+        let dir = tempdir().unwrap();
+        let sub = dir.path().join("never-created");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let res = IrohNode::new_with_options_cancellable(
+            sub.clone(),
+            false,
+            None,
+            true,
+            false,
+            NodeOptions::default(),
+            &cancel,
+        );
+        assert!(matches!(res, Err(OperationError::Cancelled)));
+        assert!(!sub.exists());
     }
 }
