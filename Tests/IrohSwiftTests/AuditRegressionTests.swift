@@ -1,4 +1,8 @@
 import Foundation
+import os
+#if canImport(Observation)
+import Observation
+#endif
 import Testing
 @testable import IrohSwift
 
@@ -283,9 +287,19 @@ struct AuditRegressionTests {
         await manager.initialize(config: config)
         #expect(manager.node != nil)
 
-        // Download with progress: isDownloading must be false immediately after and stay false.
+        // Download with progress: isDownloading must be false immediately after and stay false,
+        // and @Observable tracking must observe transitions through activeDownloadCount/downloadProgress.
         let downloaded = try await manager.download(ticket: ticket)
         #expect(downloaded == payload)
+        #expect(!manager.isDownloading)
+        let invalidated = OSAllocatedUnfairLock(initialState: false)
+        withObservationTracking {
+            _ = manager.isDownloading
+        } onChange: {
+            invalidated.withLock { $0 = true }
+        }
+        _ = try await manager.download(ticket: ticket)
+        #expect(invalidated.withLock { $0 })
         #expect(!manager.isDownloading)
         try await Task.sleep(for: .milliseconds(50))
         #expect(!manager.isDownloading)

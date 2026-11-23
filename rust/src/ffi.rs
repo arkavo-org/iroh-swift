@@ -228,23 +228,20 @@ unsafe impl Send for IrohCloseCallback {}
 /// - `callback` must have valid function pointers
 #[unsafe(no_mangle)]
 pub extern "C" fn iroh_node_create(config: IrohNodeConfig, callback: IrohNodeCreateCallback) {
+    let completion = NodeCreateCompletion::new(callback);
     let parsed = unsafe { parse_node_config(&config) };
     let (storage_path, custom_relay_url, relay_enabled, serves_blobs, accepts_pushes, options) =
         match parsed {
             Ok(parts) => parts,
             Err(message) => {
-                let error = c_string(message);
-                (callback.on_failure)(callback.userdata, error);
+                completion.fail(message);
                 return;
             }
         };
 
-    let userdata = callback.userdata as usize;
-    let on_success = callback.on_success;
-    let on_failure = callback.on_failure;
-    spawn_thread_or_inline("iroh-node-create", move || {
-        let userdata = userdata as *mut c_void;
-        match IrohNode::new_with_options(
+    spawn_thread_or_inline(
+        "iroh-node-create",
+        move || match IrohNode::new_with_options(
             storage_path,
             relay_enabled,
             custom_relay_url,
@@ -255,14 +252,13 @@ pub extern "C" fn iroh_node_create(config: IrohNodeConfig, callback: IrohNodeCre
             Ok(node) => {
                 let boxed = Box::new(node);
                 let handle = Box::into_raw(boxed) as *mut IrohNodeHandle;
-                (on_success)(userdata, handle);
+                completion.succeed(handle);
             }
             Err(e) => {
-                let error = c_string(format!("{:#}", e));
-                (on_failure)(userdata, error);
+                completion.fail(format!("{:#}", e));
             }
-        }
-    });
+        },
+    );
 }
 
 /// Destroy an Iroh node and free its resources.
@@ -599,26 +595,18 @@ pub unsafe extern "C" fn iroh_validate_ticket(
 /// - `callback` must have valid function pointers
 #[unsafe(no_mangle)]
 pub extern "C" fn iroh_node_close(handle: *mut IrohNodeHandle, callback: IrohCloseCallback) {
+    let completion = VoidCompletion::new(callback);
     if handle.is_null() {
-        (callback.on_complete)(callback.userdata);
+        completion.succeed();
         return;
     }
 
     // Run shutdown on a dedicated thread (with inline fallback on thread
     // exhaustion) to avoid blocking Swift's cooperative thread pool.
     let node = unsafe { Box::from_raw(handle as *mut IrohNode) };
-    let on_complete = callback.on_complete;
-    let on_failure = callback.on_failure;
-    let userdata = callback.userdata as usize;
-    spawn_thread_or_inline("iroh-node-close", move || {
-        let userdata = userdata as *mut c_void;
-        match node.shutdown() {
-            Ok(()) => (on_complete)(userdata),
-            Err(e) => {
-                let error = c_string(format!("{:#}", e));
-                (on_failure)(userdata, error);
-            }
-        }
+    spawn_thread_or_inline("iroh-node-close", move || match node.shutdown() {
+        Ok(()) => completion.succeed(),
+        Err(e) => completion.fail(format!("{:#}", e)),
     });
 }
 
@@ -1694,36 +1682,26 @@ pub unsafe extern "C" fn iroh_node_create_async(
     cancel_token: *const IrohCancelToken,
     callback: IrohNodeCreateAsyncCallback,
 ) {
+    let completion = NodeCreateAsyncCompletion::new(callback);
     let parsed = unsafe { parse_node_config(&config) };
     let (storage_path, custom_relay_url, relay_enabled, serves_blobs, accepts_pushes, options) =
         match parsed {
             Ok(parts) => parts,
             Err(message) => {
-                (callback.on_failure)(
-                    callback.userdata,
-                    IrohOperationErrorCode::Failed,
-                    c_string(message),
-                );
+                completion.fail(IrohOperationErrorCode::Failed, message);
                 return;
             }
         };
 
     let token = operation_token(cancel_token);
     if token.is_cancelled() {
-        (callback.on_failure)(
-            callback.userdata,
-            IrohOperationErrorCode::Cancelled,
-            c_string("operation cancelled"),
-        );
+        completion.fail(IrohOperationErrorCode::Cancelled, "operation cancelled");
         return;
     }
 
-    let userdata = callback.userdata as usize;
-    let on_success = callback.on_success;
-    let on_failure = callback.on_failure;
-    spawn_thread_or_inline("iroh-node-create", move || {
-        let userdata = userdata as *mut c_void;
-        match IrohNode::new_with_options_cancellable(
+    spawn_thread_or_inline(
+        "iroh-node-create",
+        move || match IrohNode::new_with_options_cancellable(
             storage_path,
             relay_enabled,
             custom_relay_url,
@@ -1735,14 +1713,14 @@ pub unsafe extern "C" fn iroh_node_create_async(
             Ok(node) => {
                 let boxed = Box::new(node);
                 let handle = Box::into_raw(boxed) as *mut IrohNodeHandle;
-                (on_success)(userdata, handle);
+                completion.succeed(handle);
             }
             Err(e) => {
                 let (code, _) = operation_error_code(&e);
-                (on_failure)(userdata, code, c_string(e.to_string()));
+                completion.fail(code, e.to_string());
             }
-        }
-    });
+        },
+    );
 }
 
 /// Add bytes to the blob store asynchronously with optional timeout and cancellation.
@@ -2241,6 +2219,90 @@ fn ffi_node_info(info: crate::node::NodeInfo) -> IrohNodeInfo {
         is_connected: info.is_connected,
         direct_addrs,
         dht_active: info.dht_active,
+    }
+}
+
+/// Drop-guard completion for `IrohNodeCreateCallback`.
+struct NodeCreateCompletion {
+    userdata: usize,
+    on_success: extern "C" fn(userdata: *mut c_void, handle: *mut IrohNodeHandle),
+    on_failure: extern "C" fn(userdata: *mut c_void, error: *const c_char),
+    done: bool,
+}
+
+impl NodeCreateCompletion {
+    fn new(callback: IrohNodeCreateCallback) -> Self {
+        Self {
+            userdata: callback.userdata as usize,
+            on_success: callback.on_success,
+            on_failure: callback.on_failure,
+            done: false,
+        }
+    }
+
+    fn succeed(mut self, handle: *mut IrohNodeHandle) {
+        self.done = true;
+        (self.on_success)(self.userdata as *mut c_void, handle);
+    }
+
+    fn fail(mut self, message: impl Into<String>) {
+        self.done = true;
+        (self.on_failure)(self.userdata as *mut c_void, c_string(message.into()));
+    }
+}
+
+impl Drop for NodeCreateCompletion {
+    fn drop(&mut self) {
+        if !self.done {
+            self.done = true;
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                c_string("node creation aborted".to_string()),
+            );
+        }
+    }
+}
+
+/// Drop-guard completion for `IrohNodeCreateAsyncCallback`.
+struct NodeCreateAsyncCompletion {
+    userdata: usize,
+    on_success: extern "C" fn(userdata: *mut c_void, handle: *mut IrohNodeHandle),
+    on_failure:
+        extern "C" fn(userdata: *mut c_void, code: IrohOperationErrorCode, error: *const c_char),
+    done: bool,
+}
+
+impl NodeCreateAsyncCompletion {
+    fn new(callback: IrohNodeCreateAsyncCallback) -> Self {
+        Self {
+            userdata: callback.userdata as usize,
+            on_success: callback.on_success,
+            on_failure: callback.on_failure,
+            done: false,
+        }
+    }
+
+    fn succeed(mut self, handle: *mut IrohNodeHandle) {
+        self.done = true;
+        (self.on_success)(self.userdata as *mut c_void, handle);
+    }
+
+    fn fail(mut self, code: IrohOperationErrorCode, message: impl Into<String>) {
+        self.done = true;
+        (self.on_failure)(self.userdata as *mut c_void, code, c_string(message.into()));
+    }
+}
+
+impl Drop for NodeCreateAsyncCompletion {
+    fn drop(&mut self) {
+        if !self.done {
+            self.done = true;
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                IrohOperationErrorCode::Failed,
+                c_string("node creation aborted".to_string()),
+            );
+        }
     }
 }
 

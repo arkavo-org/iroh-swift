@@ -832,28 +832,25 @@ async fn get_bytes_on_connection(
                     BaoContentItem::Leaf(leaf) => {
                         let len = leaf.data.len() as u64;
                         let leaf_end = leaf.offset.saturating_add(len);
+                        if leaf.offset != downloaded {
+                            return Err(anyhow::anyhow!(
+                                "Unexpected non-sequential blob leaf offset {} (expected {})",
+                                leaf.offset,
+                                downloaded
+                            )
+                            .into());
+                        }
                         if leaf_end > size {
                             return Err(anyhow::anyhow!(
                                 "Remote sent data past the announced size ({leaf_end} > {size})"
                             )
                             .into());
                         }
-                        downloaded += len;
+                        downloaded = downloaded.saturating_add(len);
                         if downloaded > max_size {
                             return Err(OperationError::SizeLimitExceeded(downloaded));
                         }
-                        if leaf.offset == buf.len() as u64 {
-                            buf.extend_from_slice(&leaf.data);
-                        } else {
-                            let start = usize::try_from(leaf.offset)
-                                .map_err(|_| OperationError::SizeLimitExceeded(leaf_end))?;
-                            let end = usize::try_from(leaf_end)
-                                .map_err(|_| OperationError::SizeLimitExceeded(leaf_end))?;
-                            if buf.len() < end {
-                                buf.resize(end, 0);
-                            }
-                            buf[start..end].copy_from_slice(&leaf.data);
-                        }
+                        buf.extend_from_slice(&leaf.data);
 
                         if downloaded == size || downloaded - reported >= FETCH_PROGRESS_STEP {
                             on_progress(downloaded, size);

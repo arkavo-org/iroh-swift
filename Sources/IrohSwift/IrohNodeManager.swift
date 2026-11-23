@@ -60,7 +60,6 @@ public final class IrohNodeManager: Sendable {
     private static var nextCleanupId: UInt64 = 0
 
     @MainActor
-    @ObservationIgnored
     private var activeDownloadCount: Int = 0
 
     @MainActor
