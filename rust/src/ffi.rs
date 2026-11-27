@@ -251,26 +251,27 @@ pub extern "C" fn iroh_node_create(config: IrohNodeConfig, callback: IrohNodeCre
             let Some(completion) = slot.take() else {
                 return;
             };
-            spawn_thread_or_inline(
-                "iroh-node-create",
-                move || match IrohNode::new_with_options(
-                    storage_path,
-                    relay_enabled,
-                    custom_relay_url,
-                    serves_blobs,
-                    accepts_pushes,
-                    options,
-                ) {
-                    Ok(node) => {
-                        let boxed = Box::new(node);
-                        let handle = Box::into_raw(boxed) as *mut IrohNodeHandle;
-                        completion.succeed(handle);
+            spawn_thread_or_inline("iroh-node-create", move || {
+                ffi_catch_completion("iroh_node_create", completion, |slot| {
+                    match IrohNode::new_with_options(
+                        storage_path,
+                        relay_enabled,
+                        custom_relay_url,
+                        serves_blobs,
+                        accepts_pushes,
+                        options,
+                    ) {
+                        Ok(node) => {
+                            let boxed = Box::new(node);
+                            let handle = Box::into_raw(boxed) as *mut IrohNodeHandle;
+                            slot.finish(|c| c.succeed(handle));
+                        }
+                        Err(e) => {
+                            slot.finish(|c| c.fail(format!("{:#}", e)));
+                        }
                     }
-                    Err(e) => {
-                        completion.fail(format!("{:#}", e));
-                    }
-                },
-            );
+                });
+            });
         },
     );
 }
@@ -339,15 +340,19 @@ pub extern "C" fn iroh_put(
             return;
         };
         node.runtime().spawn(async move {
-            let result = crate::node::run_cancellable(
+            match CatchUnwindFuture(crate::node::run_cancellable(
                 crate::node::put_bytes(&endpoint, &store, &data, 0),
                 &cancel,
                 &shutdown,
-            )
-            .await;
-            match result {
-                Ok(ticket) => completion.succeed(ticket),
-                Err(e) => completion.fail(e.to_string()),
+            ))
+            .await
+            {
+                Ok(Ok(ticket)) => completion.succeed(ticket),
+                Ok(Err(e)) => completion.fail(e.to_string()),
+                Err(payload) => {
+                    log_panic("iroh_put", payload);
+                    completion.fail_panic();
+                }
             }
         });
     });
@@ -396,7 +401,7 @@ pub unsafe extern "C" fn iroh_get(
             return;
         };
         node.runtime().spawn(async move {
-            let result = crate::node::run_cancellable(
+            match CatchUnwindFuture(crate::node::run_cancellable(
                 crate::node::get_from_ticket(
                     &endpoint,
                     &store,
@@ -409,11 +414,15 @@ pub unsafe extern "C" fn iroh_get(
                 ),
                 &cancel,
                 &shutdown,
-            )
-            .await;
-            match result {
-                Ok(bytes) => completion.succeed(bytes),
-                Err(e) => completion.fail(e.to_string()),
+            ))
+            .await
+            {
+                Ok(Ok(bytes)) => completion.succeed(bytes),
+                Ok(Err(e)) => completion.fail(e.to_string()),
+                Err(payload) => {
+                    log_panic("iroh_get", payload);
+                    completion.fail_panic();
+                }
             }
         });
     });
@@ -506,7 +515,7 @@ pub unsafe extern "C" fn iroh_get_with_progress(
                 return;
             };
             node.runtime().spawn(async move {
-                let result = crate::node::run_cancellable(
+                match CatchUnwindFuture(crate::node::run_cancellable(
                     crate::node::get_from_ticket(
                         &endpoint,
                         &store,
@@ -519,11 +528,15 @@ pub unsafe extern "C" fn iroh_get_with_progress(
                     ),
                     &cancel,
                     &shutdown,
-                )
-                .await;
-                match result {
-                    Ok(bytes) => completion.succeed(bytes),
-                    Err(e) => completion.fail(e.to_string()),
+                ))
+                .await
+                {
+                    Ok(Ok(bytes)) => completion.succeed(bytes),
+                    Ok(Err(e)) => completion.fail(e.to_string()),
+                    Err(payload) => {
+                        log_panic("iroh_get_with_progress", payload);
+                        completion.fail_panic();
+                    }
                 }
             });
         },
@@ -561,12 +574,21 @@ pub extern "C" fn iroh_node_info(handle: *const IrohNodeHandle, callback: IrohNo
                 return;
             };
             node.runtime().spawn(async move {
-                if shutdown.is_cancelled() {
-                    completion.fail("node shut down");
-                    return;
+                match CatchUnwindFuture(async {
+                    if shutdown.is_cancelled() {
+                        return Err("node shut down");
+                    }
+                    Ok(crate::node::node_info_from_endpoint(&endpoint, dht_active))
+                })
+                .await
+                {
+                    Ok(Ok(info)) => completion.succeed(info),
+                    Ok(Err(msg)) => completion.fail(msg),
+                    Err(payload) => {
+                        log_panic("iroh_node_info", payload);
+                        completion.fail_panic();
+                    }
                 }
-                let info = crate::node::node_info_from_endpoint(&endpoint, dht_active);
-                completion.succeed(info);
             });
         },
     );
@@ -597,13 +619,13 @@ pub unsafe extern "C" fn iroh_validate_ticket(
         match unsafe { CStr::from_ptr(ticket) }.to_str() {
             Ok(ticket_str) => match ticket_str.parse::<BlobTicket>() {
                 Ok(parsed) => {
-                    let hash_str = parsed.hash().to_string();
-                    let node_id_str = parsed.addr().id.to_string();
+                    let hash = to_c_string(parsed.hash().to_string());
+                    let node_id = to_c_string(parsed.addr().id.to_string());
                     let is_recursive = parsed.recursive();
                     IrohTicketInfo {
                         is_valid: true,
-                        hash: c_string(hash_str),
-                        node_id: c_string(node_id_str),
+                        hash: hash.into_raw(),
+                        node_id: node_id.into_raw(),
                         is_recursive,
                     }
                 }
@@ -643,9 +665,13 @@ pub extern "C" fn iroh_node_close(handle: *mut IrohNodeHandle, callback: IrohClo
         let Some(completion) = slot.take() else {
             return;
         };
-        spawn_thread_or_inline("iroh-node-close", move || match node.shutdown() {
-            Ok(()) => completion.succeed(),
-            Err(e) => completion.fail(format!("{:#}", e)),
+        spawn_thread_or_inline("iroh-node-close", move || {
+            ffi_catch_completion("iroh_node_close", completion, |slot| {
+                match node.shutdown() {
+                    Ok(()) => slot.finish(VoidCompletion::succeed),
+                    Err(e) => slot.finish(|c| c.fail(format!("{:#}", e))),
+                }
+            });
         });
     });
 }
@@ -690,15 +716,19 @@ pub extern "C" fn iroh_put_with_options(
                 return;
             };
             node.runtime().spawn(async move {
-                let result = crate::node::run_cancellable(
+                match CatchUnwindFuture(crate::node::run_cancellable(
                     crate::node::put_bytes(&endpoint, &store, &data, timeout_ms),
                     &cancel,
                     &shutdown,
-                )
-                .await;
-                match result {
-                    Ok(ticket) => completion.succeed(ticket),
-                    Err(e) => completion.fail(e.to_string()),
+                ))
+                .await
+                {
+                    Ok(Ok(ticket)) => completion.succeed(ticket),
+                    Ok(Err(e)) => completion.fail(e.to_string()),
+                    Err(payload) => {
+                        log_panic("iroh_put_with_options", payload);
+                        completion.fail_panic();
+                    }
                 }
             });
         },
@@ -884,7 +914,7 @@ pub unsafe extern "C" fn iroh_get_with_options(
                 return;
             };
             node.runtime().spawn(async move {
-                let result = crate::node::run_cancellable(
+                match CatchUnwindFuture(crate::node::run_cancellable(
                     crate::node::get_from_ticket(
                         &endpoint,
                         &store,
@@ -897,11 +927,15 @@ pub unsafe extern "C" fn iroh_get_with_options(
                     ),
                     &cancel,
                     &shutdown,
-                )
-                .await;
-                match result {
-                    Ok(bytes) => completion.succeed(bytes),
-                    Err(e) => completion.fail(e.to_string()),
+                ))
+                .await
+                {
+                    Ok(Ok(bytes)) => completion.succeed(bytes),
+                    Ok(Err(e)) => completion.fail(e.to_string()),
+                    Err(payload) => {
+                        log_panic("iroh_get_with_options", payload);
+                        completion.fail_panic();
+                    }
                 }
             });
         },
@@ -972,7 +1006,7 @@ pub unsafe extern "C" fn iroh_blob_tag_set(
             return;
         };
         node.runtime().spawn(async move {
-            let result = crate::node::run_cancellable(
+            match CatchUnwindFuture(crate::node::run_cancellable(
                 async {
                     store
                         .tags()
@@ -982,11 +1016,15 @@ pub unsafe extern "C" fn iroh_blob_tag_set(
                 },
                 &cancel,
                 &shutdown,
-            )
-            .await;
-            match result {
-                Ok(()) => completion.succeed(),
-                Err(e) => completion.fail(e.to_string()),
+            ))
+            .await
+            {
+                Ok(Ok(())) => completion.succeed(),
+                Ok(Err(e)) => completion.fail(e.to_string()),
+                Err(payload) => {
+                    log_panic("iroh_blob_tag_set", payload);
+                    completion.fail_panic();
+                }
             }
         });
     });
@@ -1016,7 +1054,12 @@ pub unsafe extern "C" fn iroh_blob_ticket_create(
                 if handle.is_null() {
                     return Err("handle cannot be null".to_string());
                 }
-                let hash_string = unsafe { required_str(hash_str, "hash_str") }?;
+                if hash_str.is_null() {
+                    return Err("hash_str cannot be null".to_string());
+                }
+                let hash_string = unsafe { CStr::from_ptr(hash_str) }
+                    .to_str()
+                    .map_err(|e| format!("Invalid hash UTF-8: {}", e))?;
                 parse_hash_str(hash_string)
             })() {
                 Ok(h) => h,
@@ -1085,7 +1128,7 @@ pub unsafe extern "C" fn iroh_blob_tag_delete(
                 return;
             };
             node.runtime().spawn(async move {
-                let result = crate::node::run_cancellable(
+                match CatchUnwindFuture(crate::node::run_cancellable(
                     async {
                         store
                             .tags()
@@ -1096,11 +1139,15 @@ pub unsafe extern "C" fn iroh_blob_tag_delete(
                     },
                     &cancel,
                     &shutdown,
-                )
-                .await;
-                match result {
-                    Ok(()) => completion.succeed(),
-                    Err(e) => completion.fail(e.to_string()),
+                ))
+                .await
+                {
+                    Ok(Ok(())) => completion.succeed(),
+                    Ok(Err(e)) => completion.fail(e.to_string()),
+                    Err(payload) => {
+                        log_panic("iroh_blob_tag_delete", payload);
+                        completion.fail_panic();
+                    }
                 }
             });
         },
@@ -1366,7 +1413,7 @@ pub unsafe extern "C" fn iroh_fetch_from_node(
         node.runtime().spawn(async move {
             // Hostnames are resolved inside the cancellable future, so a cancel or
             // a node shutdown also ends a slow DNS lookup.
-            let result = crate::node::run_cancellable(
+            match CatchUnwindFuture(crate::node::run_cancellable(
                 async {
                     let remote = resolver.resolve_target(target).await?;
                     crate::node::fetch_to_path(
@@ -1382,13 +1429,17 @@ pub unsafe extern "C" fn iroh_fetch_from_node(
                 },
                 &token,
                 &shutdown,
-            )
-            .await;
-            match result {
-                Ok(size) => completion.succeed(size),
-                Err(e) => {
+            ))
+            .await
+            {
+                Ok(Ok(size)) => completion.succeed(size),
+                Ok(Err(e)) => {
                     let (code, size) = operation_error_code(&e);
                     completion.fail(code, size, e.to_string());
+                }
+                Err(payload) => {
+                    log_panic("iroh_fetch_from_node", payload);
+                    completion.fail_panic();
                 }
             }
         });
@@ -1467,28 +1518,29 @@ pub unsafe extern "C" fn iroh_push_file_to_node(
             return;
         };
         node.runtime().spawn(async move {
-            let result = crate::node::run_cancellable(
-                async {
-                    let remote = resolver.resolve_target(target).await?;
-                    crate::node::push_path_transfer(&endpoint, &store, &path, remote).await
-                },
-                &token,
-                &shutdown,
-            )
-            .await;
-            match result {
-                Ok((hash, conn)) => {
-                    match crate::node::await_push_grace(conn, Some(&token), Some(&shutdown)).await {
-                        Ok(()) => completion.succeed(hash.to_hex().to_string()),
-                        Err(e) => {
-                            let (code, _) = operation_error_code(&e);
-                            completion.fail(code, e.to_string());
-                        }
-                    }
-                }
-                Err(e) => {
+            match CatchUnwindFuture(async {
+                let (hash, conn) = crate::node::run_cancellable(
+                    async {
+                        let remote = resolver.resolve_target(target).await?;
+                        crate::node::push_path_transfer(&endpoint, &store, &path, remote).await
+                    },
+                    &token,
+                    &shutdown,
+                )
+                .await?;
+                crate::node::await_push_grace(conn, Some(&token), Some(&shutdown)).await?;
+                Ok::<_, crate::node::OperationError>(hash.to_hex().to_string())
+            })
+            .await
+            {
+                Ok(Ok(hash_hex)) => completion.succeed(hash_hex),
+                Ok(Err(e)) => {
                     let (code, _) = operation_error_code(&e);
                     completion.fail(code, e.to_string());
+                }
+                Err(payload) => {
+                    log_panic("iroh_push_file_to_node", payload);
+                    completion.fail_panic();
                 }
             }
         });
@@ -1570,27 +1622,28 @@ pub unsafe extern "C" fn iroh_push_bytes_to_node(
             return;
         };
         node.runtime().spawn(async move {
-            let result = crate::node::run_cancellable(
-                crate::node::push_bytes_transfer(
-                    &endpoint, &store, &resolver, target, &data, timeout_ms,
-                ),
-                &token,
-                &shutdown,
-            )
-            .await;
-            match result {
-                Ok((hash, conn)) => {
-                    match crate::node::await_push_grace(conn, Some(&token), Some(&shutdown)).await {
-                        Ok(()) => completion.succeed(hash.to_hex().to_string()),
-                        Err(e) => {
-                            let (code, _) = operation_error_code(&e);
-                            completion.fail(code, e.to_string());
-                        }
-                    }
-                }
-                Err(e) => {
+            match CatchUnwindFuture(async {
+                let (hash, conn) = crate::node::run_cancellable(
+                    crate::node::push_bytes_transfer(
+                        &endpoint, &store, &resolver, target, &data, timeout_ms,
+                    ),
+                    &token,
+                    &shutdown,
+                )
+                .await?;
+                crate::node::await_push_grace(conn, Some(&token), Some(&shutdown)).await?;
+                Ok::<_, crate::node::OperationError>(hash.to_hex().to_string())
+            })
+            .await
+            {
+                Ok(Ok(hash_hex)) => completion.succeed(hash_hex),
+                Ok(Err(e)) => {
                     let (code, _) = operation_error_code(&e);
                     completion.fail(code, e.to_string());
+                }
+                Err(payload) => {
+                    log_panic("iroh_push_bytes_to_node", payload);
+                    completion.fail_panic();
                 }
             }
         });
@@ -1710,25 +1763,27 @@ pub unsafe extern "C" fn iroh_node_create_async(
                 return;
             };
             spawn_thread_or_inline("iroh-node-create", move || {
-                match IrohNode::new_with_options_cancellable(
-                    storage_path,
-                    relay_enabled,
-                    custom_relay_url,
-                    serves_blobs,
-                    accepts_pushes,
-                    options,
-                    &token,
-                ) {
-                    Ok(node) => {
-                        let boxed = Box::new(node);
-                        let handle = Box::into_raw(boxed) as *mut IrohNodeHandle;
-                        completion.succeed(handle);
+                ffi_catch_completion("iroh_node_create_async", completion, |slot| {
+                    match IrohNode::new_with_options_cancellable(
+                        storage_path,
+                        relay_enabled,
+                        custom_relay_url,
+                        serves_blobs,
+                        accepts_pushes,
+                        options,
+                        &token,
+                    ) {
+                        Ok(node) => {
+                            let boxed = Box::new(node);
+                            let handle = Box::into_raw(boxed) as *mut IrohNodeHandle;
+                            slot.finish(|c| c.succeed(handle));
+                        }
+                        Err(e) => {
+                            let (code, _) = operation_error_code(&e);
+                            slot.finish(|c| c.fail(code, e.to_string()));
+                        }
                     }
-                    Err(e) => {
-                        let (code, _) = operation_error_code(&e);
-                        completion.fail(code, e.to_string());
-                    }
-                }
+                });
             });
         },
     );
@@ -1779,17 +1834,21 @@ pub unsafe extern "C" fn iroh_put_async(
             return;
         };
         node.runtime().spawn(async move {
-            let result = crate::node::run_cancellable(
+            match CatchUnwindFuture(crate::node::run_cancellable(
                 crate::node::put_bytes(&endpoint, &store, &data, timeout_ms),
                 &token,
                 &shutdown,
-            )
-            .await;
-            match result {
-                Ok(ticket) => completion.succeed(ticket),
-                Err(e) => {
+            ))
+            .await
+            {
+                Ok(Ok(ticket)) => completion.succeed(ticket),
+                Ok(Err(e)) => {
                     let (code, _) = operation_error_code(&e);
                     completion.fail(code, e.to_string());
+                }
+                Err(payload) => {
+                    log_panic("iroh_put_async", payload);
+                    completion.fail_panic();
                 }
             }
         });
@@ -1852,7 +1911,7 @@ pub unsafe extern "C" fn iroh_get_async(
             return;
         };
         node.runtime().spawn(async move {
-            let result = crate::node::run_cancellable(
+            match CatchUnwindFuture(crate::node::run_cancellable(
                 crate::node::get_from_ticket(
                     &endpoint,
                     &store,
@@ -1865,13 +1924,17 @@ pub unsafe extern "C" fn iroh_get_async(
                 ),
                 &token,
                 &shutdown,
-            )
-            .await;
-            match result {
-                Ok(bytes) => completion.succeed(bytes),
-                Err(e) => {
+            ))
+            .await
+            {
+                Ok(Ok(bytes)) => completion.succeed(bytes),
+                Ok(Err(e)) => {
                     let (code, size) = operation_error_code(&e);
                     completion.fail(code, size, e.to_string());
+                }
+                Err(payload) => {
+                    log_panic("iroh_get_async", payload);
+                    completion.fail_panic();
                 }
             }
         });
@@ -1942,7 +2005,7 @@ pub unsafe extern "C" fn iroh_blob_tag_set_async(
             return;
         };
         node.runtime().spawn(async move {
-            let result = crate::node::run_cancellable(
+            match CatchUnwindFuture(crate::node::run_cancellable(
                 async {
                     store
                         .tags()
@@ -1952,13 +2015,17 @@ pub unsafe extern "C" fn iroh_blob_tag_set_async(
                 },
                 &token,
                 &shutdown,
-            )
-            .await;
-            match result {
-                Ok(()) => completion.succeed(),
-                Err(e) => {
+            ))
+            .await
+            {
+                Ok(Ok(())) => completion.succeed(),
+                Ok(Err(e)) => {
                     let (code, _) = operation_error_code(&e);
                     completion.fail(code, e.to_string());
+                }
+                Err(payload) => {
+                    log_panic("iroh_blob_tag_set_async", payload);
+                    completion.fail_panic();
                 }
             }
         });
@@ -2013,7 +2080,7 @@ pub unsafe extern "C" fn iroh_blob_tag_delete_async(
             return;
         };
         node.runtime().spawn(async move {
-            let result = crate::node::run_cancellable(
+            match CatchUnwindFuture(crate::node::run_cancellable(
                 async {
                     store
                         .tags()
@@ -2024,13 +2091,17 @@ pub unsafe extern "C" fn iroh_blob_tag_delete_async(
                 },
                 &token,
                 &shutdown,
-            )
-            .await;
-            match result {
-                Ok(()) => completion.succeed(),
-                Err(e) => {
+            ))
+            .await
+            {
+                Ok(Ok(())) => completion.succeed(),
+                Ok(Err(e)) => {
                     let (code, _) = operation_error_code(&e);
                     completion.fail(code, e.to_string());
+                }
+                Err(payload) => {
+                    log_panic("iroh_blob_tag_delete_async", payload);
+                    completion.fail_panic();
                 }
             }
         });
@@ -2076,17 +2147,21 @@ pub unsafe extern "C" fn iroh_node_info_async(
             return;
         };
         node.runtime().spawn(async move {
-            let result = crate::node::run_cancellable(
+            match CatchUnwindFuture(crate::node::run_cancellable(
                 async { Ok(crate::node::node_info_from_endpoint(&endpoint, dht_active)) },
                 &token,
                 &shutdown,
-            )
-            .await;
-            match result {
-                Ok(info) => completion.succeed(info),
-                Err(e) => {
+            ))
+            .await
+            {
+                Ok(Ok(info)) => completion.succeed(info),
+                Ok(Err(e)) => {
                     let (code, _) = operation_error_code(&e);
                     completion.fail(code, e.to_string());
+                }
+                Err(payload) => {
+                    log_panic("iroh_node_info_async", payload);
+                    completion.fail_panic();
                 }
             }
         });
@@ -2097,14 +2172,16 @@ pub unsafe extern "C" fn iroh_node_info_async(
 // Panic Boundary Helpers
 // ============================================================================
 
-/// Extract a human-readable message from a caught panic payload.
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        format!("internal panic: {s}")
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        format!("internal panic: {s}")
-    } else {
-        "internal panic".to_string()
+const INTERNAL_PANIC_MESSAGE: &str = "internal panic";
+
+/// Log a caught panic without exposing raw panic payloads (which may contain
+/// paths, tickets, or node IDs) across the FFI boundary.
+fn log_panic(export: &'static str, payload: Box<dyn std::any::Any + Send>) {
+    tracing::error!(export, "{INTERNAL_PANIC_MESSAGE}");
+    if let Some(detail) = payload.downcast_ref::<&str>() {
+        tracing::debug!(export, detail, "panic payload");
+    } else if let Some(detail) = payload.downcast_ref::<String>() {
+        tracing::debug!(export, detail = %detail, "panic payload");
     }
 }
 
@@ -2113,17 +2190,40 @@ fn ffi_catch_or<T>(export: &'static str, fallback: T, f: impl FnOnce() -> T) -> 
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(value) => value,
         Err(payload) => {
-            let msg = panic_message(payload);
-            tracing::error!(export, "{msg}");
+            log_panic(export, payload);
             fallback
         }
     }
 }
 
+/// Future wrapper that catches panics thrown during `Future::poll` so a task
+/// can explicitly report `Failed` / `"internal panic"` instead of letting the
+/// completion guard's `Drop` (which reports `NodeShutDown`) conflate task panics
+/// with runtime shutdown.
+struct CatchUnwindFuture<F>(F);
+
+impl<F: std::future::Future> std::future::Future for CatchUnwindFuture<F> {
+    type Output = Result<F::Output, Box<dyn std::any::Any + Send>>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // SAFETY: structural projection; `self` is never moved out of.
+        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(std::task::Poll::Ready(val)) => std::task::Poll::Ready(Ok(val)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(payload) => std::task::Poll::Ready(Err(payload)),
+        }
+    }
+}
+
 /// Trait implemented by every FFI completion drop-guard so `ffi_catch_completion`
-/// can report a caught panic through the export's exact failure path.
+/// and `CatchUnwindFuture` can report a caught panic through the export's exact
+/// failure path with a fixed `"internal panic"` message.
 trait FailOnPanic {
-    fn fail_panic(self, message: String);
+    fn fail_panic(self);
 }
 
 /// Owns a completion guard inside `ffi_catch_completion` so it is consumed at
@@ -2145,10 +2245,11 @@ impl<C> CompletionSlot<C> {
 
 /// Run the body of a callback-based `extern "C"` export inside `catch_unwind`.
 ///
-/// If the body panics before taking the completion guard from `slot`, the panic
-/// payload is reported through `C::fail_panic` exactly once. If the guard was
-/// already consumed (callback already invoked or moved to a spawned worker), a
-/// subsequent panic is caught and logged without invoking the callback again.
+/// If the body panics before taking the completion guard from `slot`, a fixed
+/// `"internal panic"` failure is reported through `C::fail_panic` exactly once.
+/// If the guard was already consumed (callback already invoked or moved to a
+/// spawned worker), a subsequent panic is caught and logged without invoking
+/// the callback again.
 fn ffi_catch_completion<C: FailOnPanic>(
     export: &'static str,
     completion: C,
@@ -2158,10 +2259,9 @@ fn ffi_catch_completion<C: FailOnPanic>(
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         f(&mut slot);
     })) {
-        let msg = panic_message(payload);
-        tracing::error!(export, "{msg}");
+        log_panic(export, payload);
         if let Some(completion) = slot.take() {
-            completion.fail_panic(msg);
+            completion.fail_panic();
         }
     }
 }
@@ -2169,8 +2269,7 @@ fn ffi_catch_completion<C: FailOnPanic>(
 /// Delivers the outcome of a fetch to its callback exactly once.
 ///
 /// If the task is dropped before completing (the runtime shut down), `Drop`
-/// reports `NodeShutDown`, or `Failed` if unwinding from a panic, so the Swift
-/// continuation is always resumed.
+/// reports `NodeShutDown`, so the Swift continuation is always resumed.
 struct FetchCompletion {
     userdata: usize,
     on_progress: Option<extern "C" fn(userdata: *mut c_void, downloaded: u64, total: u64)>,
@@ -2204,8 +2303,8 @@ impl FetchCompletion {
 }
 
 impl FailOnPanic for FetchCompletion {
-    fn fail_panic(self, message: String) {
-        self.fail(IrohOperationErrorCode::Failed, 0, message);
+    fn fail_panic(self) {
+        self.fail(IrohOperationErrorCode::Failed, 0, INTERNAL_PANIC_MESSAGE);
     }
 }
 
@@ -2213,12 +2312,12 @@ impl Drop for FetchCompletion {
     fn drop(&mut self) {
         if !self.done {
             self.done = true;
-            let (code, msg) = if std::thread::panicking() {
-                (IrohOperationErrorCode::Failed, "internal panic")
-            } else {
-                (IrohOperationErrorCode::NodeShutDown, "node shut down")
-            };
-            (self.on_failure)(self.userdata as *mut c_void, code, 0, c_string(msg));
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                IrohOperationErrorCode::NodeShutDown,
+                0,
+                c_string("node shut down"),
+            );
         }
     }
 }
@@ -2247,8 +2346,8 @@ impl PushFileCompletion {
 }
 
 impl FailOnPanic for PushFileCompletion {
-    fn fail_panic(self, message: String) {
-        self.fail(IrohOperationErrorCode::Failed, message);
+    fn fail_panic(self) {
+        self.fail(IrohOperationErrorCode::Failed, INTERNAL_PANIC_MESSAGE);
     }
 }
 
@@ -2256,41 +2355,37 @@ impl Drop for PushFileCompletion {
     fn drop(&mut self) {
         if !self.done {
             self.done = true;
-            let (code, msg) = if std::thread::panicking() {
-                (IrohOperationErrorCode::Failed, "internal panic")
-            } else {
-                (IrohOperationErrorCode::NodeShutDown, "node shut down")
-            };
-            (self.on_failure)(self.userdata as *mut c_void, code, c_string(msg));
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                IrohOperationErrorCode::NodeShutDown,
+                c_string("node shut down"),
+            );
         }
     }
 }
 
 /// Spawn `f` on a named OS thread; if thread creation fails (e.g. thread
 /// exhaustion), execute `f` inline instead of panicking across `extern "C"`.
-fn spawn_thread_or_inline<F>(name: &str, f: F)
+fn spawn_thread_or_inline<F>(name: &'static str, f: F)
 where
     F: FnOnce() + Send + 'static,
 {
     let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(f)));
     let thread_slot = std::sync::Arc::clone(&slot);
-    let thread_name = name.to_string();
     let spawned = std::thread::Builder::new()
-        .name(thread_name.clone())
+        .name(name.to_string())
         .spawn(move || {
             if let Some(work) = thread_slot.lock().unwrap_or_else(|e| e.into_inner()).take()
                 && let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
             {
-                let msg = panic_message(payload);
-                tracing::error!(thread = %thread_name, "{msg}");
+                log_panic(name, payload);
             }
         });
     if spawned.is_err()
         && let Some(work) = slot.lock().unwrap_or_else(|e| e.into_inner()).take()
         && let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
     {
-        let msg = panic_message(payload);
-        tracing::error!(thread = name, "{msg}");
+        log_panic(name, payload);
     }
 }
 
@@ -2380,8 +2475,8 @@ impl NodeCreateCompletion {
 }
 
 impl FailOnPanic for NodeCreateCompletion {
-    fn fail_panic(self, message: String) {
-        self.fail(message);
+    fn fail_panic(self) {
+        self.fail(INTERNAL_PANIC_MESSAGE);
     }
 }
 
@@ -2389,12 +2484,10 @@ impl Drop for NodeCreateCompletion {
     fn drop(&mut self) {
         if !self.done {
             self.done = true;
-            let msg = if std::thread::panicking() {
-                "internal panic"
-            } else {
-                "node creation aborted"
-            };
-            (self.on_failure)(self.userdata as *mut c_void, c_string(msg));
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                c_string("node creation aborted"),
+            );
         }
     }
 }
@@ -2431,8 +2524,8 @@ impl NodeCreateAsyncCompletion {
 }
 
 impl FailOnPanic for NodeCreateAsyncCompletion {
-    fn fail_panic(self, message: String) {
-        self.fail(IrohOperationErrorCode::Failed, message);
+    fn fail_panic(self) {
+        self.fail(IrohOperationErrorCode::Failed, INTERNAL_PANIC_MESSAGE);
     }
 }
 
@@ -2440,15 +2533,10 @@ impl Drop for NodeCreateAsyncCompletion {
     fn drop(&mut self) {
         if !self.done {
             self.done = true;
-            let msg = if std::thread::panicking() {
-                "internal panic"
-            } else {
-                "node creation aborted"
-            };
             (self.on_failure)(
                 self.userdata as *mut c_void,
                 IrohOperationErrorCode::Failed,
-                c_string(msg),
+                c_string("node creation aborted"),
             );
         }
     }
@@ -2486,8 +2574,8 @@ impl StringCompletion {
 }
 
 impl FailOnPanic for StringCompletion {
-    fn fail_panic(self, message: String) {
-        self.fail(message);
+    fn fail_panic(self) {
+        self.fail(INTERNAL_PANIC_MESSAGE);
     }
 }
 
@@ -2495,12 +2583,7 @@ impl Drop for StringCompletion {
     fn drop(&mut self) {
         if !self.done {
             self.done = true;
-            let msg = if std::thread::panicking() {
-                "internal panic"
-            } else {
-                "node shut down"
-            };
-            (self.on_failure)(self.userdata as *mut c_void, c_string(msg));
+            (self.on_failure)(self.userdata as *mut c_void, c_string("node shut down"));
         }
     }
 }
@@ -2558,8 +2641,8 @@ impl BytesCompletion {
 }
 
 impl FailOnPanic for BytesCompletion {
-    fn fail_panic(self, message: String) {
-        self.fail(message);
+    fn fail_panic(self) {
+        self.fail(INTERNAL_PANIC_MESSAGE);
     }
 }
 
@@ -2567,12 +2650,7 @@ impl Drop for BytesCompletion {
     fn drop(&mut self) {
         if !self.done {
             self.done = true;
-            let msg = if std::thread::panicking() {
-                "internal panic"
-            } else {
-                "node shut down"
-            };
-            (self.on_failure)(self.userdata as *mut c_void, c_string(msg));
+            (self.on_failure)(self.userdata as *mut c_void, c_string("node shut down"));
         }
     }
 }
@@ -2608,8 +2686,8 @@ impl VoidCompletion {
 }
 
 impl FailOnPanic for VoidCompletion {
-    fn fail_panic(self, message: String) {
-        self.fail(message);
+    fn fail_panic(self) {
+        self.fail(INTERNAL_PANIC_MESSAGE);
     }
 }
 
@@ -2617,12 +2695,7 @@ impl Drop for VoidCompletion {
     fn drop(&mut self) {
         if !self.done {
             self.done = true;
-            let msg = if std::thread::panicking() {
-                "internal panic"
-            } else {
-                "node shut down"
-            };
-            (self.on_failure)(self.userdata as *mut c_void, c_string(msg));
+            (self.on_failure)(self.userdata as *mut c_void, c_string("node shut down"));
         }
     }
 }
@@ -2659,8 +2732,8 @@ impl NodeInfoCompletion {
 }
 
 impl FailOnPanic for NodeInfoCompletion {
-    fn fail_panic(self, message: String) {
-        self.fail(message);
+    fn fail_panic(self) {
+        self.fail(INTERNAL_PANIC_MESSAGE);
     }
 }
 
@@ -2668,12 +2741,7 @@ impl Drop for NodeInfoCompletion {
     fn drop(&mut self) {
         if !self.done {
             self.done = true;
-            let msg = if std::thread::panicking() {
-                "internal panic"
-            } else {
-                "node shut down"
-            };
-            (self.on_failure)(self.userdata as *mut c_void, c_string(msg));
+            (self.on_failure)(self.userdata as *mut c_void, c_string("node shut down"));
         }
     }
 }
@@ -2702,8 +2770,8 @@ impl OperationStringCompletion {
 }
 
 impl FailOnPanic for OperationStringCompletion {
-    fn fail_panic(self, message: String) {
-        self.fail(IrohOperationErrorCode::Failed, message);
+    fn fail_panic(self) {
+        self.fail(IrohOperationErrorCode::Failed, INTERNAL_PANIC_MESSAGE);
     }
 }
 
@@ -2711,12 +2779,11 @@ impl Drop for OperationStringCompletion {
     fn drop(&mut self) {
         if !self.done {
             self.done = true;
-            let (code, msg) = if std::thread::panicking() {
-                (IrohOperationErrorCode::Failed, "internal panic")
-            } else {
-                (IrohOperationErrorCode::NodeShutDown, "node shut down")
-            };
-            (self.on_failure)(self.userdata as *mut c_void, code, c_string(msg));
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                IrohOperationErrorCode::NodeShutDown,
+                c_string("node shut down"),
+            );
         }
     }
 }
@@ -2744,8 +2811,8 @@ impl VoidOperationCompletion {
 }
 
 impl FailOnPanic for VoidOperationCompletion {
-    fn fail_panic(self, message: String) {
-        self.fail(IrohOperationErrorCode::Failed, message);
+    fn fail_panic(self) {
+        self.fail(IrohOperationErrorCode::Failed, INTERNAL_PANIC_MESSAGE);
     }
 }
 
@@ -2753,12 +2820,11 @@ impl Drop for VoidOperationCompletion {
     fn drop(&mut self) {
         if !self.done {
             self.done = true;
-            let (code, msg) = if std::thread::panicking() {
-                (IrohOperationErrorCode::Failed, "internal panic")
-            } else {
-                (IrohOperationErrorCode::NodeShutDown, "node shut down")
-            };
-            (self.on_failure)(self.userdata as *mut c_void, code, c_string(msg));
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                IrohOperationErrorCode::NodeShutDown,
+                c_string("node shut down"),
+            );
         }
     }
 }
@@ -2798,8 +2864,8 @@ impl GetAsyncCompletion {
 }
 
 impl FailOnPanic for GetAsyncCompletion {
-    fn fail_panic(self, message: String) {
-        self.fail(IrohOperationErrorCode::Failed, 0, message);
+    fn fail_panic(self) {
+        self.fail(IrohOperationErrorCode::Failed, 0, INTERNAL_PANIC_MESSAGE);
     }
 }
 
@@ -2807,12 +2873,12 @@ impl Drop for GetAsyncCompletion {
     fn drop(&mut self) {
         if !self.done {
             self.done = true;
-            let (code, msg) = if std::thread::panicking() {
-                (IrohOperationErrorCode::Failed, "internal panic")
-            } else {
-                (IrohOperationErrorCode::NodeShutDown, "node shut down")
-            };
-            (self.on_failure)(self.userdata as *mut c_void, code, 0, c_string(msg));
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                IrohOperationErrorCode::NodeShutDown,
+                0,
+                c_string("node shut down"),
+            );
         }
     }
 }
@@ -2841,8 +2907,8 @@ impl NodeInfoAsyncCompletion {
 }
 
 impl FailOnPanic for NodeInfoAsyncCompletion {
-    fn fail_panic(self, message: String) {
-        self.fail(IrohOperationErrorCode::Failed, message);
+    fn fail_panic(self) {
+        self.fail(IrohOperationErrorCode::Failed, INTERNAL_PANIC_MESSAGE);
     }
 }
 
@@ -2850,12 +2916,11 @@ impl Drop for NodeInfoAsyncCompletion {
     fn drop(&mut self) {
         if !self.done {
             self.done = true;
-            let (code, msg) = if std::thread::panicking() {
-                (IrohOperationErrorCode::Failed, "internal panic")
-            } else {
-                (IrohOperationErrorCode::NodeShutDown, "node shut down")
-            };
-            (self.on_failure)(self.userdata as *mut c_void, code, c_string(msg));
+            (self.on_failure)(
+                self.userdata as *mut c_void,
+                IrohOperationErrorCode::NodeShutDown,
+                c_string("node shut down"),
+            );
         }
     }
 }
@@ -2960,15 +3025,20 @@ unsafe fn borrowed_bytes<'a>(bytes: &IrohBytes) -> &'a [u8] {
     }
 }
 
-/// A C string for Swift to free with `iroh_string_free` (interior NULs are dropped).
-fn c_string(s: impl Into<String>) -> *mut c_char {
+/// Build a `CString` with interior NULs stripped (never panics on NUL).
+fn to_c_string(s: impl Into<String>) -> CString {
     let s: String = s.into();
     let s = if s.contains('\0') {
         s.replace('\0', "")
     } else {
         s
     };
-    CString::new(s).unwrap().into_raw()
+    CString::new(s).unwrap()
+}
+
+/// A C string for Swift to free with `iroh_string_free` (interior NULs are dropped).
+fn c_string(s: impl Into<String>) -> *mut c_char {
+    to_c_string(s).into_raw()
 }
 
 #[cfg(test)]
@@ -3380,7 +3450,8 @@ mod tests {
             rec.failures.lock().unwrap().push((None, msg));
         }
 
-        // 1. Panic before completing: on_failure fires once with panic message.
+        // 1. Panic before completing: on_failure fires once with fixed "internal panic"
+        // (never leaking the raw panic payload across FFI).
         let rec = Record {
             successes: AtomicUsize::new(0),
             failures: Mutex::new(Vec::new()),
@@ -3391,12 +3462,12 @@ mod tests {
             on_failure: on_str_err,
         };
         ffi_catch_completion("test_panic_before", StringCompletion::new(cb), |_slot| {
-            panic!("unexpected failure");
+            panic!("sensitive /secret/path");
         });
         assert_eq!(rec.successes.load(Ordering::SeqCst), 0);
         let failures = rec.failures.lock().unwrap();
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].1, "internal panic: unexpected failure");
+        assert_eq!(failures[0].1, "internal panic");
         drop(failures);
 
         // 2. Panic AFTER on_success already ran: callback is NOT invoked again.
@@ -3477,11 +3548,11 @@ mod tests {
         let failures4 = rec4.failures.lock().unwrap();
         assert_eq!(failures4.len(), 1);
         assert_eq!(failures4[0].0, Some(IrohOperationErrorCode::Failed));
-        assert_eq!(failures4[0].1, "internal panic: fetch exploded");
+        assert_eq!(failures4[0].1, "internal panic");
     }
 
     #[test]
-    fn test_completion_drop_distinguishes_panic_from_shutdown() {
+    fn test_async_and_worker_panics_vs_unrelated_unwind_drop() {
         use std::sync::mpsc;
 
         extern "C" fn on_ok(_: *mut c_void, _: *const c_char) {
@@ -3502,16 +3573,17 @@ mod tests {
             let _ = tx.send((code, msg));
         }
 
-        // Normal drop -> NodeShutDown.
+        // 1. Unrelated unwind dropping a guard still reports NodeShutDown (not internal panic).
         let (tx1, rx1) = mpsc::channel::<(IrohOperationErrorCode, String)>();
-        {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _c = OperationStringCompletion {
                 userdata: Box::into_raw(Box::new(tx1)) as usize,
                 on_success: on_ok,
                 on_failure: on_err,
                 done: false,
             };
-        }
+            panic!("unrelated outer unwind");
+        }));
         assert_eq!(
             rx1.recv().unwrap(),
             (
@@ -3520,7 +3592,10 @@ mod tests {
             )
         );
 
-        // Panicking drop (e.g. inside spawned thread or Tokio task) -> Failed + "internal panic".
+        // 2. Panic inside CatchUnwindFuture (spawned Tokio task) reports Failed + "internal panic".
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let (tx2, rx2) = mpsc::channel::<(IrohOperationErrorCode, String)>();
         let c2 = OperationStringCompletion {
             userdata: Box::into_raw(Box::new(tx2)) as usize,
@@ -3528,14 +3603,108 @@ mod tests {
             on_failure: on_err,
             done: false,
         };
-        spawn_thread_or_inline("iroh-test-panic-worker", move || {
-            let _guard = c2;
-            panic!("worker boom");
+        rt.block_on(async move {
+            match CatchUnwindFuture(async {
+                panic!("task boom");
+            })
+            .await
+            {
+                Ok(()) => c2.succeed("ok".to_string()),
+                Err(payload) => {
+                    log_panic("test_task", payload);
+                    c2.fail_panic();
+                }
+            }
         });
         assert_eq!(
-            rx2.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            rx2.recv().unwrap(),
             (IrohOperationErrorCode::Failed, "internal panic".to_string())
         );
+
+        // 3. Panic inside spawn_thread_or_inline worker using ffi_catch_completion reports Failed + "internal panic".
+        let (tx3, rx3) = mpsc::channel::<(IrohOperationErrorCode, String)>();
+        let c3 = OperationStringCompletion {
+            userdata: Box::into_raw(Box::new(tx3)) as usize,
+            on_success: on_ok,
+            on_failure: on_err,
+            done: false,
+        };
+        spawn_thread_or_inline("iroh-test-panic-worker", move || {
+            ffi_catch_completion("test_worker", c3, |_slot| {
+                panic!("worker boom");
+            });
+        });
+        assert_eq!(
+            rx3.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            (IrohOperationErrorCode::Failed, "internal panic".to_string())
+        );
+    }
+
+    /// Extract the slice between a `{` and its matching `}`, ignoring braces
+    /// inside string/char literals and `//` or `/* */` comments.
+    fn extract_brace_body(s: &str, open_brace: usize) -> &str {
+        let bytes = s.as_bytes();
+        let mut i = open_brace;
+        let mut depth = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                    i += 2;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i += 2;
+                }
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == b'\\' {
+                            i += 2;
+                        } else if bytes[i] == b'"' {
+                            i += 1;
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                b'\'' => {
+                    // Distinguish char literals ('x', '\n', '\0') from lifetimes ('a).
+                    if i + 2 < bytes.len() && bytes[i + 1] == b'\\' {
+                        i += 2;
+                        while i < bytes.len() && bytes[i] != b'\'' {
+                            i += 1;
+                        }
+                        i += 1;
+                    } else if i + 2 < bytes.len() && bytes[i + 2] == b'\'' {
+                        i += 3;
+                    } else {
+                        i += 1;
+                    }
+                }
+                b'{' => {
+                    depth += 1;
+                    i += 1;
+                }
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &s[open_brace + 1..i];
+                    }
+                    i += 1;
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+        panic!("unterminated brace block in ffi.rs");
     }
 
     /// Guardrail: every `pub [unsafe] extern "C" fn` export in `ffi.rs` must
@@ -3544,7 +3713,7 @@ mod tests {
     #[test]
     fn test_every_extern_c_export_catches_panics() {
         let src = include_str!("ffi.rs");
-        let prod_src = src.split("#[cfg(test)]").next().unwrap();
+        let prod_src = src.split("\nmod tests").next().unwrap();
         let mut exports = Vec::new();
         let mut search_from = 0;
 
@@ -3557,11 +3726,9 @@ mod tests {
                 let name_end = rest.find('(').unwrap();
                 let name = rest[..name_end].trim();
                 let body_open = rest.find('{').unwrap();
-                // Inspect the opening slice of the function body (up to the next export or 600 chars).
-                let body_start = &rest[body_open + 1..];
-                let window = &body_start[..body_start.len().min(600)];
+                let body = extract_brace_body(rest, body_open);
                 assert!(
-                    window.contains("ffi_catch_or(") || window.contains("ffi_catch_completion("),
+                    body.contains("ffi_catch_or(") || body.contains("ffi_catch_completion("),
                     "extern \"C\" export `{name}` must wrap its body in `ffi_catch_or` or `ffi_catch_completion`"
                 );
                 exports.push(name.to_string());
