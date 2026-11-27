@@ -21,6 +21,11 @@ echo "Releasing version: $VERSION"
 echo "Building XCFramework..."
 ./scripts/build-xcframework.sh
 
+# Regenerate third-party Rust crate license notices
+echo "Generating third-party licenses..."
+cargo fetch --locked --manifest-path rust/Cargo.toml
+./scripts/generate-third-party-licenses.sh
+
 # Create zip archive
 XCFRAMEWORK_PATH="IrohSwiftFFI.xcframework"
 ZIP_NAME="IrohSwiftFFI.xcframework.zip"
@@ -50,7 +55,7 @@ echo "  Checksum: $CHECKSUM"
 echo "  Artifact: $ZIP_NAME"
 echo ""
 echo "Next steps:"
-echo "  1. Commit the updated Package.swift"
+echo "  1. Commit the updated Package.swift (and THIRD-PARTY-LICENSES.md if changed)"
 echo "  2. Create a git tag: git tag v$VERSION"
 echo "  3. Push the tag: git push origin v$VERSION"
 echo "  4. Create a GitHub release and upload $ZIP_NAME"

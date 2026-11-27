@@ -355,4 +355,6 @@ existing `ip:port` addresses behave as before.
 
 ## License
 
-Apache-2.0 OR MIT
+Apache-2.0 OR MIT (`LICENSE-APACHE` and `LICENSE-MIT`).
+
+Third-party notices for the Rust crates statically linked into `IrohSwiftFFI.xcframework` are shipped in [`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md).

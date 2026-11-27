@@ -29,6 +29,10 @@ cd rust && cargo clippy --all-targets -- -D warnings
 # twin kept identical.
 cd rust && cbindgen --config cbindgen.toml --crate iroh-swift-ffi --output ../include/iroh_swift.h
 cp include/iroh_swift.h include/iroh_swift_ffi.h
+
+# Regenerate / verify third-party Rust crate notices (required whenever rust/Cargo.lock changes)
+./scripts/generate-third-party-licenses.sh
+./scripts/generate-third-party-licenses.sh --check
 ```
 
 ## Architecture
@@ -129,6 +133,8 @@ Swift Layer (IrohSwift)           Rust FFI Layer                Iroh Libraries
 - `Sources/IrohSwift/IrohNode+Fetch.swift`, `IrohNode+Push.swift`, `IrohNode+Identity.swift` - fetch-from-node, push, endpoint id / signing / BLAKE3
 - `Sources/IrohSwift/FFISupport.swift` - `CancelTokenBox` and C-string helpers
 - `scripts/build-xcframework.sh` - Builds static libs for all platforms into XCFramework
+- `scripts/generate-third-party-licenses.sh` - Generates/checks `THIRD-PARTY-LICENSES.md` from `rust/Cargo.lock` via `cargo-about` (`rust/about.toml`, `rust/about.hbs`)
+- `THIRD-PARTY-LICENSES.md` - Third-party notices for all Rust crates linked into `IrohSwiftFFI.xcframework`
 - `VERSION` - Single source of truth for version (sync with Cargo.toml and Package.swift)
 
 ## Version Management

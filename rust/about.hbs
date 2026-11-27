@@ -1,0 +1,39 @@
+# Third-Party Licenses
+
+`IrohSwiftFFI.xcframework` statically links third-party Rust crates for Apple
+platforms (`aarch64-apple-ios`, `aarch64-apple-ios-sim`, `x86_64-apple-ios`,
+`aarch64-apple-darwin`, and `x86_64-apple-darwin`).
+
+`iroh-swift` itself is dual-licensed under the MIT License (`LICENSE-MIT`) and
+the Apache License, Version 2.0 (`LICENSE-APACHE`).
+
+This file is generated from `rust/Cargo.lock` using `cargo-about`. To
+regenerate it, run:
+
+```sh
+./scripts/generate-third-party-licenses.sh
+```
+
+## Overview
+
+| License | SPDX Identifier | Crates |
+| --- | --- | ---: |
+{{#each overview}}| {{{name}}} | `{{{id}}}` | {{count}} |
+{{/each}}
+
+## Licenses
+{{#each licenses}}
+
+---
+
+### {{{name}}} (`{{{id}}}`)
+
+Used by:
+{{#each used_by}}
+- [{{{crate.name}}} {{{crate.version}}}]({{#if crate.repository}}{{{crate.repository}}}{{else}}https://crates.io/crates/{{{crate.name}}}{{/if}})
+{{/each}}
+
+````text
+{{{text}}}
+````
+{{/each}}

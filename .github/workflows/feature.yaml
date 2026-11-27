@@ -144,3 +144,13 @@ jobs:
         run: |
           cd rust
           cargo test
+
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.3
+
+      - name: Check third-party licenses
+        run: |
+          cargo fetch --locked --manifest-path rust/Cargo.toml
+          ./scripts/generate-third-party-licenses.sh --check

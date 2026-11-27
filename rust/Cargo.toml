@@ -4,6 +4,7 @@ version = "0.8.1"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
 description = "Minimal FFI bindings for Iroh blob operations"
+publish = false
 
 [lib]
 crate-type = ["staticlib"]

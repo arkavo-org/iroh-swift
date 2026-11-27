@@ -50,9 +50,21 @@ jobs:
         if: steps.version.outputs.SKIP != 'true'
         run: cargo install cbindgen
 
+      - name: Install cargo-about
+        if: steps.version.outputs.SKIP != 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.3
+
       - name: Build XCFramework
         if: steps.version.outputs.SKIP != 'true'
         run: ./scripts/build-xcframework.sh
+
+      - name: Generate third-party licenses
+        if: steps.version.outputs.SKIP != 'true'
+        run: |
+          cargo fetch --locked --manifest-path rust/Cargo.toml
+          ./scripts/generate-third-party-licenses.sh
 
       - name: Run tests
         if: steps.version.outputs.SKIP != 'true'
@@ -139,7 +151,7 @@ jobs:
           # Commit and push
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Package.swift
+          git add Package.swift THIRD-PARTY-LICENSES.md
           git commit -m "chore: set checksum for $VERSION [skip ci]"
           git push
         env:
