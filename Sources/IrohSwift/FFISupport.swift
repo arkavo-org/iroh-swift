@@ -8,7 +8,7 @@ import IrohSwiftFFI
 /// every call to `cancel()`; it is freed in `deinit`. The Rust operation holds
 /// its own reference, so freeing never races with the transfer.
 final class CancelTokenBox: @unchecked Sendable {
-    let pointer: UnsafeMutablePointer<IrohCancelToken>
+    let pointer: UnsafeMutablePointer<IrohCancelToken>?
 
     init() {
         pointer = iroh_cancel_token_new()
@@ -16,10 +16,12 @@ final class CancelTokenBox: @unchecked Sendable {
 
     /// Cancel the operation. Thread-safe and idempotent.
     func cancel() {
+        guard let pointer else { return }
         iroh_cancel_token_cancel(pointer)
     }
 
     deinit {
+        guard let pointer else { return }
         iroh_cancel_token_free(pointer)
     }
 }
