@@ -9695,7 +9695,7 @@ Copyright notices are retained in src/* files where relevant.
 ### Mozilla Public License 2.0 (`MPL-2.0`)
 
 Used by:
-- [attohttpc 0.30.1](https://github.com/sbstp/attohttpc)
+- [attohttpc 0.30.1](https://github.com/sbstp/attohttpc) — Source code for this MPL-2.0 component (version 0.30.1) is available at https://github.com/sbstp/attohttpc.
 
 ````text
 Mozilla Public License Version 2.0

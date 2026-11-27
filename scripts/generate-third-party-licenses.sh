@@ -19,9 +19,18 @@ elif [ -n "${1:-}" ]; then
     exit 2
 fi
 
+EXPECTED_CARGO_ABOUT_VERSION="0.9.3"
+
 if ! command -v cargo-about >/dev/null 2>&1; then
-    echo "error: cargo-about is not installed." >&2
-    echo "Install it with: brew install cargo-about  (or: cargo install --locked cargo-about)" >&2
+    echo "error: cargo-about $EXPECTED_CARGO_ABOUT_VERSION is not installed." >&2
+    echo "Install it with: cargo install --locked --version $EXPECTED_CARGO_ABOUT_VERSION cargo-about" >&2
+    exit 1
+fi
+
+ACTUAL_CARGO_ABOUT_VERSION="$(cargo about --version | awk '{print $2}')"
+if [ "$ACTUAL_CARGO_ABOUT_VERSION" != "$EXPECTED_CARGO_ABOUT_VERSION" ]; then
+    echo "error: expected cargo-about $EXPECTED_CARGO_ABOUT_VERSION, found $ACTUAL_CARGO_ABOUT_VERSION" >&2
+    echo "Install the pinned version with: cargo install --locked --version $EXPECTED_CARGO_ABOUT_VERSION cargo-about" >&2
     exit 1
 fi
 
