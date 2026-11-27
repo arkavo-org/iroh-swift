@@ -1,0 +1,83 @@
+# cargo-about configuration for generating THIRD-PARTY-LICENSES.md
+# Covers every Rust crate linked into IrohSwiftFFI.xcframework across all
+# Apple release targets (matches TARGETS in scripts/build-xcframework.sh).
+
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+]
+
+targets = [
+    "aarch64-apple-ios",
+    "aarch64-apple-ios-sim",
+    "x86_64-apple-ios",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Exclude the root workspace crate (iroh-swift-ffi, publish = false);
+# its own licenses ship in LICENSE-MIT and LICENSE-APACHE.
+[private]
+ignore = true
+
+# ring puts ISC copyright headers at the top of many short .rs/.h files, which
+# otherwise causes cargo-about to include raw source files as license blocks.
+# Point directly at its canonical license files instead.
+[ring.clarify]
+license = "Apache-2.0 AND ISC"
+[[ring.clarify.files]]
+path = "LICENSE-BoringSSL"
+license = "Apache-2.0"
+checksum = "005fc765ddc5115da796cca915baa9557abae13ff35e0a47c47affc56f6c414d"
+[[ring.clarify.files]]
+path = "LICENSE-other-bits"
+license = "ISC"
+checksum = "f025ccfb7dfb6bdfedc75ca0f67acc69e6fb4998143d834f7c2f38a29989680f"
+[[ring.clarify.files]]
+path = "third_party/fiat/LICENSE"
+license = "Apache-2.0"
+checksum = "9eacbcb81be660840c714a560a9d65ba07913db98dd4baf969f78dd499fdd60f"
+
+# libm combines its MIT notice, Apache-2.0 notice, and musl/Sun/FreeBSD notices
+# in LICENSE.txt. Include the full file rather than a generic SPDX fallback.
+[libm.clarify]
+license = "MIT"
+[[libm.clarify.files]]
+path = "LICENSE.txt"
+license = "MIT"
+checksum = "3823dda7cf046602f4b4e77ec8e227863dc4736037cc85bb33d9f19febe16bb7"
+
+# sha1_smol combines BSD-3-Clause and MIT (for src/simd.rs) in LICENSE.
+# Include the full file verbatim rather than a generic SPDX fallback.
+[sha1_smol.clarify]
+license = "BSD-3-Clause"
+[[sha1_smol.clarify.files]]
+path = "LICENSE"
+license = "BSD-3-Clause"
+checksum = "282a21b0710441c364025461a447362daf18f5798a7b72ae2f801a2aa536da51"
+
+# iroh and iroh-relay include code derived from Tailscale under BSD-3-Clause
+# (shipped in LICENSE-BSD3 alongside their MIT OR Apache-2.0 licensing).
+[iroh.clarify]
+license = "Apache-2.0 AND BSD-3-Clause"
+[[iroh.clarify.files]]
+path = "LICENSE-BSD3"
+license = "BSD-3-Clause"
+checksum = "7c6c032bf8c84fb4cd99784965a39be9e836fb7f244b3cf40c42faf4b211c10a"
+
+[iroh-relay.clarify]
+license = "Apache-2.0 AND BSD-3-Clause"
+[[iroh-relay.clarify.files]]
+path = "LICENSE-BSD3"
+license = "BSD-3-Clause"
+checksum = "bcaa9acadee6c20991d4b5eb56e226191411a3f6ceb92587b272f2ef0221ed71"
